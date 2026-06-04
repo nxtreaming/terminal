@@ -1469,7 +1469,10 @@ fn dispatch_browser_command(
 ) -> Result<Value> {
     match argv.first().map(String::as_str).unwrap_or("help") {
         "help" | "--help" | "-h" => Ok(Value::String(browser_help().to_string())),
-        "status" => Ok(session.status_json()),
+        "status" => {
+            session.refresh_connection_health();
+            Ok(session.status_json())
+        }
         "doctor" => {
             let doctor = session.doctor(cwd)?;
             if has_flag(argv, "--json") {
@@ -2014,8 +2017,14 @@ impl BrowserSession {
             .as_deref()
             .map(active_browser_script_runs_json)
             .unwrap_or_default();
-        let next_step = active_browser_script_next_step(&active_scripts)
-            .or_else(|| self.next_step().map(ToOwned::to_owned));
+        let next_step = if connected {
+            active_browser_script_next_step(&active_scripts)
+                .or_else(|| self.next_step().map(ToOwned::to_owned))
+        } else {
+            self.next_step()
+                .map(ToOwned::to_owned)
+                .or_else(|| active_browser_script_next_step(&active_scripts))
+        };
         let page = json!({
             "target_id": self.current_target_id,
             "session_id": self.current_session_id,
@@ -2094,7 +2103,7 @@ impl BrowserSession {
             Some("browser connect local")
         } else if matches!(
             self.last_error_kind.as_deref(),
-            Some("browser-closed" | "stale-port")
+            Some("browser-closed" | "stale-port" | "browser-not-running")
         ) && self.mode == BrowserMode::Local
         {
             Some("Open Chrome with the selected profile, then run browser connect local")
@@ -2216,6 +2225,37 @@ impl BrowserSession {
             ws_url: candidate.ws_url.clone(),
             candidate_id: Some(candidate.id.clone()),
         };
+        if self.can_reuse_local_endpoint(&endpoint) {
+            if self.preferred_target_marker.is_some() || self.preferred_profile_id.is_some() {
+                if let Err(error) = self.attach_first_page() {
+                    let message = format!("{error:#}");
+                    let kind =
+                        self.normalize_local_connectivity_error(classify_browser_error(&message));
+                    self.last_error = Some(message.clone());
+                    self.last_error_kind = Some(kind.to_string());
+                    return Ok(json!({
+                        "status": "blocked",
+                        "state": kind,
+                        "reason": local_connect_error_reason(kind, &message),
+                        "candidate": candidate,
+                        "raw_error": message,
+                        "next_step": local_connect_next_step(kind),
+                    }));
+                }
+            }
+            self.endpoint = Some(endpoint);
+            self.browser_name = Some(candidate.browser_name.clone());
+            self.profile = Some(candidate.profile_path.display().to_string());
+            self.last_error = None;
+            self.last_error_kind = None;
+            self.close_remote_debugging_setup_targets();
+            return Ok(json!({
+                "status": "connected",
+                "candidate": candidate,
+                "browser": self.status_json(),
+                "reused_connection": true,
+            }));
+        }
         if let Err(error) =
             self.connect_endpoint(endpoint, BrowserMode::Local, BrowserOwner::External)
         {
@@ -2234,6 +2274,7 @@ impl BrowserSession {
         }
         self.browser_name = Some(candidate.browser_name.clone());
         self.profile = Some(candidate.profile_path.display().to_string());
+        self.close_remote_debugging_setup_targets();
         Ok(json!({
             "status": "connected",
             "candidate": candidate,
@@ -2452,6 +2493,22 @@ impl BrowserSession {
         let Some(endpoint) = self.endpoint.clone() else {
             bail!("no browser endpoint is configured");
         };
+        if self.mode == BrowserMode::Local {
+            let probe = probe_endpoint(&endpoint);
+            if !probe.ok && matches!(probe.state, "browser-closed" | "websocket-dropped") {
+                self.connection = None;
+                self.last_target_id = self.current_target_id.take();
+                self.last_session_id = self.current_session_id.take();
+                let kind = self.normalize_local_connectivity_error(probe.state);
+                self.last_error = Some(probe.detail);
+                self.last_error_kind = Some(kind.to_string());
+                self.connection_generation += 1;
+                bail!(
+                    "local Chrome endpoint is not reachable; state: {kind}; next_step: {}",
+                    self.next_step().unwrap_or("browser connect local")
+                );
+            }
+        }
         self.connection = Some(CdpDispatcher::connect(&endpoint.ws_url)?);
         self.connection_generation += 1;
         if self.current_target_id.is_some() {
@@ -2463,6 +2520,92 @@ impl BrowserSession {
             "status": "reconnected",
             "browser": self.status_json(),
         }))
+    }
+
+    fn refresh_connection_health(&mut self) {
+        if self.connection.is_none() || self.mode != BrowserMode::Local {
+            return;
+        }
+        let Some(endpoint) = self.endpoint.clone() else {
+            return;
+        };
+        let probe = probe_endpoint(&endpoint);
+        if probe.ok {
+            return;
+        }
+        let kind = self.normalize_local_connectivity_error(probe.state);
+        if !should_drop_browser_connection(kind) {
+            return;
+        }
+        self.connection = None;
+        self.last_target_id = self.current_target_id.take();
+        self.last_session_id = self.current_session_id.take();
+        self.last_error = Some(probe.detail);
+        self.last_error_kind = Some(kind.to_string());
+        self.connection_generation += 1;
+    }
+
+    fn can_reuse_local_endpoint(&mut self, endpoint: &Endpoint) -> bool {
+        if self.connection.is_none()
+            || self.mode != BrowserMode::Local
+            || self.owner != BrowserOwner::External
+        {
+            return false;
+        }
+        let Some(current_endpoint) = self.endpoint.as_ref() else {
+            return false;
+        };
+        if current_endpoint.ws_url != endpoint.ws_url {
+            return false;
+        }
+        let probe = probe_endpoint(endpoint);
+        if probe.ok {
+            return true;
+        }
+        let kind = self.normalize_local_connectivity_error(probe.state);
+        if should_drop_browser_connection(kind) {
+            self.connection = None;
+            self.last_target_id = self.current_target_id.take();
+            self.last_session_id = self.current_session_id.take();
+            self.last_error = Some(probe.detail);
+            self.last_error_kind = Some(kind.to_string());
+            self.connection_generation += 1;
+        }
+        false
+    }
+
+    fn normalize_local_connectivity_error(&self, kind: &'static str) -> &'static str {
+        if self.mode != BrowserMode::Local {
+            return kind;
+        }
+        if !matches!(
+            kind,
+            "permission-blocked"
+                | "cdp-disabled"
+                | "browser-closed"
+                | "websocket-dropped"
+                | "browser-not-running"
+                | "stale-port"
+        ) {
+            return kind;
+        }
+        let candidates = local_candidates();
+        if candidates.iter().any(|candidate| candidate.connectable) {
+            return kind;
+        }
+        if candidates
+            .iter()
+            .any(|candidate| candidate.state == "cdp-disabled")
+        {
+            return "cdp-disabled";
+        }
+        if candidates.iter().any(|candidate| candidate.stale) {
+            return "stale-port";
+        }
+        if candidates.is_empty() {
+            return "browser-not-running";
+        }
+        kind
     }
 
     fn reattach_same_target(&mut self) -> Result<Value> {
@@ -2749,7 +2892,8 @@ impl BrowserSession {
                         }
                     }
                 }
-                let final_error_kind = classify_browser_error(&message);
+                let final_error_kind =
+                    self.normalize_local_connectivity_error(classify_browser_error(&message));
                 self.last_error = Some(message.clone());
                 self.last_error_kind = Some(final_error_kind.to_string());
                 if should_drop_browser_connection(final_error_kind) {
@@ -2822,7 +2966,7 @@ impl BrowserSession {
                     .and_then(|target| target.get("browserContextId"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
-                attached_launched_profile = attached_browser_context_id.is_some();
+                attached_launched_profile = attached_profile_id.is_some();
             }
             target_info
                 .as_ref()
@@ -2854,7 +2998,7 @@ impl BrowserSession {
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned)
                 });
-            attached_launched_profile = attached_browser_context_id.is_some();
+            attached_launched_profile = true;
         }
         let session_id = self.attach_target(&target_id)?;
         self.current_target_id = Some(target_id);
@@ -2898,6 +3042,25 @@ impl BrowserSession {
                 continue;
             };
             if Some(target_id) == keep_target_id {
+                continue;
+            }
+            let _ = self.cdp("Target.closeTarget", None, json!({ "targetId": target_id }));
+        }
+    }
+
+    fn close_remote_debugging_setup_targets(&mut self) {
+        let Ok(targets) = self.targets() else {
+            return;
+        };
+        let current_target_id = self.current_target_id.clone();
+        for target in targets {
+            if !is_remote_debugging_setup_target(&target) {
+                continue;
+            }
+            let Some(target_id) = target.get("targetId").and_then(Value::as_str) else {
+                continue;
+            };
+            if current_target_id.as_deref() == Some(target_id) {
                 continue;
             }
             let _ = self.cdp("Target.closeTarget", None, json!({ "targetId": target_id }));
@@ -3501,7 +3664,10 @@ fn browser_issue_diagnosis(
 }
 
 fn should_drop_browser_connection(error_kind: &str) -> bool {
-    matches!(error_kind, "browser-closed" | "websocket-dropped")
+    matches!(
+        error_kind,
+        "browser-closed" | "websocket-dropped" | "stale-port" | "browser-not-running"
+    )
 }
 
 fn is_cdp_command_error(message: &str) -> bool {
@@ -6936,6 +7102,14 @@ fn is_profile_marker_target(target: &Value) -> bool {
             .is_some_and(|url| url.contains("browser-use-profile-target"))
 }
 
+fn is_remote_debugging_setup_target(target: &Value) -> bool {
+    target.get("type").and_then(Value::as_str) == Some("page")
+        && target
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.starts_with("chrome://inspect/#remote-debugging"))
+}
+
 fn ensure_target_browser_context(
     session: &mut BrowserSession,
     target_id: &str,
@@ -7437,6 +7611,22 @@ mod tests {
         assert_eq!(session.preferred_profile_id, None);
         assert_eq!(session.active_local_profile_id, None);
         assert_eq!(session.preferred_browser_context_id, None);
+    }
+
+    #[test]
+    fn remote_debugging_setup_target_matches_inspect_page_only() {
+        assert!(is_remote_debugging_setup_target(&json!({
+            "type": "page",
+            "url": "chrome://inspect/#remote-debugging",
+        })));
+        assert!(!is_remote_debugging_setup_target(&json!({
+            "type": "page",
+            "url": "chrome://inspect/#devices",
+        })));
+        assert!(!is_remote_debugging_setup_target(&json!({
+            "type": "page",
+            "url": "https://example.com",
+        })));
     }
 
     #[test]

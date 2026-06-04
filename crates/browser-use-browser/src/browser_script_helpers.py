@@ -504,6 +504,7 @@ def _is_placeholder_tab_url(url):
     return (
         url.startswith("about:blank#")
         or PROFILE_MARKER in url
+        or url.startswith("chrome://inspect/#remote-debugging")
         or url.startswith("chrome://newtab")
         or url.startswith("chrome://new-tab-page")
     )
