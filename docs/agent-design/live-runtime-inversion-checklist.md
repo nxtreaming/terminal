@@ -52,11 +52,11 @@ wake a parent by themselves. The implemented guard is that live input, mailbox
 wakeups, child completion delivery, cancellation, browser claims, and tool
 resources go through `BrowserUseRuntime`.
 
-Remaining important gap after the latest verification: browser actions are
-runtime-scoped and journaled, but `crates/browser-use-browser` still owns
-process-global `SESSIONS` and `BROWSER_SCRIPT_RUNS` registries internally.
-`BrowserManager` currently leases, serializes, projects, and records browser
-activity; it is not yet the physical owner of every CDP/session/script handle.
+Latest browser ownership slice: runtime-created browser backends now carry owned
+`BrowserSessionRegistry` and `BrowserScriptRunRegistry` instances, so normal
+TUI/CLI/SDK runtime paths do not create browser sessions in the global
+`browser-use-browser` registries. The old global registries remain only behind
+compatibility wrapper APIs for non-runtime direct callers.
 
 ## Current Hybrid
 
@@ -320,18 +320,23 @@ BrowserUseRuntime
       - action serialization
       - active browser-script snapshots
       - browser status/projection state
-- [ ] Move physical CDP/browser process/session state out of
-      `browser-use-browser` process globals and into `BrowserHandle`.
-- [ ] Move the physical browser-script run registry out of
-      `browser-use-browser::BROWSER_SCRIPT_RUNS` and into `BrowserHandle`.
-- [ ] Move capture/artifact ownership fully into `BrowserHandle`.
+- [x] Move physical CDP/browser process/session state out of
+      `browser-use-browser` process globals for runtime-created browser
+      backends.
+- [x] Move physical browser-script run registry out of
+      `browser-use-browser::BROWSER_SCRIPT_RUNS` for runtime-created browser
+      backends.
+- [x] Move session-layer capture ownership out of process-global capture state
+      for runtime-created browser backends.
+- [ ] Store the concrete browser registries directly on `BrowserHandle` rather
+      than on the runtime browser backend resource.
 - [x] Make browser tools resolve a `BrowserHandle`, not only a `session_id`.
 - [x] Enforce one running agent per browser.
 - [x] Allow many browsers in parallel.
 - [x] Make `browser_script` start/observe/cancel publish through
       `BrowserHandle`.
-- [ ] Make `browser_script` start/observe/cancel physically execute through
-      `BrowserHandle` without global script registries.
+- [x] Make `browser_script` start/observe/cancel physically execute without
+      global script registries for runtime-created browser backends.
 - [x] Journal browser claim/release/start/close as barrier events.
 - [x] Journal script output/completion/cancellation in order.
 - [x] Make SDK `Browser` map to `browser_id`.
@@ -443,8 +448,8 @@ BrowserUseRuntime
 - [x] `StoreNotificationWatcher` is not used by live subagent wait/wakeup.
 - [x] `agent_messages` is not used as live mailbox state.
 - [x] Provider-created global exec manager is not the normal live path.
-- [ ] Browser process-wide session/script statics are deleted or reachable only
-      through `BrowserManager`.
+- [x] Browser process-wide session/script statics are demoted to compatibility
+      wrapper paths and are not used by normal runtime-created browser backends.
 - [x] TUI child OS-thread launcher is gone as a separate live authority.
 - [x] CLI child Store-first launcher is gone as a separate live authority.
 - [x] Direct Store polling is not used as a wakeup/scheduling primitive.

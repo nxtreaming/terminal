@@ -218,13 +218,14 @@ impl Default for BrowserSession {
     }
 }
 
-static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
+static BROWSER_SESSIONS: OnceLock<BrowserSessionRegistry> = OnceLock::new();
 static BROWSER_SCRIPT_RUNS: OnceLock<BrowserScriptRunRegistry> = OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct BrowserScriptRun {
     id: String,
     session_id: String,
+    session_registry: BrowserSessionRegistry,
     child: Child,
     stdout_reader: Option<thread::JoinHandle<Vec<u8>>>,
     stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
@@ -290,6 +291,61 @@ struct BrowserScriptDelta {
     images: Vec<Value>,
     browser_events: Vec<Value>,
     consumed_bytes: u64,
+}
+
+#[derive(Clone, Default)]
+pub struct BrowserSessionRegistry {
+    sessions: Arc<Mutex<HashMap<String, BrowserSession>>>,
+    captures: Arc<Mutex<HashMap<String, SessionCaptureHandle>>>,
+}
+
+impl std::fmt::Debug for BrowserSessionRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserSessionRegistry")
+            .field("active_session_count", &self.active_session_count())
+            .field("active_capture_count", &self.active_capture_count())
+            .finish()
+    }
+}
+
+impl BrowserSessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn global() -> Self {
+        browser_sessions().clone()
+    }
+
+    pub fn active_session_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .expect("browser session registry poisoned")
+            .len()
+    }
+
+    pub fn active_capture_count(&self) -> usize {
+        self.captures
+            .lock()
+            .expect("session capture registry poisoned")
+            .len()
+    }
+
+    pub fn contains_session(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .expect("browser session registry poisoned")
+            .contains_key(session_id)
+    }
+}
+
+fn browser_sessions() -> &'static BrowserSessionRegistry {
+    BROWSER_SESSIONS.get_or_init(BrowserSessionRegistry::new)
+}
+
+#[cfg(test)]
+fn sessions() -> &'static Mutex<HashMap<String, BrowserSession>> {
+    &browser_sessions().sessions
 }
 
 fn browser_script_runs() -> &'static BrowserScriptRunRegistry {
@@ -391,6 +447,26 @@ pub fn run_browser_command_with_options_and_script_registry(
     options: BrowserCommandOptions,
     script_registry: &BrowserScriptRunRegistry,
 ) -> Result<BrowserCommandOutput> {
+    run_browser_command_with_options_and_registries(
+        session_id,
+        cwd,
+        artifact_dir,
+        raw_cmd,
+        options,
+        script_registry,
+        browser_sessions(),
+    )
+}
+
+pub fn run_browser_command_with_options_and_registries(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    raw_cmd: &str,
+    options: BrowserCommandOptions,
+    script_registry: &BrowserScriptRunRegistry,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<BrowserCommandOutput> {
     let mut argv = shell_words(raw_cmd)?;
     if argv.first().is_some_and(|arg| arg == "browser") {
         argv.remove(0);
@@ -401,7 +477,8 @@ pub fn run_browser_command_with_options_and_script_registry(
 
     if argv.first().map(String::as_str) == Some("script") {
         {
-            let mut sessions = sessions()
+            let mut sessions = session_registry
+                .sessions
                 .lock()
                 .expect("browser session registry poisoned");
             let session = sessions.entry(session_id.to_string()).or_default();
@@ -409,7 +486,8 @@ pub fn run_browser_command_with_options_and_script_registry(
             session.log(format!("browser {}", argv.join(" ")));
         }
         let content = dispatch_script_runtime(session_id, &argv, script_registry)?;
-        let mut sessions = sessions()
+        let mut sessions = session_registry
+            .sessions
             .lock()
             .expect("browser session registry poisoned");
         let events = sessions
@@ -419,7 +497,8 @@ pub fn run_browser_command_with_options_and_script_registry(
         return Ok(BrowserCommandOutput { events, content });
     }
 
-    let mut sessions = sessions()
+    let mut sessions = session_registry
+        .sessions
         .lock()
         .expect("browser session registry poisoned");
     let session = sessions.entry(session_id.to_string()).or_default();
@@ -439,7 +518,9 @@ pub fn run_browser_command_with_options_and_script_registry(
     // Tool-agnostic recording: once the browser is connected (via any `browser`
     // command), start session-layer 2fps capture if it isn't already running.
     if connected {
-        start_session_capture(session_id, artifact_dir.as_ref());
+        start_session_capture_with_registry(session_id, artifact_dir.as_ref(), session_registry);
+    } else {
+        stop_session_capture_with_registry(session_id, session_registry);
     }
     Ok(BrowserCommandOutput { events, content })
 }
@@ -451,7 +532,32 @@ pub fn run_browser_script(
     code: &str,
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
-    let mut run = spawn_browser_script(session_id, cwd, artifact_dir, code, timeout_seconds)?;
+    run_browser_script_with_session_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        browser_sessions(),
+    )
+}
+
+pub fn run_browser_script_with_session_registry(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    code: &str,
+    timeout_seconds: u64,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<BrowserScriptOutput> {
+    let mut run = spawn_browser_script_with_session_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        session_registry,
+    )?;
     loop {
         if run.child.try_wait()?.is_some() {
             return finish_browser_script_run(run, false);
@@ -488,7 +594,34 @@ pub fn start_browser_script_with_registry(
     timeout_seconds: u64,
     registry: &BrowserScriptRunRegistry,
 ) -> Result<BrowserScriptOutput> {
-    let mut run = spawn_browser_script(session_id, cwd, artifact_dir, code, timeout_seconds)?;
+    start_browser_script_with_registries(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        registry,
+        browser_sessions(),
+    )
+}
+
+pub fn start_browser_script_with_registries(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    code: &str,
+    timeout_seconds: u64,
+    script_registry: &BrowserScriptRunRegistry,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<BrowserScriptOutput> {
+    let mut run = spawn_browser_script_with_session_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        session_registry,
+    )?;
     let initial_deadline = Instant::now() + Duration::from_millis(BROWSER_SCRIPT_INITIAL_WAIT_MS);
     loop {
         if run.child.try_wait()?.is_some() {
@@ -526,7 +659,7 @@ pub fn start_browser_script_with_registry(
                 ..Default::default()
             };
             attach_inline_window_stitch(&mut run, &mut output);
-            registry
+            script_registry
                 .lock()
                 .expect("browser_script run registry poisoned")
                 .insert(run_id, run);
@@ -627,18 +760,19 @@ pub fn cancel_browser_script_with_registry(
     finish_cancelled_browser_script_run(run)
 }
 
-fn spawn_browser_script(
+fn spawn_browser_script_with_session_registry(
     session_id: &str,
     cwd: impl AsRef<Path>,
     artifact_dir: impl AsRef<Path>,
     code: &str,
     timeout_seconds: u64,
+    session_registry: &BrowserSessionRegistry,
 ) -> Result<BrowserScriptRun> {
     fs::create_dir_all(artifact_dir.as_ref())
         .with_context(|| format!("create artifact dir {}", artifact_dir.as_ref().display()))?;
     // Ensure session-layer capture is running (idempotent) so browser_script
     // runs are recorded by the same tool-agnostic capture as `browser`.
-    start_session_capture(session_id, artifact_dir.as_ref());
+    start_session_capture_with_registry(session_id, artifact_dir.as_ref(), session_registry);
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind browser_script bridge")?;
     let bridge_addr = listener.local_addr()?;
     listener
@@ -649,8 +783,15 @@ fn spawn_browser_script(
     let bridge_stop = stop.clone();
     let bridge_error_sink = bridge_errors.clone();
     let bridge_session_id = session_id.to_string();
+    let bridge_session_registry = session_registry.clone();
     let bridge = thread::spawn(move || {
-        run_bridge(listener, bridge_session_id, bridge_stop, bridge_error_sink)
+        run_bridge(
+            listener,
+            bridge_session_id,
+            bridge_stop,
+            bridge_error_sink,
+            bridge_session_registry,
+        )
     });
 
     let agent_workspace_dir = agent_workspace_dir_for(artifact_dir.as_ref());
@@ -685,6 +826,7 @@ fn spawn_browser_script(
     Ok(BrowserScriptRun {
         id: run_id,
         session_id: session_id.to_string(),
+        session_registry: session_registry.clone(),
         child,
         stdout_reader,
         stderr_reader,
@@ -739,7 +881,11 @@ fn finish_browser_script_run(
             status: Some("failed".to_string()),
             run_id: Some(run.id),
             text: std::mem::take(&mut delta.text),
-            diagnosis: Some(browser_script_failure_diagnosis(&run.session_id, &error)),
+            diagnosis: Some(browser_script_failure_diagnosis(
+                &run.session_id,
+                &error,
+                &run.session_registry,
+            )),
             error: Some(error),
             outputs: std::mem::take(&mut delta.outputs),
             summary: std::mem::take(&mut delta.summary),
@@ -771,7 +917,11 @@ fn finish_browser_script_run(
             } else {
                 std::mem::take(&mut delta.text)
             },
-            diagnosis: Some(browser_script_failure_diagnosis(&run.session_id, &error)),
+            diagnosis: Some(browser_script_failure_diagnosis(
+                &run.session_id,
+                &error,
+                &run.session_registry,
+            )),
             error: Some(error),
             outputs: std::mem::take(&mut delta.outputs),
             summary: std::mem::take(&mut delta.summary),
@@ -829,7 +979,11 @@ fn finish_browser_script_run(
             .error
             .as_deref()
             .unwrap_or("browser_script failed without an error message");
-        response.diagnosis = Some(browser_script_failure_diagnosis(&run.session_id, error));
+        response.diagnosis = Some(browser_script_failure_diagnosis(
+            &run.session_id,
+            error,
+            &run.session_registry,
+        ));
     }
     response.status = Some(if response.ok { "finished" } else { "failed" }.to_string());
     response.run_id = Some(run.id);
@@ -874,8 +1028,12 @@ struct BrowserIssueState {
     next_step: Option<String>,
 }
 
-fn browser_script_failure_diagnosis(session_id: &str, error: &str) -> BrowserIssueDiagnosis {
-    let state = browser_issue_state_for_session(session_id);
+fn browser_script_failure_diagnosis(
+    session_id: &str,
+    error: &str,
+    session_registry: &BrowserSessionRegistry,
+) -> BrowserIssueDiagnosis {
+    let state = browser_issue_state_for_session(session_id, session_registry);
     browser_issue_diagnosis(
         classify_browser_script_failure(error),
         state.browser_connected,
@@ -884,8 +1042,11 @@ fn browser_script_failure_diagnosis(session_id: &str, error: &str) -> BrowserIss
     )
 }
 
-fn browser_issue_state_for_session(session_id: &str) -> BrowserIssueState {
-    let Ok(sessions) = sessions().lock() else {
+fn browser_issue_state_for_session(
+    session_id: &str,
+    session_registry: &BrowserSessionRegistry,
+) -> BrowserIssueState {
+    let Ok(sessions) = session_registry.sessions.lock() else {
         return BrowserIssueState::default();
     };
     let Some(session) = sessions.get(session_id) else {
@@ -1385,9 +1546,19 @@ pub fn cleanup_session_with_script_registry(
     session_id: &str,
     script_registry: &BrowserScriptRunRegistry,
 ) -> usize {
+    cleanup_session_with_registries(session_id, script_registry, browser_sessions())
+}
+
+pub fn cleanup_session_with_registries(
+    session_id: &str,
+    script_registry: &BrowserScriptRunRegistry,
+    session_registry: &BrowserSessionRegistry,
+) -> usize {
     cancel_browser_script_runs_for_session(session_id, script_registry);
+    stop_session_capture_with_registry(session_id, session_registry);
     let session = {
-        let mut sessions = sessions()
+        let mut sessions = session_registry
+            .sessions
             .lock()
             .expect("browser session registry poisoned");
         sessions.remove(session_id)
@@ -1424,10 +1595,6 @@ fn cancel_browser_script_runs_for_session(
         let _ = run.child.kill();
         let _ = finish_cancelled_browser_script_run(run);
     }
-}
-
-fn sessions() -> &'static Mutex<HashMap<String, BrowserSession>> {
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn dispatch_browser_command(
@@ -4830,11 +4997,12 @@ fn run_bridge(
     session_id: String,
     stop: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<String>>>,
+    session_registry: BrowserSessionRegistry,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Err(error) = handle_bridge_stream(stream, &session_id) {
+                if let Err(error) = handle_bridge_stream(stream, &session_id, &session_registry) {
                     errors
                         .lock()
                         .expect("browser_script bridge error registry poisoned")
@@ -4857,7 +5025,11 @@ fn run_bridge(
     }
 }
 
-fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
+fn handle_bridge_stream(
+    mut stream: TcpStream,
+    session_id: &str,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<()> {
     // The listener is nonblocking so the bridge thread can poll the stop flag.
     // On macOS, accepted streams can still surface EWOULDBLOCK on large writes
     // unless the child socket is forced back to blocking mode. Screenshots are
@@ -4871,7 +5043,7 @@ fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let request: Value = serde_json::from_str(&line)?;
-    let response = match bridge_request(session_id, &request) {
+    let response = match bridge_request(session_id, &request, session_registry) {
         Ok(value) => json!({ "ok": true, "result": value }),
         Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
     };
@@ -4882,7 +5054,11 @@ fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn bridge_request(session_id: &str, request: &Value) -> Result<Value> {
+fn bridge_request(
+    session_id: &str,
+    request: &Value,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<Value> {
     #[cfg(test)]
     {
         let kind = request.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -4896,7 +5072,8 @@ fn bridge_request(session_id: &str, request: &Value) -> Result<Value> {
     }
 
     let mut session = {
-        let mut sessions = sessions()
+        let mut sessions = session_registry
+            .sessions
             .lock()
             .expect("browser session registry poisoned");
         sessions.remove(session_id).ok_or_else(|| {
@@ -4905,7 +5082,8 @@ fn bridge_request(session_id: &str, request: &Value) -> Result<Value> {
     };
     session.session_id = Some(session_id.to_string());
     let result = bridge_request_with_session(&mut session, request);
-    sessions()
+    session_registry
+        .sessions
         .lock()
         .expect("browser session registry poisoned")
         .insert(session_id.to_string(), session);
@@ -6357,10 +6535,6 @@ fn inline_frames_enabled() -> bool {
 struct SessionCaptureHandle {
     stop: Arc<AtomicBool>,
 }
-static SESSION_CAPTURE: OnceLock<Mutex<HashMap<String, SessionCaptureHandle>>> = OnceLock::new();
-fn session_capture_registry() -> &'static Mutex<HashMap<String, SessionCaptureHandle>> {
-    SESSION_CAPTURE.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 fn session_capture_fps() -> f64 {
     std::env::var("LLM_BROWSER_CAPTURE_FPS")
@@ -6375,11 +6549,16 @@ fn session_capture_quality() -> i64 {
         .unwrap_or(60)
 }
 
-fn start_session_capture(session_id: &str, artifact_dir: &Path) {
+fn start_session_capture_with_registry(
+    session_id: &str,
+    artifact_dir: &Path,
+    session_registry: &BrowserSessionRegistry,
+) {
     if session_capture_fps() <= 0.0 {
         return;
     }
-    let mut reg = session_capture_registry()
+    let mut reg = session_registry
+        .captures
         .lock()
         .expect("session capture registry poisoned");
     if reg.contains_key(session_id) {
@@ -6395,11 +6574,17 @@ fn start_session_capture(session_id: &str, artifact_dir: &Path) {
         SessionCaptureHandle { stop: stop.clone() },
     );
     let sid = session_id.to_string();
-    thread::spawn(move || session_capture_loop(sid, frames_dir, stop));
+    let capture_registry = session_registry.clone();
+    thread::spawn(move || session_capture_loop(sid, frames_dir, stop, capture_registry));
 }
 
 fn stop_session_capture(session_id: &str) {
-    if let Some(handle) = session_capture_registry()
+    stop_session_capture_with_registry(session_id, browser_sessions());
+}
+
+fn stop_session_capture_with_registry(session_id: &str, session_registry: &BrowserSessionRegistry) {
+    if let Some(handle) = session_registry
+        .captures
         .lock()
         .expect("session capture registry poisoned")
         .remove(session_id)
@@ -6410,8 +6595,11 @@ fn stop_session_capture(session_id: &str) {
 
 // Brief lock to read (ws_url, current_target_id) from the shared session. No
 // round-trip under the lock — just clones two strings.
-fn session_capture_dispatcher(session_id: &str) -> Option<(Arc<CdpDispatcher>, String)> {
-    let sessions = sessions().lock().ok()?;
+fn session_capture_dispatcher(
+    session_id: &str,
+    session_registry: &BrowserSessionRegistry,
+) -> Option<(Arc<CdpDispatcher>, String)> {
+    let sessions = session_registry.sessions.lock().ok()?;
     let session = sessions.get(session_id)?;
     let dispatcher = session.connection.clone()?;
     let target = session.current_target_id.clone()?;
@@ -6429,7 +6617,12 @@ fn write_capture_manifest(path: &Path, records: &[Value]) {
     let _ = fs::write(path, text);
 }
 
-fn session_capture_loop(session_id: String, frames_dir: PathBuf, stop: Arc<AtomicBool>) {
+fn session_capture_loop(
+    session_id: String,
+    frames_dir: PathBuf,
+    stop: Arc<AtomicBool>,
+    session_registry: BrowserSessionRegistry,
+) {
     let interval = Duration::from_secs_f64(1.0 / session_capture_fps().max(0.1));
     let quality = session_capture_quality();
     let manifest = frames_dir.join("frames.ndjson");
@@ -6442,7 +6635,7 @@ fn session_capture_loop(session_id: String, frames_dir: PathBuf, stop: Arc<Atomi
 
     while !stop.load(Ordering::SeqCst) {
         let tick = Instant::now();
-        match session_capture_dispatcher(&session_id) {
+        match session_capture_dispatcher(&session_id, &session_registry) {
             None => {
                 idle_ticks += 1;
                 if idle_ticks > 20 {
@@ -6531,7 +6724,8 @@ fn session_capture_loop(session_id: String, frames_dir: PathBuf, stop: Arc<Atomi
         }
     }
     // Remove our registry entry so a later reconnect can restart capture.
-    session_capture_registry()
+    session_registry
+        .captures
         .lock()
         .expect("session capture registry poisoned")
         .remove(&session_id);

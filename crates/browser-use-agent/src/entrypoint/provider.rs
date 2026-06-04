@@ -446,6 +446,7 @@ fn browser_backend_for_runtime_or_config(
                             profile_id: Some(session_id.as_str().to_string()),
                         },
                     )?;
+                    let session_registry = browser_use_browser::BrowserSessionRegistry::new();
                     let script_registry = browser_use_browser::BrowserScriptRunRegistry::new();
                     Ok(RuntimeBrowserBackend {
                         session_id: session_id.as_str().to_string(),
@@ -453,8 +454,9 @@ fn browser_backend_for_runtime_or_config(
                         agent_id,
                         browser_id,
                         backend: Arc::new(
-                            crate::tools::handlers::browser::RealBackend::with_browser_mode_and_script_registry(
+                            crate::tools::handlers::browser::RealBackend::with_browser_mode_and_registries(
                                 config.options.browser_mode.clone(),
+                                session_registry,
                                 script_registry,
                             ),
                         ),
@@ -4539,6 +4541,11 @@ mod tests {
                 "browser status --json",
             )
             .expect("browser status should create a browser-use-browser session");
+        assert!(
+            !browser_use_browser::BrowserSessionRegistry::global()
+                .contains_session(session_id.as_str()),
+            "runtime-backed browser backend must not create sessions in the global browser registry"
+        );
         let browser_snapshots = handle.snapshot().browsers;
         assert_eq!(browser_snapshots.len(), 1);
         assert_eq!(
