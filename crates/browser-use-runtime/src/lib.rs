@@ -489,6 +489,29 @@ pub struct BrowserLease {
 }
 
 #[derive(Clone, Debug)]
+pub struct BrowserPhysicalRegistries {
+    session_registry: browser_use_browser::BrowserSessionRegistry,
+    script_registry: browser_use_browser::BrowserScriptRunRegistry,
+}
+
+impl BrowserPhysicalRegistries {
+    fn new() -> Self {
+        Self {
+            session_registry: browser_use_browser::BrowserSessionRegistry::new(),
+            script_registry: browser_use_browser::BrowserScriptRunRegistry::new(),
+        }
+    }
+
+    pub fn session_registry(&self) -> browser_use_browser::BrowserSessionRegistry {
+        self.session_registry.clone()
+    }
+
+    pub fn script_registry(&self) -> browser_use_browser::BrowserScriptRunRegistry {
+        self.script_registry.clone()
+    }
+}
+
+#[derive(Clone, Debug)]
 struct BrowserHandleState {
     status: BrowserStatus,
     active_agent_id: Option<AgentId>,
@@ -502,6 +525,7 @@ pub struct BrowserHandle {
     config: BrowserConfig,
     state: Arc<Mutex<BrowserHandleState>>,
     action_lock: Arc<Mutex<()>>,
+    physical: BrowserPhysicalRegistries,
 }
 
 impl BrowserHandle {
@@ -516,6 +540,7 @@ impl BrowserHandle {
                 active_scripts: HashMap::new(),
             })),
             action_lock: Arc::new(Mutex::new(())),
+            physical: BrowserPhysicalRegistries::new(),
         }
     }
 
@@ -537,6 +562,10 @@ impl BrowserHandle {
             active_agent_id: state.active_agent_id.clone(),
             active_scripts,
         }
+    }
+
+    pub fn physical_registries(&self) -> BrowserPhysicalRegistries {
+        self.physical.clone()
     }
 
     fn claim(&self, agent_id: AgentId) -> Result<BrowserLease> {
@@ -698,6 +727,17 @@ impl BrowserManager {
             .get(browser_id)
             .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
         Ok(handle.snapshot())
+    }
+
+    pub fn physical_registries(&self, browser_id: &BrowserId) -> Result<BrowserPhysicalRegistries> {
+        let browsers = self
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = browsers
+            .get(browser_id)
+            .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
+        Ok(handle.physical_registries())
     }
 
     pub fn validate_browser_claim(&self, browser_id: &BrowserId, agent_id: &AgentId) -> Result<()> {
@@ -3978,6 +4018,13 @@ impl RuntimeHandle {
         &self.inner.browsers
     }
 
+    pub fn browser_physical_registries(
+        &self,
+        browser_id: &BrowserId,
+    ) -> Result<BrowserPhysicalRegistries> {
+        self.inner.browsers.physical_registries(browser_id)
+    }
+
     pub fn create_browser(&self, config: BrowserConfig) -> BrowserId {
         let browser_id = self.inner.browsers.create_browser(config.clone());
         self.inner.events.publish(
@@ -6440,6 +6487,45 @@ mod tests {
         manager.release_browser(&lease)?;
         let lease_b = manager.claim_browser(&browser_id, agent_b.clone())?;
         assert_eq!(lease_b.agent_id, agent_b);
+        Ok(())
+    }
+
+    #[test]
+    fn browser_manager_owns_isolated_physical_registries() -> Result<()> {
+        let manager = BrowserManager::new();
+        let browser_a = manager.create_browser(BrowserConfig::default());
+        let browser_b = manager.create_browser(BrowserConfig::default());
+        let registries_a = manager.physical_registries(&browser_a)?;
+        let registries_b = manager.physical_registries(&browser_b)?;
+        let workspace = tempfile::tempdir()?;
+
+        browser_use_browser::run_browser_command_with_options_and_registries(
+            "runtime-session-a",
+            workspace.path(),
+            workspace.path(),
+            "browser status --json",
+            browser_use_browser::BrowserCommandOptions::default(),
+            &registries_a.script_registry(),
+            &registries_a.session_registry(),
+        )?;
+
+        assert!(
+            registries_a
+                .session_registry()
+                .contains_session("runtime-session-a"),
+            "the session should live in browser A's runtime-owned registry"
+        );
+        assert!(
+            !registries_b
+                .session_registry()
+                .contains_session("runtime-session-a"),
+            "browser B must not see browser A's physical session"
+        );
+        assert!(
+            !browser_use_browser::BrowserSessionRegistry::global()
+                .contains_session("runtime-session-a"),
+            "runtime-owned physical browser state must not hit the global compatibility registry"
+        );
         Ok(())
     }
 

@@ -328,7 +328,7 @@ BrowserUseRuntime
       backends.
 - [x] Move session-layer capture ownership out of process-global capture state
       for runtime-created browser backends.
-- [ ] Store the concrete browser registries directly on `BrowserHandle` rather
+- [x] Store the concrete browser registries directly on `BrowserHandle` rather
       than on the runtime browser backend resource.
 - [x] Make browser tools resolve a `BrowserHandle`, not only a `session_id`.
 - [x] Enforce one running agent per browser.

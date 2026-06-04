@@ -446,8 +446,7 @@ fn browser_backend_for_runtime_or_config(
                             profile_id: Some(session_id.as_str().to_string()),
                         },
                     )?;
-                    let session_registry = browser_use_browser::BrowserSessionRegistry::new();
-                    let script_registry = browser_use_browser::BrowserScriptRunRegistry::new();
+                    let browser_registries = handle.browser_physical_registries(&browser_id)?;
                     Ok(RuntimeBrowserBackend {
                         session_id: session_id.as_str().to_string(),
                         runtime: handle.clone(),
@@ -456,8 +455,8 @@ fn browser_backend_for_runtime_or_config(
                         backend: Arc::new(
                             crate::tools::handlers::browser::RealBackend::with_browser_mode_and_registries(
                                 config.options.browser_mode.clone(),
-                                session_registry,
-                                script_registry,
+                                browser_registries.session_registry(),
+                                browser_registries.script_registry(),
                             ),
                         ),
                     })
