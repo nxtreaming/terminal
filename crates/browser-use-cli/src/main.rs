@@ -5255,6 +5255,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
     Ok(result)
 }
 
+#[cfg(test)]
 fn cleanup_dataset_browser_session(store: &Store, session_id: &str) -> Result<usize> {
     let removed_sessions = browser_use_browser::cleanup_session(session_id);
     store.append_event(
@@ -7323,6 +7324,10 @@ command = "test-mcp"
         assert_eq!(
             store.agent_summary_for_child(&child.id)?.unwrap().status,
             "closed"
+        );
+        assert_eq!(
+            store.load_session(&child.id)?.unwrap().status,
+            browser_use_protocol::SessionStatus::Cancelled
         );
         let child_events = store.events_for_session(&child.id)?;
         assert!(child_events

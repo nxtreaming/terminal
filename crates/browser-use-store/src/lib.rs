@@ -1202,6 +1202,11 @@ fn status_for_event(event_type: &str, payload: &Value) -> Option<SessionStatus> 
         "session.done" => Some(SessionStatus::Done),
         "session.failed" => Some(SessionStatus::Failed),
         "session.cancelled" => Some(SessionStatus::Cancelled),
+        "agent.closed"
+            if payload.get("cancelled_active_run").and_then(Value::as_bool) == Some(true) =>
+        {
+            Some(SessionStatus::Cancelled)
+        }
         "session.status" => payload
             .get("status")
             .and_then(Value::as_str)
@@ -1486,6 +1491,30 @@ mod tests {
         let events = store.events_for_session(&session.id)?;
         assert_eq!(events[2].event_type, "session.cancel_requested");
         assert_eq!(events[3].event_type, "session.cancelled");
+        Ok(())
+    }
+
+    #[test]
+    fn agent_closed_with_active_cancel_projects_cancelled_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, "/tmp")?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "start child"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "agent.closed",
+            serde_json::json!({
+                "reason": "closed by close_agent",
+                "cancelled_active_run": true,
+            }),
+        )?;
+
+        let session = store.load_session(&session.id)?.expect("session");
+        assert_eq!(session.status, SessionStatus::Cancelled);
         Ok(())
     }
 

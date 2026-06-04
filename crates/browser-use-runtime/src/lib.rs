@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use browser_use_protocol::{EventRecord, SessionMeta};
+use browser_use_protocol::{EventRecord, SessionMeta, SessionStatus};
 use browser_use_store::{AgentSummary, Store};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -432,7 +432,7 @@ pub trait StateIndex: Send + Sync {
         child_session_id: &SessionId,
         status: SpawnEdgeStatus,
     ) -> Result<()>;
-    fn close_spawn_edge(&self, child_session_id: &SessionId) -> Result<()>;
+    fn close_spawn_edge(&self, child_session_id: &SessionId, reason: &str) -> Result<()>;
     fn list_children(&self, parent_session_id: &SessionId) -> Result<Vec<SpawnEdge>>;
     fn list_descendants(&self, root_session_id: &SessionId) -> Result<Vec<SpawnEdge>>;
 }
@@ -989,13 +989,19 @@ impl StateIndex for MemoryJournal {
         Ok(())
     }
 
-    fn close_spawn_edge(&self, child_session_id: &SessionId) -> Result<()> {
+    fn close_spawn_edge(&self, child_session_id: &SessionId, _reason: &str) -> Result<()> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(edge) = inner.edges.get_mut(child_session_id.as_str()) {
             edge.status = SpawnEdgeStatus::Closed;
+        }
+        if let Some(session) = inner.sessions.get_mut(child_session_id.as_str()) {
+            if session.status.is_active() {
+                session.status = SessionStatus::Cancelled;
+                session.updated_ms = now_ms();
+            }
         }
         Ok(())
     }
@@ -1199,12 +1205,12 @@ impl StateIndex for SqliteJournal {
         store.set_child_agent_status(edge.child_session_id.as_str(), "open")
     }
 
-    fn close_spawn_edge(&self, child_session_id: &SessionId) -> Result<()> {
+    fn close_spawn_edge(&self, child_session_id: &SessionId, reason: &str) -> Result<()> {
         let store = self
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.set_child_agent_status(child_session_id.as_str(), "closed")
+        store.close_child_agent(child_session_id.as_str(), reason)
     }
 
     fn finish_spawn_edge(
@@ -3446,7 +3452,8 @@ impl BrowserUseRuntime {
             if closing.parent_agent_id.is_some() {
                 let control = self.agents.control_for_thread(closing)?;
                 control.scheduler.close_spawned_agent(&closing.agent_id);
-                self.state_index.close_spawn_edge(&closing.session_id)?;
+                self.state_index
+                    .close_spawn_edge(&closing.session_id, &reason)?;
                 closed_live_edge_sessions.insert(closing.session_id.clone());
             }
             closing.set_status(AgentThreadStatus::Closed);
@@ -3455,7 +3462,8 @@ impl BrowserUseRuntime {
         }
         for child_session_id in edge_session_ids_to_close {
             if !closed_live_edge_sessions.contains(&child_session_id) {
-                self.state_index.close_spawn_edge(&child_session_id)?;
+                self.state_index
+                    .close_spawn_edge(&child_session_id, &reason)?;
             }
         }
         if let Some(parent_agent_id) = thread.parent_agent_id.as_ref() {
@@ -4505,8 +4513,8 @@ mod tests {
             self.inner.finish_spawn_edge(child_session_id, status)
         }
 
-        fn close_spawn_edge(&self, child_session_id: &SessionId) -> Result<()> {
-            self.inner.close_spawn_edge(child_session_id)
+        fn close_spawn_edge(&self, child_session_id: &SessionId, reason: &str) -> Result<()> {
+            self.inner.close_spawn_edge(child_session_id, reason)
         }
 
         fn list_children(&self, parent_session_id: &SessionId) -> Result<Vec<SpawnEdge>> {
