@@ -1272,14 +1272,28 @@ impl AgentMailbox {
         self.seq_tx.subscribe()
     }
 
-    pub fn enqueue(&self, mut item: MailboxItem) -> u64 {
+    pub fn prepare_item(&self, mut item: MailboxItem) -> MailboxItem {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.next_seq = state.next_seq.saturating_add(1);
         item.seq = state.next_seq;
+        item
+    }
+
+    pub fn enqueue(&self, item: MailboxItem) -> u64 {
+        let item = self.prepare_item(item);
+        self.enqueue_prepared(item)
+    }
+
+    pub fn enqueue_prepared(&self, item: MailboxItem) -> u64 {
         let seq = item.seq;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.next_seq = state.next_seq.max(seq);
         state.queue.push_back(item);
         drop(state);
         let _ = self.seq_tx.send(seq);
@@ -1323,6 +1337,20 @@ impl AgentMailbox {
             .queue
             .iter()
             .any(|item| item.delivery_phase == delivery_phase)
+    }
+
+    pub fn pending_items_for_phase(
+        &self,
+        delivery_phase: MailboxDeliveryPhase,
+    ) -> Vec<MailboxItem> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .iter()
+            .filter(|item| item.delivery_phase == delivery_phase)
+            .cloned()
+            .collect()
     }
 
     pub fn has_pending_trigger_turn_phase(&self, delivery_phase: MailboxDeliveryPhase) -> bool {
@@ -1411,11 +1439,26 @@ fn target_matches(item: &MailboxItem, target: &AgentTarget) -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum AgentThreadStatus {
     Created,
+    Queued,
     Running,
+    Cancelling,
     Completed,
     Failed,
     Cancelled,
     Closed,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AgentLiveStateSnapshot {
+    pub accepted_input_count: usize,
+    pub accepted_followup_count: usize,
+    pub pending_mailbox_count: usize,
+    pub pending_trigger_turn_count: usize,
+    pub last_enqueued_mailbox_seq: u64,
+    pub last_delivered_mailbox_seq: u64,
+    pub last_consumed_mailbox_seq: u64,
+    pub current_run_id: Option<RunId>,
+    pub cancellation_requested: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1430,6 +1473,7 @@ pub struct AgentThreadSnapshot {
     pub nickname: Option<String>,
     pub role: Option<String>,
     pub status: AgentThreadStatus,
+    pub live: AgentLiveStateSnapshot,
 }
 
 type AgentResourceCleanup = Arc<dyn Fn(Arc<dyn Any + Send + Sync>) -> usize + Send + Sync>;
@@ -1522,6 +1566,94 @@ impl AgentResourceSet {
     }
 }
 
+#[derive(Default)]
+struct AgentLiveState {
+    inner: Mutex<AgentLiveStateSnapshot>,
+}
+
+impl AgentLiveState {
+    fn snapshot(&self) -> AgentLiveStateSnapshot {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn begin_run(&self, run_id: RunId) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.current_run_id = Some(run_id);
+        state.cancellation_requested = false;
+    }
+
+    fn request_cancel(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancellation_requested = true;
+    }
+
+    fn finish_run(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current_run_id = None;
+    }
+
+    fn record_accepted_input(&self, item: &MailboxItem) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match item.kind {
+            MailboxItemKind::Followup => {
+                state.accepted_followup_count = state.accepted_followup_count.saturating_add(1);
+            }
+            MailboxItemKind::Input => {
+                state.accepted_input_count = state.accepted_input_count.saturating_add(1);
+            }
+            MailboxItemKind::Completion | MailboxItemKind::Notification => {}
+        }
+    }
+
+    fn record_mailbox_enqueued(&self, item: &MailboxItem) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending_mailbox_count = state.pending_mailbox_count.saturating_add(1);
+        if item.trigger_turn {
+            state.pending_trigger_turn_count = state.pending_trigger_turn_count.saturating_add(1);
+        }
+        state.last_enqueued_mailbox_seq = state.last_enqueued_mailbox_seq.max(item.seq);
+    }
+
+    fn record_mailbox_delivered(&self, items: &[MailboxItem]) {
+        let max_seq = items.iter().map(|item| item.seq).max().unwrap_or_default();
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.last_delivered_mailbox_seq = state.last_delivered_mailbox_seq.max(max_seq);
+    }
+
+    fn record_mailbox_consumed(&self, items: &[MailboxItem]) {
+        let max_seq = items.iter().map(|item| item.seq).max().unwrap_or_default();
+        let trigger_count = items.iter().filter(|item| item.trigger_turn).count();
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending_mailbox_count = state.pending_mailbox_count.saturating_sub(items.len());
+        state.pending_trigger_turn_count = state
+            .pending_trigger_turn_count
+            .saturating_sub(trigger_count);
+        state.last_consumed_mailbox_seq = state.last_consumed_mailbox_seq.max(max_seq);
+    }
+}
+
 pub struct AgentThread {
     agent_id: AgentId,
     session_id: SessionId,
@@ -1535,6 +1667,7 @@ pub struct AgentThread {
     status_tx: watch::Sender<AgentThreadStatus>,
     mailbox: AgentMailbox,
     resources: AgentResourceSet,
+    live_state: AgentLiveState,
 }
 
 impl AgentThread {
@@ -1563,6 +1696,7 @@ impl AgentThread {
             status_tx,
             mailbox: AgentMailbox::new(),
             resources: AgentResourceSet::default(),
+            live_state: AgentLiveState::default(),
         }
     }
 
@@ -1582,6 +1716,10 @@ impl AgentThread {
         &self.resources
     }
 
+    pub fn live_state_snapshot(&self) -> AgentLiveStateSnapshot {
+        self.live_state.snapshot()
+    }
+
     pub fn set_status(&self, status: AgentThreadStatus) {
         self.status_tx.send_replace(status);
     }
@@ -1598,6 +1736,7 @@ impl AgentThread {
             nickname: self.nickname.clone(),
             role: self.role.clone(),
             status: self.status_tx.borrow().clone(),
+            live: self.live_state.snapshot(),
         }
     }
 }
@@ -1992,6 +2131,31 @@ impl ProjectedRuntimeSubscription {
     }
 }
 
+pub struct ProjectedAgentSubscription {
+    agent_id: AgentId,
+    snapshot: AgentThreadSnapshot,
+    rx: broadcast::Receiver<RuntimeEvent>,
+}
+
+impl ProjectedAgentSubscription {
+    pub fn snapshot(&self) -> &AgentThreadSnapshot {
+        &self.snapshot
+    }
+
+    pub async fn recv(&mut self) -> Result<ProjectedEvent> {
+        loop {
+            match self.rx.recv().await {
+                Ok(event) if event.agent_id.as_ref() == Some(&self.agent_id) => {
+                    return Ok(RuntimeEventProjection::project(&event));
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => bail!("runtime event bus closed"),
+            }
+        }
+    }
+}
+
 pub struct RuntimeEventProjection;
 
 impl RuntimeEventProjection {
@@ -2065,18 +2229,67 @@ pub struct RuntimeHandle {
 
 #[derive(Clone, Debug)]
 pub struct RunAgentRequest {
+    pub agent_id: Option<AgentId>,
     pub session_id: SessionId,
     pub run_id: RunId,
+    pub provider_config: Option<Value>,
+    pub initial_input: Option<Value>,
+    pub browser_id: Option<BrowserId>,
+    pub cwd: Option<PathBuf>,
+    pub input_source: Option<String>,
+    pub resume_mode: ResumeMode,
     pub cancellation_token: CancellationToken,
 }
 
 impl RunAgentRequest {
     pub fn new(session_id: SessionId) -> Self {
         Self {
+            agent_id: None,
             session_id,
             run_id: RunId::new(),
+            provider_config: None,
+            initial_input: None,
+            browser_id: None,
+            cwd: None,
+            input_source: None,
+            resume_mode: ResumeMode::Continue,
             cancellation_token: CancellationToken::new(),
         }
+    }
+
+    pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
+        self.agent_id = Some(agent_id);
+        self
+    }
+
+    pub fn with_provider_config(mut self, provider_config: Value) -> Self {
+        self.provider_config = Some(provider_config);
+        self
+    }
+
+    pub fn with_initial_input(mut self, initial_input: Value) -> Self {
+        self.initial_input = Some(initial_input);
+        self
+    }
+
+    pub fn with_browser_id(mut self, browser_id: BrowserId) -> Self {
+        self.browser_id = Some(browser_id);
+        self
+    }
+
+    pub fn with_cwd(mut self, cwd: PathBuf) -> Self {
+        self.cwd = Some(cwd);
+        self
+    }
+
+    pub fn with_input_source(mut self, input_source: impl Into<String>) -> Self {
+        self.input_source = Some(input_source.into());
+        self
+    }
+
+    pub fn with_resume_mode(mut self, resume_mode: ResumeMode) -> Self {
+        self.resume_mode = resume_mode;
+        self
     }
 
     pub fn with_cancellation_token(mut self, cancellation_token: CancellationToken) -> Self {
@@ -2085,11 +2298,23 @@ impl RunAgentRequest {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeMode {
+    Continue,
+    Replay,
+    Fresh,
+}
+
 #[derive(Clone, Debug)]
 pub struct RunAgentResponse<T> {
     pub agent_id: AgentId,
     pub session_id: SessionId,
     pub run_id: RunId,
+    pub final_status: AgentThreadStatus,
+    pub final_result: Option<String>,
+    pub usage: Option<Value>,
+    pub terminal_event_seq: Option<i64>,
     pub output: T,
 }
 
@@ -2167,7 +2392,23 @@ impl RuntimeHandle {
     }
 
     pub fn cancel_run(&self, session_id: &SessionId) -> bool {
-        self.inner.active_runs.cancel(session_id)
+        let cancelled = self.inner.active_runs.cancel(session_id);
+        if cancelled {
+            if let Ok(thread) = self.inner.agents.thread_for_session(session_id) {
+                thread.set_status(AgentThreadStatus::Cancelling);
+                thread.live_state.request_cancel();
+                let mut event =
+                    RuntimeEvent::new(RuntimeEventKind::AgentCancelRequested, Durability::Barrier)
+                        .with_agent_id(thread.agent_id.clone())
+                        .with_session_id(thread.session_id.clone())
+                        .with_payload(json!({
+                            "runtime_owned": true,
+                        }));
+                event.root_id = Some(thread.root_id.clone());
+                let _ = self.inner.publish_after_barrier(event);
+            }
+        }
+        cancelled
     }
 
     pub async fn run_agent<T, Fut>(
@@ -2180,7 +2421,18 @@ impl RuntimeHandle {
         T: Send,
     {
         let thread = self.inner.agents.thread_for_session(&request.session_id)?;
+        if let Some(requested_agent_id) = request.agent_id.as_ref() {
+            if requested_agent_id != thread.agent_id() {
+                bail!(
+                    "run_agent agent/session mismatch: request agent {} maps to session {}, but runtime owns agent {}",
+                    requested_agent_id,
+                    request.session_id,
+                    thread.agent_id()
+                );
+            }
+        }
         let agent_id = thread.agent_id().clone();
+        thread.live_state.begin_run(request.run_id.clone());
         thread.set_status(AgentThreadStatus::Running);
 
         self.inner.publish_after_barrier(
@@ -2192,6 +2444,12 @@ impl RuntimeHandle {
                 .with_payload(json!({
                     "runtime_owned": true,
                     "run_id": request.run_id.as_str(),
+                    "provider_config": request.provider_config.clone(),
+                    "initial_input": request.initial_input.clone(),
+                    "browser_id": request.browser_id.as_ref().map(BrowserId::as_str),
+                    "cwd": request.cwd.as_ref().map(|cwd| cwd.display().to_string()),
+                    "input_source": request.input_source.clone(),
+                    "resume_mode": request.resume_mode.clone(),
                 })),
         )?;
         self.inner.publish_after_barrier(
@@ -2218,11 +2476,13 @@ impl RuntimeHandle {
         let output = match run.await {
             Ok(output) => output,
             Err(error) => {
-                thread.set_status(if request.cancellation_token.is_cancelled() {
+                let final_status = if request.cancellation_token.is_cancelled() {
                     AgentThreadStatus::Cancelled
                 } else {
                     AgentThreadStatus::Failed
-                });
+                };
+                thread.set_status(final_status);
+                thread.live_state.finish_run();
                 self.inner.publish_after_barrier(
                     RuntimeEvent::new(RuntimeEventKind::AgentTurnAborted, Durability::Barrier)
                         .with_agent_id(agent_id.clone())
@@ -2241,7 +2501,8 @@ impl RuntimeHandle {
         };
 
         thread.set_status(AgentThreadStatus::Completed);
-        self.inner.publish_after_barrier(
+        thread.live_state.finish_run();
+        let terminal_append = self.inner.publish_after_barrier(
             RuntimeEvent::new(RuntimeEventKind::AgentTurnCompleted, Durability::Barrier)
                 .with_agent_id(agent_id.clone())
                 .with_session_id(request.session_id.clone())
@@ -2257,6 +2518,10 @@ impl RuntimeHandle {
             agent_id,
             session_id: request.session_id,
             run_id: request.run_id,
+            final_status: AgentThreadStatus::Completed,
+            final_result: None,
+            usage: None,
+            terminal_event_seq: terminal_append.seq,
             output,
         })
     }
@@ -2312,8 +2577,19 @@ impl RuntimeHandle {
         self.inner.snapshot()
     }
 
+    pub fn snapshot_agent(&self, agent_id: &AgentId) -> Result<AgentThreadSnapshot> {
+        Ok(self.inner.agents.thread(agent_id)?.snapshot())
+    }
+
     pub fn subscribe_projected(&self) -> ProjectedRuntimeSubscription {
         self.inner.subscribe_projected()
+    }
+
+    pub fn subscribe_agent_projection(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<ProjectedAgentSubscription> {
+        self.inner.subscribe_agent_projection(agent_id)
     }
 
     pub fn create_root_agent(&self, request: CreateRootAgentRequest) -> Result<Arc<AgentThread>> {
@@ -2462,6 +2738,18 @@ impl BrowserUseRuntime {
         let rx = self.events.subscribe();
         let snapshot = self.snapshot();
         ProjectedRuntimeSubscription { snapshot, rx }
+    }
+
+    pub fn subscribe_agent_projection(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<ProjectedAgentSubscription> {
+        let thread = self.agents.thread(&agent_id)?;
+        Ok(ProjectedAgentSubscription {
+            agent_id,
+            snapshot: thread.snapshot(),
+            rx: self.events.subscribe(),
+        })
     }
 
     pub fn publish_after_barrier(&self, event: RuntimeEvent) -> Result<JournalAppend> {
@@ -2744,7 +3032,7 @@ impl BrowserUseRuntime {
                 "status": notification_status,
             })
         );
-        let mailbox_item = MailboxItem {
+        let mailbox_item = parent.mailbox.prepare_item(MailboxItem {
             seq: 0,
             id: Uuid::new_v4().simple().to_string(),
             kind: MailboxItemKind::Completion,
@@ -2763,7 +3051,7 @@ impl BrowserUseRuntime {
                 "result": terminal_text,
                 "runtime_owned": true,
             }),
-        };
+        });
         let mut mailbox_event =
             RuntimeEvent::new(RuntimeEventKind::MailboxEnqueued, Durability::Barrier)
                 .with_session_id(parent.session_id.clone())
@@ -2789,7 +3077,8 @@ impl BrowserUseRuntime {
                 SpawnEdgeStatus::Failed
             },
         )?;
-        parent.mailbox.enqueue(mailbox_item);
+        parent.mailbox.enqueue_prepared(mailbox_item.clone());
+        parent.live_state.record_mailbox_enqueued(&mailbox_item);
         self.events.publish(completed);
         self.events.publish(parent_terminal);
         self.events.publish(mailbox_event);
@@ -2875,7 +3164,7 @@ impl BrowserUseRuntime {
             &author.agent_path,
             &target.agent_path,
         );
-        let mailbox_item = MailboxItem {
+        let mailbox_item = target.mailbox.prepare_item(MailboxItem {
             seq: 0,
             id: Uuid::new_v4().simple().to_string(),
             kind: request.kind,
@@ -2886,7 +3175,7 @@ impl BrowserUseRuntime {
             trigger_turn: request.trigger_turn,
             delivery_phase: request.delivery_phase,
             payload,
-        };
+        });
         let mut mailbox_event =
             RuntimeEvent::new(RuntimeEventKind::MailboxEnqueued, Durability::Barrier)
                 .with_session_id(target.session_id.clone())
@@ -2899,9 +3188,8 @@ impl BrowserUseRuntime {
                 }));
         mailbox_event.root_id = Some(target.root_id.clone());
         self.append_runtime_event(&mailbox_event)?;
-        let seq = target.mailbox.enqueue(mailbox_item.clone());
-        let mut mailbox_item = mailbox_item;
-        mailbox_item.seq = seq;
+        target.mailbox.enqueue_prepared(mailbox_item.clone());
+        target.live_state.record_mailbox_enqueued(&mailbox_item);
         self.events.publish(mailbox_event);
         Ok(SendAgentMessageResponse { mailbox_item })
     }
@@ -2931,6 +3219,9 @@ impl BrowserUseRuntime {
             delivery_phase: request.delivery_phase,
             payload: request.payload,
         })?;
+        target
+            .live_state
+            .record_accepted_input(&response.mailbox_item);
         Ok(SubmitInputResponse {
             mailbox_item: response.mailbox_item,
         })
@@ -2976,9 +3267,23 @@ impl BrowserUseRuntime {
         request: DrainAgentMailboxRequest,
     ) -> Result<DrainAgentMailboxResponse> {
         let thread = self.agents.thread_for_session(&request.session_id)?;
-        let items = thread.mailbox.drain_phase(request.delivery_phase);
+        let items = thread
+            .mailbox
+            .pending_items_for_phase(request.delivery_phase);
         if !items.is_empty() {
-            let mut event =
+            let mut delivered =
+                RuntimeEvent::new(RuntimeEventKind::MailboxDelivered, Durability::Barrier)
+                    .with_session_id(thread.session_id.clone())
+                    .with_agent_id(thread.agent_id.clone())
+                    .with_payload(json!({
+                        "delivery_phase": request.delivery_phase,
+                        "count": items.len(),
+                        "mailbox_seqs": items.iter().map(|item| item.seq).collect::<Vec<_>>(),
+                        "mailbox_items": items.clone(),
+                    }));
+            delivered.root_id = Some(thread.root_id.clone());
+
+            let mut consumed =
                 RuntimeEvent::new(RuntimeEventKind::MailboxConsumed, Durability::Barrier)
                     .with_session_id(thread.session_id.clone())
                     .with_agent_id(thread.agent_id.clone())
@@ -2988,8 +3293,15 @@ impl BrowserUseRuntime {
                         "mailbox_seqs": items.iter().map(|item| item.seq).collect::<Vec<_>>(),
                         "mailbox_items": items.clone(),
                     }));
-            event.root_id = Some(thread.root_id.clone());
-            self.publish_after_barrier(event)?;
+            consumed.root_id = Some(thread.root_id.clone());
+
+            self.append_runtime_event(&delivered)?;
+            self.append_runtime_event(&consumed)?;
+            let drained = thread.mailbox.drain_phase(request.delivery_phase);
+            thread.live_state.record_mailbox_delivered(&drained);
+            thread.live_state.record_mailbox_consumed(&drained);
+            self.events.publish(delivered);
+            self.events.publish(consumed);
         }
         Ok(DrainAgentMailboxResponse {
             mailbox_items: items,
@@ -3849,8 +4161,14 @@ mod tests {
         let session_id_for_run = session_id.clone();
         let handle_for_run = handle.clone();
 
+        let request = RunAgentRequest::new(session_id.clone())
+            .with_agent_id(root.agent_id().clone())
+            .with_initial_input(json!({"text": "root task"}))
+            .with_input_source("test");
+        let run_id = request.run_id.clone();
+        let root_agent_id = root.agent_id().clone();
         let response = handle
-            .run_agent(RunAgentRequest::new(session_id.clone()), async move {
+            .run_agent(request, async move {
                 assert!(handle_for_run
                     .inner
                     .active_runs
@@ -3858,15 +4176,24 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .contains_key(&session_id_for_run));
+                let live = handle_for_run
+                    .snapshot_agent(&root_agent_id)
+                    .expect("agent snapshot")
+                    .live;
+                assert_eq!(live.current_run_id, Some(run_id));
                 Ok::<_, anyhow::Error>("done".to_string())
             })
             .await?;
 
         assert_eq!(response.agent_id, *root.agent_id());
         assert_eq!(response.session_id, session_id);
+        assert_eq!(response.final_status, AgentThreadStatus::Completed);
+        assert!(response.terminal_event_seq.is_some());
         assert_eq!(response.output, "done");
         assert!(!handle.cancel_run(root.session_id()));
-        assert_eq!(root.snapshot().status, AgentThreadStatus::Completed);
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.status, AgentThreadStatus::Completed);
+        assert_eq!(snapshot.live.current_run_id, None);
 
         let event_types = journal
             .events_for_session(root.session_id())?
@@ -4313,6 +4640,14 @@ mod tests {
             .find(|event| event.event_type == "mailbox.enqueued")
             .context("mailbox.enqueued event")?;
         assert_eq!(mailbox_event.payload["payload"]["trigger_turn"], false);
+        assert_eq!(
+            mailbox_event.payload["payload"]["mailbox_item"]["seq"],
+            sent.mailbox_item.seq
+        );
+        let live = root.live_state_snapshot();
+        assert_eq!(live.pending_mailbox_count, 1);
+        assert_eq!(live.pending_trigger_turn_count, 0);
+        assert_eq!(live.last_enqueued_mailbox_seq, sent.mailbox_item.seq);
 
         let err = handle
             .send_agent_message(SendAgentMessageRequest {
@@ -4364,6 +4699,11 @@ mod tests {
         );
         assert!(submitted.mailbox_item.payload["input_items"].is_array());
         assert_eq!(root.mailbox().pending_items().len(), 1);
+        let live = root.live_state_snapshot();
+        assert_eq!(live.accepted_followup_count, 1);
+        assert_eq!(live.pending_mailbox_count, 1);
+        assert_eq!(live.pending_trigger_turn_count, 1);
+        assert_eq!(live.last_enqueued_mailbox_seq, submitted.mailbox_item.seq);
 
         let root_events = journal.events_for_session(root.session_id())?;
         let mailbox_event = root_events
@@ -4374,6 +4714,27 @@ mod tests {
             mailbox_event.payload["payload"]["mailbox_item"]["id"],
             submitted.mailbox_item.id
         );
+        assert_eq!(
+            mailbox_event.payload["payload"]["mailbox_item"]["seq"],
+            submitted.mailbox_item.seq
+        );
+        let drained = handle.drain_agent_mailbox(DrainAgentMailboxRequest {
+            session_id: root.session_id().clone(),
+            delivery_phase: MailboxDeliveryPhase::CurrentTurn,
+        })?;
+        assert_eq!(drained.mailbox_items.len(), 1);
+        let live = root.live_state_snapshot();
+        assert_eq!(live.pending_mailbox_count, 0);
+        assert_eq!(live.pending_trigger_turn_count, 0);
+        assert_eq!(live.last_delivered_mailbox_seq, submitted.mailbox_item.seq);
+        assert_eq!(live.last_consumed_mailbox_seq, submitted.mailbox_item.seq);
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"mailbox.delivered".to_string()));
+        assert!(event_types.contains(&"mailbox.consumed".to_string()));
         Ok(())
     }
 
@@ -4411,6 +4772,7 @@ mod tests {
 
         assert!(err.to_string().contains("forced journal failure"));
         assert!(root.mailbox().pending_items().is_empty());
+        assert_eq!(root.live_state_snapshot().pending_mailbox_count, 0);
         assert!(journal
             .events_for_session(root.session_id())?
             .iter()
