@@ -2554,6 +2554,18 @@ pub struct RunAgentResponse<T> {
     pub output: T,
 }
 
+fn initial_input_source_event_seq(initial_input: &Value) -> Option<i64> {
+    initial_input
+        .get("source_event_seq")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            initial_input
+                .get("payload")
+                .and_then(|payload| payload.get("source_event_seq"))
+                .and_then(Value::as_i64)
+        })
+}
+
 impl RuntimeHandle {
     pub fn new(runtime: BrowserUseRuntime) -> Self {
         Self {
@@ -2765,6 +2777,19 @@ impl RuntimeHandle {
             .as_ref()
             .map(|browser_id| self.claim_browser(browser_id, agent_id.clone()))
             .transpose()?;
+
+        if let Some(initial_input) = request.initial_input.clone() {
+            if let Err(error) = self.inner.accept_prompt_input(AcceptPromptInputRequest {
+                target_agent_id: agent_id.clone(),
+                source_event_seq: initial_input_source_event_seq(&initial_input),
+                payload: initial_input,
+            }) {
+                if let Some(lease) = browser_lease.as_ref() {
+                    self.release_browser(lease)?;
+                }
+                return Err(error);
+            }
+        }
 
         if let Err(error) = self.inner.publish_after_barrier(
             RuntimeEvent::new(RuntimeEventKind::AgentStarted, Durability::Barrier)
@@ -5047,6 +5072,8 @@ mod tests {
                     .expect("agent snapshot")
                     .live;
                 assert_eq!(live.current_run_id, Some(run_id));
+                assert_eq!(live.accepted_input_count, 1);
+                assert_eq!(live.pending_prompt_input_count, 1);
                 Ok::<_, anyhow::Error>("done".to_string())
             })
             .await?;
@@ -5066,6 +5093,7 @@ mod tests {
             .into_iter()
             .map(|event| event.event_type)
             .collect::<Vec<_>>();
+        assert!(event_types.contains(&"agent.input.accepted".to_string()));
         assert!(event_types.contains(&"agent.started".to_string()));
         assert!(event_types.contains(&"agent.turn.started".to_string()));
         assert!(event_types.contains(&"agent.turn.completed".to_string()));

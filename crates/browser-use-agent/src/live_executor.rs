@@ -7,9 +7,9 @@ use std::thread;
 use anyhow::{anyhow, Context, Result};
 use browser_use_protocol::EventRecord;
 use browser_use_runtime::{
-    AcceptPromptInputRequest, AgentId, AttachChildAgentRequest, AttachRootAgentRequest,
-    BrowserId as RuntimeBrowserId, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
-    RunAgentRequest, RuntimeHandle, SessionId as RuntimeSessionId,
+    AgentId, AttachChildAgentRequest, AttachRootAgentRequest, BrowserId as RuntimeBrowserId,
+    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RunAgentRequest, RuntimeHandle,
+    SessionId as RuntimeSessionId,
 };
 use browser_use_store::{Store, StoreNotifier};
 use serde_json::json;
@@ -163,7 +163,15 @@ impl RuntimeAgentExecutor {
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
         )?;
-        accept_latest_durable_prompt_input(&self.inner.runtime, &store, &request.session_id)?;
+        let initial_input =
+            latest_durable_prompt_input_event(&store, &request.session_id)?.map(|event| {
+                json!({
+                    "source": "durable_prompt_input",
+                    "event_type": event.event_type,
+                    "source_event_seq": event.seq,
+                    "payload": event.payload,
+                })
+            });
         let session_meta = store
             .load_session(&request.session_id)?
             .with_context(|| format!("unknown session id: {}", request.session_id))?;
@@ -193,6 +201,11 @@ impl RuntimeAgentExecutor {
                     .with_cwd(run_cwd.clone())
                     .with_input_source("runtime_agent_executor")
                     .with_cancellation_token(cancel.clone());
+                let runtime_request = if let Some(initial_input) = initial_input.clone() {
+                    runtime_request.with_initial_input(initial_input)
+                } else {
+                    runtime_request
+                };
                 let runtime_request = if let Some(browser_id) = request.browser_id.clone() {
                     runtime_request.with_browser_id(browser_id)
                 } else {
@@ -278,26 +291,6 @@ impl RuntimeAgentExecutor {
             .context("spawn live agent executor thread")?;
         Ok(())
     }
-}
-
-fn accept_latest_durable_prompt_input(
-    runtime: &RuntimeHandle,
-    store: &Store,
-    session_id: &str,
-) -> Result<()> {
-    let Some(event) = latest_durable_prompt_input_event(store, session_id)? else {
-        return Ok(());
-    };
-    let payload = json!({
-        "source": "durable_prompt_input",
-        "event_type": event.event_type,
-    });
-    let _ = runtime.accept_prompt_input(AcceptPromptInputRequest {
-        target_agent_id: AgentId::from_string(session_id.to_string())?,
-        source_event_seq: Some(event.seq),
-        payload,
-    })?;
-    Ok(())
 }
 
 fn latest_durable_prompt_input_event(
@@ -454,8 +447,8 @@ mod tests {
         Ok(BrowserUseRuntime::new(persistence, state_index).handle())
     }
 
-    #[test]
-    fn durable_prompt_input_is_accepted_once_without_mailbox() -> Result<()> {
+    #[tokio::test]
+    async fn durable_prompt_input_is_accepted_once_without_mailbox() -> Result<()> {
         let dir = TempDir::new()?;
         let store = Store::open(dir.path())?;
         let session = store.create_session(None, Path::new("/work"))?;
@@ -467,20 +460,58 @@ mod tests {
         let runtime = sqlite_runtime(dir.path())?;
         ensure_agent_attached(&runtime, &store, &session.id, 3)?;
 
-        accept_latest_durable_prompt_input(&runtime, &store, &session.id)?;
+        let runtime_session_id = RuntimeSessionId::from_string(session.id.clone())?;
+        let agent_id = AgentId::from_string(session.id.clone())?;
+        let initial_input = json!({
+            "source": "durable_prompt_input",
+            "event_type": input.event_type,
+            "source_event_seq": input.seq,
+            "payload": input.payload,
+        });
+        let runtime_for_run = runtime.clone();
+        let runtime_session_id_for_run = runtime_session_id.clone();
+        runtime
+            .run_agent(
+                RunAgentRequest::new(runtime_session_id.clone())
+                    .with_agent_id(agent_id.clone())
+                    .with_initial_input(initial_input.clone()),
+                async move {
+                    let thread = runtime_for_run.agents().thread(&agent_id)?;
+                    assert!(thread.mailbox().pending_items().is_empty());
+                    let live = thread.live_state_snapshot();
+                    assert_eq!(live.accepted_input_count, 1);
+                    assert_eq!(live.pending_prompt_input_count, 1);
+                    assert_eq!(live.last_accepted_prompt_input_seq, input.seq);
+                    let consumed = runtime_for_run
+                        .consume_prompt_input_for_session(&runtime_session_id_for_run)?;
+                    assert!(consumed.consumed);
+                    Ok::<_, anyhow::Error>(())
+                },
+            )
+            .await?;
+
         let agent_id = AgentId::from_string(session.id.clone())?;
         let thread = runtime.agents().thread(&agent_id)?;
         assert!(thread.mailbox().pending_items().is_empty());
-        let live = thread.live_state_snapshot();
-        assert_eq!(live.accepted_input_count, 1);
-        assert_eq!(live.pending_prompt_input_count, 1);
-        assert_eq!(live.last_accepted_prompt_input_seq, input.seq);
 
-        let consumed = runtime.consume_prompt_input_for_session(&RuntimeSessionId::from_string(
-            session.id.clone(),
-        )?)?;
-        assert!(consumed.consumed);
-        accept_latest_durable_prompt_input(&runtime, &store, &session.id)?;
+        let runtime_for_rerun = runtime.clone();
+        let runtime_session_id_for_rerun = runtime_session_id.clone();
+        runtime
+            .run_agent(
+                RunAgentRequest::new(runtime_session_id.clone())
+                    .with_agent_id(agent_id.clone())
+                    .with_initial_input(initial_input),
+                async move {
+                    let consumed = runtime_for_rerun
+                        .consume_prompt_input_for_session(&runtime_session_id_for_rerun)?;
+                    assert!(
+                        !consumed.consumed,
+                        "same durable input seq must not be re-accepted by run_agent"
+                    );
+                    Ok::<_, anyhow::Error>(())
+                },
+            )
+            .await?;
         let live = thread.live_state_snapshot();
         assert_eq!(live.accepted_input_count, 1);
         assert_eq!(live.pending_prompt_input_count, 0);
