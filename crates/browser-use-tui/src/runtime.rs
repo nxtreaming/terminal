@@ -6,8 +6,9 @@ use anyhow::{bail, Context, Result};
 use browser_use_agent::config_overrides::{
     load_mcp_servers_for_profile, resolve_agent_roles_for_profile,
     resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
-    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
-    ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderRunConfig,
+    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentCompletionHandler,
+    ChildAgentRunCompletion, ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides,
+    ProviderRunConfig,
 };
 use browser_use_agent::context::{
     typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
@@ -483,7 +484,7 @@ fn notify_tui_child_completion(
     runtime_handle: &RuntimeHandle,
     state_dir: &Path,
     child_id: &str,
-    request: &ChildAgentRunRequest,
+    _request: &ChildAgentRunRequest,
     run_error: Option<&str>,
 ) {
     let completion = match run_error {
@@ -527,13 +528,6 @@ fn notify_tui_child_completion(
     };
     if let Err(error) = runtime_result {
         eprintln!("tui child agent completion runtime update failed: {error:#}");
-    } else {
-        return;
-    }
-    if let Some(handler) = request.completion_handler.clone() {
-        if let Err(error) = handler.notify(completion) {
-            eprintln!("tui child agent completion notification failed: {error:#}");
-        }
     }
 }
 
@@ -1205,6 +1199,63 @@ command = "test-mcp"
                 .snapshot()
                 .status,
             browser_use_runtime::AgentThreadStatus::Completed
+        );
+    }
+
+    #[test]
+    fn tui_child_completion_runtime_failure_does_not_call_legacy_handler() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = Store::open(&state_dir).unwrap();
+        let parent = store.create_session(None, &cwd).unwrap();
+        let runtime = tui_runtime_handle(&state_dir).unwrap();
+        ensure_tui_agent_attached(
+            &runtime,
+            &store,
+            &parent.id,
+            browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        )
+        .unwrap();
+        let handler_called = Arc::new(Mutex::new(false));
+        let handler_called_for_callback = Arc::clone(&handler_called);
+        let request = ChildAgentRunRequest {
+            parent_session_id: parent.id.clone(),
+            child_session_id: "00000000beef".to_string(),
+            run_id: Some("run-3".to_string()),
+            message: "Handle the missing child task".to_string(),
+            input_items: None,
+            input_is_inter_agent_communication: false,
+            agent_path: Some("/root/missing_worker".to_string()),
+            nickname: None,
+            role: None,
+            fork_turns: Some("none".to_string()),
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            config_overrides: Vec::new(),
+            completion_handler: Some(ChildAgentCompletionHandler::new(move |_| {
+                *handler_called_for_callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                Ok(())
+            })),
+        };
+
+        notify_tui_child_completion(
+            &runtime,
+            &state_dir,
+            &request.child_session_id,
+            &request,
+            None,
+        );
+
+        assert!(
+            !*handler_called
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "runtime-launched TUI child completion must not fall back to the legacy store handler"
         );
     }
 }
