@@ -5523,6 +5523,71 @@ mod tests {
     }
 
     #[test]
+    fn resume_marks_all_unclosed_tool_resources_lost_once() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = journal.create_thread(CreateThreadRequest {
+            session_id: Some(SessionId::from_string("root")?),
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(root.id)?;
+        for (event_type, payload) in [
+            (
+                "exec_command.begin",
+                json!({ "process_id": "exec-1", "session_id": 1 }),
+            ),
+            ("browser_script.started", json!({ "run_id": "browser-1" })),
+            ("python.started", json!({ "tool_call_id": "python-1" })),
+            ("mcp.tool.started", json!({ "tool_call_id": "mcp-1" })),
+        ] {
+            journal.append_session_event(&session_id, event_type, payload, Durability::Barrier)?;
+        }
+
+        for _ in 0..2 {
+            handle.attach_root_agent(AttachRootAgentRequest {
+                session_id: session_id.clone(),
+                cwd: PathBuf::from("/tmp"),
+                task: "resume".to_string(),
+                max_concurrent_threads_per_session: 4,
+            })?;
+        }
+
+        let mut lost = journal
+            .events_for_session(&session_id)?
+            .into_iter()
+            .filter(|event| event.event_type == "resource.lost")
+            .map(|event| {
+                (
+                    event.payload["payload"]["resource"]["kind"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    event.payload["payload"]["resource"]["id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        lost.sort();
+        assert_eq!(
+            lost,
+            vec![
+                ("browser_script".to_string(), "browser-1".to_string()),
+                ("exec_command".to_string(), "exec-1".to_string()),
+                ("mcp".to_string(), "mcp-1".to_string()),
+                ("python".to_string(), "python-1".to_string()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resume_does_not_mark_completed_exec_resources_lost() -> Result<()> {
         let (runtime, journal) = BrowserUseRuntime::memory();
         let handle = runtime.handle();

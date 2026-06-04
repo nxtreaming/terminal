@@ -77,10 +77,17 @@ BrowserUseRuntime
   agent snapshot.
 - Browser metadata leases exist in `BrowserManager`, including barrier tests for
   claim failure and same-browser ownership conflicts.
+- Runtime session resources are attached to the agent thread resource bag and
+  are cleaned on `close_agent`; provider tests guard the runtime path against
+  falling back to global exec/MCP/browser/Python resources.
 - The TUI projection cache overlays live session status from the runtime snapshot
   before calling `project_workbench`, so running/terminal runtime status can
   correct stale Store `SessionMeta` without mutating SQLite. Runtime `Created`
   does not resurrect a terminal Store session.
+- Replay marks stale live tool resources as lost/orphaned without resurrecting
+  process handles. This covers unclosed `exec_command`, `browser_script`,
+  Python, and MCP resource starts, and deduplicates `resource.lost` on repeated
+  attach/resume.
 
 ## What Is Still Not The Final Architecture
 
@@ -100,9 +107,11 @@ BrowserUseRuntime
 - `StoreNotificationWatcher` and `agent_messages` still exist for history,
   replay, and compatibility tests. The live runtime path has guards against
   using them, but the old storage surfaces are not removed.
-- `AgentThread.AgentResourceSet` exists, but unified exec, Python worker, MCP,
-  and browser script resources are not fully owned by a per-agent
-  `ToolResourceBag`.
+- `AgentThread.AgentResourceSet` is the current tool-resource bag and owns
+  unified exec, Python worker, MCP client, and runtime browser backend resources
+  for runtime-attached sessions. It is still named/typed as a generic resource
+  set, and browser script ownership is still mediated through the provider-built
+  runtime browser backend rather than a richer `BrowserHandle`.
 - `BrowserManager` is still mostly a metadata/lease manager. Actual
   `browser_script` execution is not fully routed through a stateful
   `BrowserHandle` with script registry, artifacts, cancellation, and crash/lost
@@ -113,9 +122,10 @@ BrowserUseRuntime
   events for `Agent.stream()`, but a true `RuntimeEventProjection` state machine
   is not the TUI authority yet and projection is still mostly a typed event
   mapper rather than a complete state reducer.
-- Replay materialization restores important mailbox/live counters, but full
-  crash recovery still does not hydrate every durable graph field or explicitly
-  journal every stale live resource as lost/orphaned.
+- Replay materialization restores important mailbox/live counters and marks
+  common stale tool resources lost, but full crash recovery still does not
+  hydrate every durable graph field or make browser leases/script registries
+  first-class runtime resources.
 
 ## Verification Passed
 
