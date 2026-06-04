@@ -313,10 +313,10 @@ fn latest_runtime_or_store_durable_prompt_input_event(
     runtime_session_id: &RuntimeSessionId,
     store_session_id: &str,
 ) -> Result<Option<EventRecord>> {
-    if let Ok(events) = runtime.events_for_session(runtime_session_id) {
-        if let Some(event) = latest_durable_prompt_input_from_events(events) {
-            return Ok(Some(event));
-        }
+    if let Some(event) =
+        latest_durable_prompt_input_from_events(runtime.events_for_session(runtime_session_id)?)
+    {
+        return Ok(Some(event));
     }
     latest_durable_prompt_input_event(store, store_session_id)
 }
@@ -456,10 +456,11 @@ fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
 mod tests {
     use super::*;
     use browser_use_runtime::{
-        BrowserUseRuntime, CreateRootAgentRequest, Durability, LiveThreadPersistence,
-        SqliteJournal, StateIndex,
+        BrowserUseRuntime, CreateRootAgentRequest, CreateThreadRequest, Durability, JournalAppend,
+        JournalReader, JournalSink, LiveThreadPersistence, MemoryJournal, RuntimeEvent, SpawnEdge,
+        SpawnEdgeStatus, SqliteJournal, StateIndex,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tempfile::TempDir;
 
     fn sqlite_runtime(state_dir: &Path) -> Result<RuntimeHandle> {
@@ -476,6 +477,103 @@ mod tests {
             max_concurrent_threads_per_session: 3,
         })?;
         Ok(root.session_id().clone())
+    }
+
+    #[derive(Clone, Default)]
+    struct ReadFailingJournal {
+        inner: MemoryJournal,
+    }
+
+    impl JournalSink for ReadFailingJournal {
+        fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<JournalAppend> {
+            self.inner.append_runtime_event(event)
+        }
+
+        fn append_session_event(
+            &self,
+            session_id: &RuntimeSessionId,
+            event_type: &str,
+            payload: Value,
+            durability: Durability,
+        ) -> Result<JournalAppend> {
+            self.inner
+                .append_session_event(session_id, event_type, payload, durability)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl JournalReader for ReadFailingJournal {
+        fn load_session(
+            &self,
+            session_id: &RuntimeSessionId,
+        ) -> Result<Option<browser_use_protocol::SessionMeta>> {
+            self.inner.load_session(session_id)
+        }
+
+        fn list_sessions(&self) -> Result<Vec<browser_use_protocol::SessionMeta>> {
+            self.inner.list_sessions()
+        }
+
+        fn events_for_session(&self, _session_id: &RuntimeSessionId) -> Result<Vec<EventRecord>> {
+            Err(anyhow!("forced runtime read failure"))
+        }
+
+        fn events_after_seq(
+            &self,
+            _session_id: &RuntimeSessionId,
+            _after_seq: i64,
+        ) -> Result<Vec<EventRecord>> {
+            Err(anyhow!("forced runtime read failure"))
+        }
+    }
+
+    impl LiveThreadPersistence for ReadFailingJournal {
+        fn create_thread(
+            &self,
+            request: CreateThreadRequest,
+        ) -> Result<browser_use_protocol::SessionMeta> {
+            self.inner.create_thread(request)
+        }
+    }
+
+    impl StateIndex for ReadFailingJournal {
+        fn open_spawn_edge(&self, edge: SpawnEdge) -> Result<()> {
+            self.inner.open_spawn_edge(edge)
+        }
+
+        fn finish_spawn_edge(
+            &self,
+            child_session_id: &RuntimeSessionId,
+            status: SpawnEdgeStatus,
+        ) -> Result<()> {
+            self.inner.finish_spawn_edge(child_session_id, status)
+        }
+
+        fn close_spawn_edge(
+            &self,
+            child_session_id: &RuntimeSessionId,
+            reason: &str,
+        ) -> Result<()> {
+            self.inner.close_spawn_edge(child_session_id, reason)
+        }
+
+        fn list_children(&self, parent_session_id: &RuntimeSessionId) -> Result<Vec<SpawnEdge>> {
+            self.inner.list_children(parent_session_id)
+        }
+
+        fn list_descendants(&self, root_session_id: &RuntimeSessionId) -> Result<Vec<SpawnEdge>> {
+            self.inner.list_descendants(root_session_id)
+        }
+    }
+
+    fn runtime_with_read_failing_journal() -> RuntimeHandle {
+        let journal = Arc::new(ReadFailingJournal::default());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        BrowserUseRuntime::new(persistence, state_index).handle()
     }
 
     #[test]
@@ -537,6 +635,34 @@ mod tests {
 
         assert_eq!(selected.seq, store_input.seq);
         assert_eq!(selected.payload["text"], "store replay input");
+        Ok(())
+    }
+
+    #[test]
+    fn durable_prompt_input_runtime_read_failure_does_not_fall_back_to_store() -> Result<()> {
+        let store_dir = TempDir::new()?;
+        let store = Store::open(store_dir.path())?;
+        let session = store.create_session(None, Path::new("/work"))?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            json!({ "text": "store input must not be resurrected" }),
+        )?;
+
+        let runtime = runtime_with_read_failing_journal();
+        let runtime_session_id = create_runtime_root(&runtime, Path::new("/work"))?;
+        let error = latest_runtime_or_store_durable_prompt_input_event(
+            &runtime,
+            &store,
+            &runtime_session_id,
+            &session.id,
+        )
+        .expect_err("runtime read failures must fail closed");
+
+        assert!(
+            format!("{error:#}").contains("forced runtime read failure"),
+            "{error:#}"
+        );
         Ok(())
     }
 
