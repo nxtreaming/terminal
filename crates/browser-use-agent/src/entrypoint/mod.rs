@@ -59,7 +59,8 @@ use browser_use_protocol::EventRecord;
 use browser_use_runtime::{
     DrainAgentMailboxRequest as RuntimeDrainAgentMailboxRequest, Durability as RuntimeDurability,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItem as RuntimeMailboxItem,
-    MailboxItemKind as RuntimeMailboxItemKind, RuntimeHandle, SessionId as RuntimeSessionId,
+    MailboxItemKind as RuntimeMailboxItemKind, RunAgentRequest as RuntimeRunAgentRequest,
+    RuntimeHandle, SessionId as RuntimeSessionId,
 };
 use browser_use_store::Store;
 use serde_json::{json, Value};
@@ -2528,8 +2529,23 @@ pub async fn run_session_with_config_with_cancel_and_runtime(
     cancel: CancellationToken,
     runtime_handle: Option<RuntimeHandle>,
 ) -> anyhow::Result<SessionId> {
+    if let Some(runtime_handle) = runtime_handle.clone() {
+        let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+        let request = RuntimeRunAgentRequest::new(runtime_session_id)
+            .with_input_source("run_session_with_config_with_cancel_and_runtime")
+            .with_cancellation_token(cancel.clone());
+        let response = runtime_handle
+            .run_agent(
+                request,
+                RuntimeTurnDriver::new(store, session_id, config, cancel)
+                    .with_runtime_handle(Some(runtime_handle.clone()))
+                    .run(),
+            )
+            .await?;
+        return Ok(response.output);
+    }
     RuntimeTurnDriver::new(store, session_id, config, cancel)
-        .with_runtime_handle(runtime_handle)
+        .with_runtime_handle(None)
         .run()
         .await
 }
@@ -3154,6 +3170,43 @@ mod tests {
                 && e.payload.get("result").and_then(|v| v.as_str()) == Some("hi from fake")),
             "expected the fake assistant reply persisted; log={log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn config_facade_with_runtime_handle_enters_runtime_run_agent() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "do a thing").await;
+        let journal = Arc::new(SqliteJournal::open(dir.path()).expect("sqlite journal"));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).expect("session id"),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "do a thing".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+
+        let id = run_session_with_config_with_cancel_and_runtime(
+            Arc::clone(&store),
+            &session_id,
+            fake_config(),
+            CancellationToken::new(),
+            Some(runtime),
+        )
+        .await
+        .expect("runtime-backed config facade must run");
+        assert_eq!(id.as_str(), session_id);
+
+        let event_types = events(&store, &session_id)
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"agent.started".to_string()));
+        assert!(event_types.contains(&"agent.turn.started".to_string()));
+        assert!(event_types.contains(&"agent.turn.completed".to_string()));
     }
 
     #[tokio::test]
