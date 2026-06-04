@@ -4,7 +4,7 @@
 //! Parity:
 //! - Args struct: `core/src/tools/handlers/multi_agents_v2/spawn.rs:242-289`
 //!   `SpawnAgentArgs { message, task_name, agent_type, model, reasoning_effort,
-//!   service_tier, fork_turns }` (+ `deny_unknown_fields`).
+//!   fork_turns, fork_context }` (+ `deny_unknown_fields`).
 //! - `fork_turns` parse: same file `:256-289` — trimmed, default `"all"`;
 //!   `"none"` → no fork, `"all"` → full history, else a positive integer.
 //! - Tool spec: `core/src/tools/handlers/multi_agents_spec.rs:75-109`
@@ -87,7 +87,7 @@ pub struct SpawnAgentArgs {
     pub model: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip)]
     pub service_tier: Option<String>,
     #[serde(default)]
     pub fork_turns: Option<String>,
@@ -111,6 +111,12 @@ impl SpawnAgentArgs {
         ForkTurns::parse(self.fork_turns.as_deref())
     }
 
+    /// True when the request tries to change metadata that a full-history fork
+    /// inherits from its parent.
+    pub fn has_full_history_metadata_override(&self) -> bool {
+        self.role_name().is_some() || self.model.is_some() || self.reasoning_effort.is_some()
+    }
+
     /// The role name a caller requested, trimmed and non-empty (codex
     /// `spawn.rs:58-62`). `None` => the default role.
     pub fn role_name(&self) -> Option<&str> {
@@ -131,11 +137,6 @@ impl SpawnAgentArgs {
         if let Some(model) = self.model.as_deref() {
             if model.trim().is_empty() {
                 return Err("model override must not be empty".to_string());
-            }
-        }
-        if let Some(service_tier) = self.service_tier.as_deref() {
-            if service_tier.trim().is_empty() {
-                return Err("service_tier override must not be empty".to_string());
             }
         }
         if let Some(reasoning) = self.reasoning_effort.as_deref() {
@@ -227,7 +228,7 @@ pub fn spawn_agent_tool_spec() -> Value {
                 },
                 "fork_turns": {
                     "type": "string",
-                    "description": "`none`, `all`, or a positive integer. Defaults to `all`."
+                    "description": "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
                 },
                 "model": {
                     "type": "string",
@@ -236,10 +237,6 @@ pub fn spawn_agent_tool_spec() -> Value {
                 "reasoning_effort": {
                     "type": "string",
                     "description": "Optional reasoning-effort override for the new agent."
-                },
-                "service_tier": {
-                    "type": "string",
-                    "description": "Optional service-tier override for the new agent."
                 }
             }
         }

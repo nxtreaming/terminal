@@ -11,7 +11,8 @@
 //!   recorded for metadata.
 //! - role application: `core/src/agent/role.rs:38-83`.
 //! - EVENT-NOTIFY mailbox wait: `core/src/tools/handlers/multi_agents_v2/
-//!   wait.rs:151-159` (parent `rx.changed().await`, then drain).
+//!   wait.rs:151-159` (parent `rx.changed().await`; wait observes mail but
+//!   does not return child content directly).
 //! - child-completion fragment: `core/src/context/subagent_notification.rs`.
 //! - registry / `<subagents>`: `core/src/agent/registry.rs` + legacy
 //!   `environment_context_subagents_for_session`.
@@ -19,9 +20,7 @@
 //! BUDGET ACCOUNTING: codex tracks per-thread token usage and the parent reads
 //! children's usage when assembling context (legacy `multi_agent_usage_hint`).
 //! Here that is modeled directly: each child's reported output-token count is
-//! aggregated onto the parent's [`SubagentManager::child_usage_total`]. This is a
-//! deliberate, simplified addition (see the WP report's caveats), not a 1:1 copy
-//! of a single codex call site.
+//! aggregated onto the parent's [`SubagentManager::child_usage_total`].
 
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicU64;
@@ -30,6 +29,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use browser_use_providers::model_request_info_for_catalog;
+use browser_use_runtime::RuntimeError;
 use tokio::time::Duration;
 use tokio::time::Instant;
 
@@ -157,6 +157,8 @@ impl SubagentManager {
         spawner: Arc<dyn ChildSpawner>,
         role_registry: RoleRegistry,
         max_depth: i32,
+        // Root-inclusive session cap. Direct spawned-child capacity is computed
+        // inside the manager by subtracting the root thread exactly once.
         max_concurrent_threads_per_session: Option<usize>,
     ) -> Self {
         Self {
@@ -215,9 +217,14 @@ impl SubagentManager {
 
             args.validate_task_name().map_err(SubagentError)?;
             args.validate_overrides().map_err(SubagentError)?;
-            // Validate fork_turns up front (parity with codex rejecting bad values).
+            // Validate fork_turns up front, then normalize the common model
+            // shape where it asks for a role/model override but omits
+            // `fork_turns`. A full-history fork cannot change those inherited
+            // fields, so preserve the requested override by making it a
+            // non-forked child instead of surfacing a failed tool call.
             let fork_turns_mode = args.fork_turns_mode().map_err(SubagentError)?;
-            reject_full_history_spawn_overrides(&args, fork_turns_mode).map_err(SubagentError)?;
+            let (args, fork_turns_mode) =
+                normalize_full_history_metadata_spawn(args, fork_turns_mode);
 
             // 1. Depth metadata. Codex v2 keeps subagent tools available even at
             // `agent_max_depth`; it only disables older/v1 collaboration tools there.
@@ -227,9 +234,9 @@ impl SubagentManager {
             self.check_concurrent_thread_limit(reservations.paths.len())?;
 
             // 2. Apply requested model/reasoning overrides and the role layer
-            //    onto a copy of the parent's live config. Codex validates
-            //    model/reasoning before role layering, then resolves the final
-            //    service tier after the role may have replaced the model/tier.
+            //    onto a copy of the parent's live config. Full-history forks keep
+            //    the inherited config; partial/non-forking spawns may layer role
+            //    and metadata overrides.
             let mut config = parent.base_config.clone();
             let parent_service_tier = config.service_tier.clone();
             if let Some(service_tier) = &args.service_tier {
@@ -567,35 +574,36 @@ impl SubagentManager {
         let Some(limit) = self.max_concurrent_threads_per_session else {
             return Ok(());
         };
-        let live_threads = self
+        let max_open_spawned_agents = limit.saturating_sub(1);
+        let open_spawned_agents = self
             .registry
             .list_agents()
             .into_iter()
             .filter(|record| record.agent_path != ROOT_AGENT_PATH && record.status.is_live())
             .count()
             + reserved;
-        if live_threads >= limit {
-            return Err(SubagentError(format!(
-                "max_concurrent_threads_per_session limit reached ({limit})"
-            )));
+        if open_spawned_agents >= max_open_spawned_agents {
+            return Err(SubagentError(
+                RuntimeError::AgentLimitReached {
+                    limit: max_open_spawned_agents,
+                    open_spawned_agents,
+                }
+                .to_string(),
+            ));
         }
         Ok(())
     }
 }
 
-fn reject_full_history_spawn_overrides(
-    args: &SpawnAgentArgs,
+fn normalize_full_history_metadata_spawn(
+    mut args: SpawnAgentArgs,
     fork_turns_mode: ForkTurns,
-) -> Result<(), String> {
-    if matches!(fork_turns_mode, ForkTurns::All)
-        && (args.role_name().is_some() || args.model.is_some() || args.reasoning_effort.is_some())
-    {
-        return Err(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork."
-                .to_string(),
-        );
+) -> (SpawnAgentArgs, ForkTurns) {
+    if matches!(fork_turns_mode, ForkTurns::All) && args.has_full_history_metadata_override() {
+        args.fork_turns = Some("none".to_string());
+        return (args, ForkTurns::None);
     }
-    Ok(())
+    (args, fork_turns_mode)
 }
 
 fn apply_requested_spawn_agent_model_overrides(

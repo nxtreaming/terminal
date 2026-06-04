@@ -982,7 +982,7 @@ fn subagent_v2_definitions_match_codex_output_schema_surface() {
     assert_eq!(
         wait.input_schema["properties"]["timeout_ms"]["description"],
         serde_json::json!(
-            "Optional timeout in milliseconds. Defaults to 30000, min 10000, max 3600000."
+            "Optional timeout in milliseconds. Defaults to 300000, min 1, max 3600000."
         )
     );
     assert_eq!(
@@ -1034,6 +1034,29 @@ fn subagent_v2_spawn_schema_can_hide_metadata_fields() {
         spawn.output_schema.expect("spawn output schema")["required"],
         serde_json::json!(["task_name"])
     );
+}
+
+#[test]
+fn spawn_agent_descriptions_explain_root_inclusive_capacity() {
+    let options = definitions::SpawnAgentDefinitionOptions {
+        max_concurrent_threads_per_session: Some(3),
+        ..Default::default()
+    };
+    let v2 = definitions::spawn_agent_with_options(options.clone());
+    assert!(v2
+        .description
+        .contains("the root agent counts toward that cap"));
+    assert!(v2
+        .description
+        .contains("at most 2 spawned subagent(s) may be open concurrently"));
+
+    let v1 = definitions::spawn_agent_v1_with_options(options);
+    assert!(v1
+        .description
+        .contains("the root agent counts toward that cap"));
+    assert!(v1
+        .description
+        .contains("at most 2 spawned subagent(s) may be open concurrently"));
 }
 
 #[test]

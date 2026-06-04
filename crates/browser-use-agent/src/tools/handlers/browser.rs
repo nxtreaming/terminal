@@ -76,7 +76,7 @@ pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_conte
 
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
-const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
+const BROWSER_PREF_PROFILE_LABEL: &str = "browser.preference.profile_label";
 
 /// What the model wants the browser to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,23 +372,74 @@ pub trait BrowserBackend: Send + Sync {
 
     /// Cancel an in-flight run. Wraps `cancel_browser_script`.
     fn cancel_script(&self, session_id: &str, run_id: &str) -> anyhow::Result<BrowserScriptOutput>;
+
+    /// Update the preferred browser mode for backends that auto-connect before
+    /// browser actions. Test/fake backends can ignore this.
+    fn set_browser_mode(&self, _browser_mode: Option<String>) {}
+
+    /// Clean up backend-owned browser/session/script resources for a session.
+    fn cleanup_session(&self, _session_id: &str) -> usize {
+        0
+    }
 }
 
 /// Production backend: a thin delegation to `browser-use-browser`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RealBackend {
     browser_mode: Arc<Mutex<Option<String>>>,
+    session_registry: browser_use_browser::BrowserSessionRegistry,
+    script_registry: browser_use_browser::BrowserScriptRunRegistry,
+}
+
+impl Default for RealBackend {
+    fn default() -> Self {
+        Self {
+            browser_mode: Arc::new(Mutex::new(None)),
+            session_registry: browser_use_browser::BrowserSessionRegistry::global(),
+            script_registry: browser_use_browser::BrowserScriptRunRegistry::global(),
+        }
+    }
 }
 
 impl RealBackend {
     pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
         Self {
             browser_mode: Arc::new(Mutex::new(browser_mode)),
+            session_registry: browser_use_browser::BrowserSessionRegistry::global(),
+            script_registry: browser_use_browser::BrowserScriptRunRegistry::global(),
+        }
+    }
+
+    pub fn with_browser_mode_and_registries(
+        browser_mode: Option<String>,
+        session_registry: browser_use_browser::BrowserSessionRegistry,
+        script_registry: browser_use_browser::BrowserScriptRunRegistry,
+    ) -> Self {
+        Self {
+            browser_mode: Arc::new(Mutex::new(browser_mode)),
+            session_registry,
+            script_registry,
         }
     }
 
     pub fn with_shared_browser_mode(browser_mode: Arc<Mutex<Option<String>>>) -> Self {
-        Self { browser_mode }
+        Self {
+            browser_mode,
+            session_registry: browser_use_browser::BrowserSessionRegistry::global(),
+            script_registry: browser_use_browser::BrowserScriptRunRegistry::global(),
+        }
+    }
+
+    pub fn with_shared_browser_mode_and_registries(
+        browser_mode: Arc<Mutex<Option<String>>>,
+        session_registry: browser_use_browser::BrowserSessionRegistry,
+        script_registry: browser_use_browser::BrowserScriptRunRegistry,
+    ) -> Self {
+        Self {
+            browser_mode,
+            session_registry,
+            script_registry,
+        }
     }
 
     fn normalized_browser_mode(&self) -> Option<String> {
@@ -461,11 +512,14 @@ impl RealBackend {
         let Some(mode) = self.normalized_browser_mode() else {
             return Ok(Vec::new());
         };
-        let status = browser_use_browser::run_browser_command(
+        let status = browser_use_browser::run_browser_command_with_options_and_registries(
             session_id,
             cwd,
             artifact_dir,
             "browser status --json",
+            browser_use_browser::BrowserCommandOptions::default(),
+            &self.script_registry,
+            &self.session_registry,
         )?;
         let mut events = status.events;
         let connected =
@@ -477,11 +531,14 @@ impl RealBackend {
         else {
             return Ok(events);
         };
-        let mut started = browser_use_browser::run_browser_command(
+        let mut started = browser_use_browser::run_browser_command_with_options_and_registries(
             session_id,
             cwd,
             artifact_dir,
             desired_command,
+            browser_use_browser::BrowserCommandOptions::default(),
+            &self.script_registry,
+            &self.session_registry,
         )?;
         events.append(&mut started.events);
         Ok(events)
@@ -493,6 +550,16 @@ pub(crate) fn browser_command_is_passive(words: &[&str]) -> bool {
         words,
         ["browser", "status", ..]
             | ["status", ..]
+            | ["browser", "connect", ..]
+            | ["connect", ..]
+            | ["browser", "local", "list", ..]
+            | ["local", "list", ..]
+            | ["browser", "local", "profiles", ..]
+            | ["local", "profiles", ..]
+            | ["browser", "local", "open", ..]
+            | ["local", "open", ..]
+            | ["browser", "local", "setup", ..]
+            | ["local", "setup", ..]
             | ["browser", "runtime", "logs", ..]
             | ["runtime", "logs", ..]
             | ["browser", "runtime", "ownership", ..]
@@ -535,6 +602,12 @@ pub(crate) fn desired_browser_connect_command(
 }
 
 impl BrowserBackend for RealBackend {
+    fn set_browser_mode(&self, browser_mode: Option<String>) {
+        if let Ok(mut mode) = self.browser_mode.lock() {
+            *mode = browser_mode;
+        }
+    }
+
     fn command(
         &self,
         session_id: &str,
@@ -548,11 +621,14 @@ impl BrowserBackend for RealBackend {
             Vec::new()
         };
         let effective_command = self.rewrite_command_for_mode(command);
-        let mut output = browser_use_browser::run_browser_command(
+        let mut output = browser_use_browser::run_browser_command_with_options_and_registries(
             session_id,
             cwd,
             artifact_dir,
             &effective_command,
+            browser_use_browser::BrowserCommandOptions::default(),
+            &self.script_registry,
+            &self.session_registry,
         )?;
         if !events.is_empty() {
             events.append(&mut output.events);
@@ -570,12 +646,13 @@ impl BrowserBackend for RealBackend {
         timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
         let mut events = self.ensure_configured_browser(session_id, cwd, artifact_dir)?;
-        let mut output = browser_use_browser::run_browser_script(
+        let mut output = browser_use_browser::run_browser_script_with_session_registry(
             session_id,
             cwd,
             artifact_dir,
             code,
             timeout_secs,
+            &self.session_registry,
         )?;
         if !events.is_empty() {
             events.append(&mut output.browser_events);
@@ -593,12 +670,14 @@ impl BrowserBackend for RealBackend {
         timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
         let mut events = self.ensure_configured_browser(session_id, cwd, artifact_dir)?;
-        let mut output = browser_use_browser::start_browser_script(
+        let mut output = browser_use_browser::start_browser_script_with_registries(
             session_id,
             cwd,
             artifact_dir,
             code,
             timeout_secs,
+            &self.script_registry,
+            &self.session_registry,
         )?;
         if !events.is_empty() {
             events.append(&mut output.browser_events);
@@ -613,11 +692,28 @@ impl BrowserBackend for RealBackend {
         run_id: &str,
         observe_timeout_ms: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
-        browser_use_browser::observe_browser_script(session_id, run_id, observe_timeout_ms)
+        browser_use_browser::observe_browser_script_with_registry(
+            session_id,
+            run_id,
+            observe_timeout_ms,
+            &self.script_registry,
+        )
     }
 
     fn cancel_script(&self, session_id: &str, run_id: &str) -> anyhow::Result<BrowserScriptOutput> {
-        browser_use_browser::cancel_browser_script(session_id, run_id)
+        browser_use_browser::cancel_browser_script_with_registry(
+            session_id,
+            run_id,
+            &self.script_registry,
+        )
+    }
+
+    fn cleanup_session(&self, session_id: &str) -> usize {
+        browser_use_browser::cleanup_session_with_registries(
+            session_id,
+            &self.script_registry,
+            &self.session_registry,
+        )
     }
 }
 
@@ -702,19 +798,24 @@ fn dispatch_browser_profile_preference(
         Some("use") => {
             enforce_selected_browser_mode(selected_browser_mode, "local")?;
             let profile_id = args
-                .get(2)
-                .map(String::as_str)
+                .get(2..)
+                .filter(|parts| !parts.is_empty())
+                .map(|parts| parts.join(" "))
                 .ok_or_else(|| anyhow!("browser profile use requires <profile-id>"))?;
-            store.set_setting(BROWSER_PREF_PROFILE, profile_id)?;
+            let profile_label =
+                local_profile_label_for_id(backend, session_id, cwd, artifact_dir, &profile_id);
+            store.set_setting(BROWSER_PREF_PROFILE, &profile_id)?;
+            store.set_setting(BROWSER_PREF_PROFILE_LABEL, &profile_label)?;
             Ok(json!({
                 "status": "ok",
                 "profile_id": profile_id,
-                "next_step": browser_profile_connect_next_step("local", Some(profile_id)),
+                "profile_label": profile_label,
+                "default_profile_id": profile_id,
+                "message": format!("Default Chrome profile set to {profile_label}. You can change it anytime with /profile."),
+                "next_step": "browser connect local",
             }))
         }
         Some("remember") => {
-            let domain = option_value_core(args, "--domain")
-                .ok_or_else(|| anyhow!("browser profile remember requires --domain <domain>"))?;
             let profile_id = option_value_core(args, "--profile")
                 .or_else(|| args.get(2).cloned())
                 .ok_or_else(|| {
@@ -731,47 +832,27 @@ fn dispatch_browser_profile_preference(
                 .or_else(|| store.get_setting(BROWSER_PREF_MODE).ok().flatten())
                 .unwrap_or_else(|| "local".to_string());
             enforce_selected_browser_mode(selected_browser_mode, &mode)?;
-            let value = json!({
-                "domain": normalize_domain(&domain),
-                "mode": mode,
-                "profile_id": profile_id,
-            });
-            store.set_setting(
-                &browser_domain_profile_key(&domain),
-                &serde_json::to_string(&value)?,
-            )?;
-            store.set_setting(BROWSER_PREF_MODE, value["mode"].as_str().unwrap_or("local"))?;
-            store.set_setting(
-                BROWSER_PREF_PROFILE,
-                value["profile_id"].as_str().unwrap_or(""),
-            )?;
-            store.set_setting(
-                "browser",
-                browser_display_name(value["mode"].as_str().unwrap_or("local")),
-            )?;
-            let next_step = browser_profile_connect_next_step(
-                value["mode"].as_str().unwrap_or("local"),
-                value["profile_id"].as_str(),
-            );
+            let profile_label =
+                local_profile_label_for_id(backend, session_id, cwd, artifact_dir, &profile_id);
+            store.set_setting(BROWSER_PREF_PROFILE, &profile_id)?;
+            store.set_setting(BROWSER_PREF_PROFILE_LABEL, &profile_label)?;
             Ok(json!({
                 "status": "ok",
-                "remembered": value,
-                "next_step": next_step,
+                "mode": mode,
+                "profile_id": profile_id,
+                "profile_label": profile_label,
+                "default_profile_id": profile_id,
+                "message": format!("Default Chrome profile set to {profile_label}. You can change it anytime with /profile."),
+                "next_step": "browser connect local",
             }))
         }
         Some("forget") => {
-            let domain = option_value_core(args, "--domain")
-                .or_else(|| args.get(2).cloned())
-                .ok_or_else(|| anyhow!("browser profile forget requires --domain <domain>"))?;
-            store.delete_setting(&browser_domain_profile_key(&domain))?;
-            Ok(json!({ "status": "ok", "forgot_domain": normalize_domain(&domain) }))
+            store.delete_setting(BROWSER_PREF_PROFILE)?;
+            store.delete_setting(BROWSER_PREF_PROFILE_LABEL)?;
+            Ok(json!({ "status": "ok", "default_profile_id": null }))
         }
         Some("suggest") => {
             enforce_selected_browser_mode(selected_browser_mode, "local")?;
-            let domain = option_value_core(args, "--domain")
-                .or_else(|| args.get(2).cloned())
-                .ok_or_else(|| anyhow!("browser profile suggest requires --domain <domain>"))?;
-            let remembered = remembered_domain_profile(store, &domain)?;
             let profiles = backend
                 .command(
                     session_id,
@@ -787,21 +868,20 @@ fn dispatch_browser_profile_preference(
                         "profiles": [],
                     })
                 });
-            let next_step = remembered.as_ref().map_or_else(
-                || "Ask the user which profile to use, then run browser profile remember --domain <domain> --profile <profile-id>".to_string(),
-                |remembered| {
-                    browser_profile_connect_next_step(
-                        remembered["mode"].as_str().unwrap_or("local"),
-                        remembered["profile_id"].as_str(),
-                    )
-                },
-            );
+            let default_profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
+            let local_profiles = profiles
+                .get("local_profiles")
+                .or_else(|| profiles.get("profiles"))
+                .cloned()
+                .unwrap_or_else(|| json!([]));
             Ok(json!({
                 "status": "ok",
-                "domain": normalize_domain(&domain),
-                "remembered": remembered,
-                "local_profiles": profiles.get("profiles").cloned().unwrap_or_else(|| json!([])),
-                "next_step": next_step,
+                "default_profile_id": default_profile_id,
+                "local_profiles": local_profiles,
+                "profile_options": formatted_profile_options(&local_profiles),
+                "profile_choices": formatted_profile_choices(&local_profiles),
+                "user_prompt": default_profile_user_prompt(&local_profiles),
+                "next_step": "If default_profile_id is null, show user_prompt exactly and wait for the user's choice. Then run browser profile use <profile-id> before browser connect local.",
             }))
         }
         Some(other) => bail!("unknown browser profile command: {other}"),
@@ -836,46 +916,423 @@ fn resolve_browser_command_for_selected_mode(
     }
 }
 
-fn local_connect_profile_preflight(
-    has_stored_profile: bool,
+fn local_connect_default_profile_preflight(
+    has_default_profile: bool,
     backend: &dyn BrowserBackend,
     session_id: &str,
     cwd: &std::path::Path,
     artifact_dir: &std::path::Path,
     resolved_command: &str,
 ) -> anyhow::Result<Option<BrowserCommandOutput>> {
+    if !is_plain_local_connect_command(resolved_command) || has_default_profile {
+        return Ok(None);
+    }
+    let profiles = backend
+        .command(
+            session_id,
+            cwd,
+            artifact_dir,
+            "browser local profiles --json",
+        )
+        .map(|output| output.content)
+        .unwrap_or_else(|error| {
+            json!({
+                "status": "failed",
+                "error": format!("{error:#}"),
+                "profiles": [],
+            })
+        });
+    let local_profiles = profiles
+        .get("local_profiles")
+        .or_else(|| profiles.get("profiles"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Ok(Some(BrowserCommandOutput {
+        content: json!({
+            "status": "needs-user-action",
+            "reason": "No default local Chrome profile is set.",
+            "local_profiles": local_profiles,
+            "profile_options": formatted_profile_options(&local_profiles),
+            "profile_choices": formatted_profile_choices(&local_profiles),
+            "user_prompt": default_profile_user_prompt(&local_profiles),
+            "next_step": "Show user_prompt exactly and wait for the user's choice. Then run browser profile use <profile-id> and retry browser connect local.",
+        }),
+        events: Vec::new(),
+    }))
+}
+
+fn enrich_local_connect_recovery_with_default_profile(
+    mut output: BrowserCommandOutput,
+    resolved_command: &str,
+    default_profile_id: Option<&str>,
+) -> BrowserCommandOutput {
     if !is_plain_local_connect_command(resolved_command) {
-        return Ok(None);
+        return output;
     }
-    if has_stored_profile {
-        return Ok(None);
+    let Some(profile_id) = default_profile_id
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
+    else {
+        return output;
+    };
+    let Some(content) = output.content.as_object_mut() else {
+        return output;
+    };
+    let status = content
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if status != "blocked" {
+        return output;
     }
-    let Ok(profiles) = backend.command(
+    let state = content
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let quoted_profile = shell_quote_browser_arg(profile_id);
+    match state {
+        "stale-port" | "browser-not-running" => {
+            content.insert("default_profile_id".to_string(), json!(profile_id));
+            content.insert(
+                "profile_recovery_command".to_string(),
+                json!(format!("browser local open --profile {quoted_profile}")),
+            );
+            content.insert(
+                "next_step".to_string(),
+                json!(format!(
+                    "Run `browser local open --profile {quoted_profile}`, give Chrome a moment to start, then run `browser connect local`."
+                )),
+            );
+        }
+        "permission-blocked" => {
+            content.insert("default_profile_id".to_string(), json!(profile_id));
+            content.insert(
+                "next_step".to_string(),
+                json!(
+                    "Ask the user to click Allow in Chrome's 'Allow remote debugging?' popup, then run `browser connect local`. Do not run `browser local open` again while permission is pending; the selected profile was already opened before this connect attempt."
+                ),
+            );
+        }
+        "profile-target-missing" => {
+            content.insert("default_profile_id".to_string(), json!(profile_id));
+            content.insert(
+                "profile_recovery_command".to_string(),
+                json!(format!("browser local open --profile {quoted_profile}")),
+            );
+            content.insert(
+                "next_step".to_string(),
+                json!(format!(
+                    "Do not ask the user to open a Chrome profile manually. Run `browser local open --profile {quoted_profile}`, give Chrome a moment, then run `browser connect local` again. If this repeats, report that Chrome ignored the selected profile launch."
+                )),
+            );
+        }
+        _ => {}
+    }
+    output
+}
+
+fn open_default_profile_before_local_connect(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    resolved_command: &str,
+    default_profile_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if !is_plain_local_connect_command(resolved_command) {
+        return Ok(());
+    }
+    let Some(profile_id) = default_profile_id
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
+    else {
+        return Ok(());
+    };
+    if !local_profile_targeting_is_ambiguous(backend, session_id, cwd, artifact_dir)? {
+        return Ok(());
+    }
+    let command = format!(
+        "browser local open --profile {}",
+        shell_quote_browser_arg(profile_id)
+    );
+    backend.command(session_id, cwd, artifact_dir, &command)?;
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    Ok(())
+}
+
+fn ensure_browser_ready_for_work(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    desired_mode: &str,
+    desired_profile_id: Option<&str>,
+) -> anyhow::Result<()> {
+    match normalize_browser_preference_mode(desired_mode)? {
+        "local" => ensure_local_browser_ready_for_work(
+            backend,
+            session_id,
+            cwd,
+            artifact_dir,
+            desired_profile_id,
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn ensure_local_browser_ready_for_work(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    desired_profile_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(profile_id) = desired_profile_id
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let status = backend.command(session_id, cwd, artifact_dir, "browser status --json")?;
+    if local_browser_ready_for_profile(&status.content, profile_id) {
+        if let Ok(reattach) = backend.command(
+            session_id,
+            cwd,
+            artifact_dir,
+            "browser recover reattach-same-target",
+        ) {
+            if local_browser_ready_for_profile(&reattach.content, profile_id) {
+                return Ok(());
+            }
+        }
+    }
+
+    if browser_status_connection(&status.content) == Some("connected") {
+        if let Some(active_profile_id) = browser_status_local_profile_id(&status.content) {
+            if active_profile_id != profile_id {
+                open_selected_local_profile(backend, session_id, cwd, artifact_dir, profile_id)?;
+                let connect =
+                    backend.command(session_id, cwd, artifact_dir, "browser connect local")?;
+                if local_browser_ready_for_profile(&connect.content, profile_id) {
+                    return Ok(());
+                }
+                return Err(local_browser_not_ready_error(&connect.content));
+            }
+        }
+    }
+
+    open_selected_local_profile(backend, session_id, cwd, artifact_dir, profile_id)?;
+    let connect = backend.command(session_id, cwd, artifact_dir, "browser connect local")?;
+    if local_browser_ready_for_profile(&connect.content, profile_id) {
+        return Ok(());
+    }
+    Err(local_browser_not_ready_error(&connect.content))
+}
+
+fn open_selected_local_profile(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    profile_id: &str,
+) -> anyhow::Result<()> {
+    let command = format!(
+        "browser local open --profile {}",
+        shell_quote_browser_arg(profile_id)
+    );
+    backend.command(session_id, cwd, artifact_dir, &command)?;
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    Ok(())
+}
+
+fn local_browser_not_ready_error(content: &serde_json::Value) -> anyhow::Error {
+    let status = content
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let state = content
+        .get("state")
+        .or_else(|| content.get("loss_reason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let next_step = content
+        .get("next_step")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("follow the browser tool recovery instructions");
+    anyhow!(
+        "Browser work is blocked; do not answer the user's browser/search/page task from memory. local Chrome is not ready for the selected default profile before browser work; connect status: {status}; state: {state}; next_step: {next_step}"
+    )
+}
+
+fn local_browser_ready_for_profile(value: &serde_json::Value, profile_id: &str) -> bool {
+    browser_status_connection(value) == Some("connected")
+        && browser_status_target_id(value).is_some()
+        && browser_status_session_id(value).is_some()
+        && browser_status_local_profile_id(value) == Some(profile_id)
+}
+
+fn browser_status_local_profile_id(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("local_profile_id")
+        .or_else(|| value.pointer("/browser/local_profile_id"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn browser_status_connection(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("connection")
+        .or_else(|| value.pointer("/browser/connection"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn browser_status_target_id(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/page/target_id")
+        .or_else(|| value.pointer("/browser/page/target_id"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn browser_status_session_id(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/page/session_id")
+        .or_else(|| value.pointer("/browser/page/session_id"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn local_profile_targeting_is_ambiguous(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+) -> anyhow::Result<bool> {
+    let profiles = backend.command(
         session_id,
         cwd,
         artifact_dir,
         "browser local profiles --json",
-    ) else {
-        return Ok(None);
-    };
-    let local_profiles = profiles
-        .content
-        .get("profiles")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if local_profiles.len() <= 1 {
-        return Ok(None);
+    )?;
+    if profile_values(&profiles.content).take(2).count() <= 1 {
+        return Ok(false);
     }
-    Ok(Some(BrowserCommandOutput {
-        content: json!({
-            "status": "needs-user-action",
-            "reason": "Multiple local Chromium profiles are available. Ask the user which profile to use before connecting.",
-            "local_profiles": local_profiles,
-            "next_step": "Ask the user which profile to use, then run browser profile use <profile-id> before browser connect local.",
-        }),
-        events: Vec::new(),
-    }))
+
+    let local_state =
+        backend.command(session_id, cwd, artifact_dir, "browser local list --json")?;
+    Ok(has_reachable_local_candidate(&local_state.content))
+}
+
+fn has_reachable_local_candidate(value: &serde_json::Value) -> bool {
+    value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|candidate| {
+            candidate
+                .get("connectable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+}
+
+fn local_profile_label_for_id(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    profile_id: &str,
+) -> String {
+    backend
+        .command(
+            session_id,
+            cwd,
+            artifact_dir,
+            "browser local profiles --json",
+        )
+        .ok()
+        .and_then(|output| {
+            profile_values(&output.content).find_map(|profile| {
+                let id = profile.get("id").and_then(serde_json::Value::as_str)?;
+                if id == profile_id {
+                    Some(profile_display_label(profile))
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| profile_id.to_string())
+}
+
+fn formatted_profile_options(profiles: &serde_json::Value) -> Vec<String> {
+    profiles
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(idx, profile)| format!("{}) {}", idx + 1, profile_display_label(profile)))
+        .collect()
+}
+
+fn formatted_profile_choices(profiles: &serde_json::Value) -> Vec<serde_json::Value> {
+    profiles
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|profile| {
+            let id = profile.get("id").and_then(serde_json::Value::as_str)?;
+            Some(json!({
+                "label": profile_display_label(profile),
+                "profile_id": id,
+            }))
+        })
+        .collect()
+}
+
+fn default_profile_user_prompt(profiles: &serde_json::Value) -> String {
+    let options = formatted_profile_options(profiles);
+    if options.is_empty() {
+        return "No local Chrome profiles were found. You can change the default anytime with /profile.".to_string();
+    }
+    format!(
+        "Which Chrome profile should I set as the default for local browser access?\n\n{}\n\nThis will be the default from now on, and you can change it anytime with /profile.",
+        options.join("\n")
+    )
+}
+
+fn profile_values(value: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    value
+        .get("local_profiles")
+        .or_else(|| value.get("profiles"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn profile_display_label(profile: &serde_json::Value) -> String {
+    profile
+        .get("profile_name")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            profile
+                .get("display_name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            profile
+                .get("profile_dir")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| profile.get("id").and_then(serde_json::Value::as_str))
+        .map(clean_profile_label)
+        .unwrap_or_else(|| "Profile".to_string())
+}
+
+fn clean_profile_label(label: &str) -> String {
+    label
+        .trim()
+        .strip_prefix("Google Chrome - ")
+        .unwrap_or_else(|| label.trim())
+        .to_string()
 }
 
 fn is_plain_local_connect_command(command: &str) -> bool {
@@ -1024,25 +1481,11 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
                 .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
         })
         .unwrap_or_else(|| "local".to_string());
-    let profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
-    let domain_profiles = store
-        .list_settings()?
-        .into_iter()
-        .filter_map(|(key, value)| {
-            key.strip_prefix(BROWSER_DOMAIN_PROFILE_PREFIX)
-                .and_then(|domain| {
-                    serde_json::from_str::<Value>(&value)
-                        .ok()
-                        .map(|value| (domain.to_string(), value))
-                })
-        })
-        .map(|(domain, value)| json!({ "domain": domain, "preference": value }))
-        .collect::<Vec<_>>();
     Ok(json!({
         "mode": normalize_browser_preference_mode(&mode)?,
         "display": browser_display_name(normalize_browser_preference_mode(&mode)?),
-        "profile_id": profile_id,
-        "domain_profiles": domain_profiles,
+        "profile_id": store.get_setting(BROWSER_PREF_PROFILE)?,
+        "profile_label": store.get_setting(BROWSER_PREF_PROFILE_LABEL)?,
         "connect_command": match normalize_browser_preference_mode(&mode)? {
             "cloud" => "browser remote start",
             "managed-headless" => "browser connect managed --headless",
@@ -1050,13 +1493,6 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
             _ => "browser connect local",
         },
     }))
-}
-
-fn remembered_domain_profile(store: &Store, domain: &str) -> anyhow::Result<Option<Value>> {
-    store
-        .get_setting(&browser_domain_profile_key(domain))?
-        .map(|raw| serde_json::from_str::<Value>(&raw).map_err(Into::into))
-        .transpose()
 }
 
 fn browser_command_words(cmd: &str) -> anyhow::Result<Vec<String>> {
@@ -1121,49 +1557,6 @@ fn shell_quote_browser_arg(value: &str) -> String {
     }
 }
 
-fn normalize_domain(domain: &str) -> String {
-    domain
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("www.")
-        .trim_matches('/')
-        .to_ascii_lowercase()
-}
-
-fn browser_domain_profile_key(domain: &str) -> String {
-    format!(
-        "{BROWSER_DOMAIN_PROFILE_PREFIX}{}",
-        normalize_domain(domain)
-    )
-}
-
-fn browser_profile_connect_next_step(mode: &str, profile_id: Option<&str>) -> String {
-    let profile_id = profile_id.filter(|value| !value.is_empty());
-    match normalize_browser_preference_mode(mode).unwrap_or("local") {
-        "cloud" => profile_id.map_or_else(
-            || "browser remote start".to_string(),
-            |profile_id| {
-                format!(
-                    "browser remote start --profile-id {}",
-                    shell_quote_browser_arg(profile_id)
-                )
-            },
-        ),
-        "managed-headless" => "browser connect managed --headless".to_string(),
-        "managed-headed" => "browser connect managed --headed".to_string(),
-        _ => profile_id.map_or_else(
-            || "browser connect local".to_string(),
-            |profile_id| {
-                format!(
-                    "If this profile is already open with remote debugging, run `browser connect local`; otherwise run `browser local setup --profile {}` and then `browser connect local`.",
-                    shell_quote_browser_arg(profile_id)
-                )
-            },
-        ),
-    }
-}
-
 fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str> {
     let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
     match normalized.as_str() {
@@ -1200,7 +1593,8 @@ fn display_browser_to_mode(display: &str) -> Option<&'static str> {
 /// list. We serialize `content` onto stdout (the model-facing payload) and the
 /// events list onto stderr, with `exit_code = 0` (a failed command surfaces its
 /// failure inside `content`; the wrapped fn errors are handled separately).
-fn map_command_output(out: BrowserCommandOutput) -> ExecOutput {
+fn map_command_output(mut out: BrowserCommandOutput) -> ExecOutput {
+    add_browser_blocked_model_instruction(&mut out.content);
     let stdout = match serde_json::to_string(&out.content) {
         Ok(s) => s,
         Err(e) => format!("<unserializable browser content: {e}>"),
@@ -1215,6 +1609,47 @@ fn map_command_output(out: BrowserCommandOutput) -> ExecOutput {
         stdout,
         stderr,
     }
+}
+
+fn add_browser_blocked_model_instruction(content: &mut Value) {
+    let connection = content
+        .get("connection")
+        .or_else(|| content.pointer("/browser/connection"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(object) = content.as_object_mut() else {
+        return;
+    };
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let state = object
+        .get("state")
+        .or_else(|| object.get("loss_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let blocked = matches!(status, "blocked" | "needs-user-action")
+        || matches!(connection.as_str(), "disconnected" | "not-configured")
+        || matches!(
+            state,
+            "cdp-disabled"
+                | "permission-blocked"
+                | "stale-port"
+                | "browser-not-running"
+                | "profile-target-missing"
+        );
+    if !blocked {
+        return;
+    }
+    object.insert("browser_task_blocked".to_string(), json!(true));
+    object.insert(
+        "model_instruction".to_string(),
+        json!(
+            "Browser work is blocked. Do not answer the user's browser/search/page task from memory or cached knowledge. Follow next_step/tool instructions, or ask the user for the required Chrome action, then retry browser work."
+        ),
+    );
 }
 
 /// Map a [`BrowserScriptOutput`] into [`ExecOutput`], using the same
@@ -1651,30 +2086,31 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         }
 
         let selected_browser_mode = self.selected_browser_mode.clone();
-        let selected_browser_mode =
-            if self.dynamic_browser_mode_from_store && self.real_backend_mode.is_some() {
-                if let Some(persistence) = self.persistence.as_ref() {
-                    let dynamic_mode = persistence
-                        .store
+        let selected_browser_mode = if self.dynamic_browser_mode_from_store {
+            if let Some(persistence) = self.persistence.as_ref() {
+                let dynamic_mode = persistence
+                    .store
+                    .lock()
+                    .map_err(|_| ToolError::Other(anyhow!("store mutex poisoned")))
+                    .and_then(|store| {
+                        preferred_browser_mode(Some(&store))
+                            .map(|mode| Some(mode.to_string()))
+                            .map_err(ToolError::Other)
+                    })?;
+                if let Some(mode) = self.real_backend_mode.as_ref() {
+                    *mode
                         .lock()
-                        .map_err(|_| ToolError::Other(anyhow!("store mutex poisoned")))
-                        .and_then(|store| {
-                            preferred_browser_mode(Some(&store))
-                                .map(|mode| Some(mode.to_string()))
-                                .map_err(ToolError::Other)
-                        })?;
-                    if let Some(mode) = self.real_backend_mode.as_ref() {
-                        *mode.lock().map_err(|_| {
-                            ToolError::Other(anyhow!("browser mode mutex poisoned"))
-                        })? = dynamic_mode.clone();
-                    }
-                    None
-                } else {
-                    selected_browser_mode
+                        .map_err(|_| ToolError::Other(anyhow!("browser mode mutex poisoned")))? =
+                        dynamic_mode.clone();
                 }
+                self.backend.set_browser_mode(dynamic_mode.clone());
+                None
             } else {
                 selected_browser_mode
-            };
+            }
+        } else {
+            selected_browser_mode
+        };
         let backend = Arc::clone(&self.backend);
         let session_id = effective_session_id.to_string();
         let cwd = req.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
@@ -1730,14 +2166,14 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 selected_browser_mode,
                             )
                             .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                            let has_stored_profile = store
+                            let default_profile_id = store
                                 .get_setting(BROWSER_PREF_PROFILE)
                                 .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                                .as_deref()
-                                .is_some_and(|profile| !profile.trim().is_empty());
+                                .filter(|profile| !profile.trim().is_empty());
+                            let has_default_profile = default_profile_id.is_some();
                             drop(store);
-                            if let Some(preflight) = local_connect_profile_preflight(
-                                has_stored_profile,
+                            if let Some(preflight) = local_connect_default_profile_preflight(
+                                has_default_profile,
                                 backend.as_ref(),
                                 &session_id,
                                 &cwd,
@@ -1748,9 +2184,23 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             {
                                 preflight
                             } else {
-                                backend
+                                open_default_profile_before_local_connect(
+                                    backend.as_ref(),
+                                    &session_id,
+                                    &cwd,
+                                    &artifact_dir,
+                                    &resolved,
+                                    default_profile_id.as_deref(),
+                                )
+                                .map_err(ToolError::Other)?;
+                                let output = backend
                                     .command(&session_id, &cwd, &artifact_dir, &resolved)
-                                    .map_err(ToolError::Other)?
+                                    .map_err(ToolError::Other)?;
+                                enrich_local_connect_recovery_with_default_profile(
+                                    output,
+                                    &resolved,
+                                    default_profile_id.as_deref(),
+                                )
                             }
                         }
                     } else {
@@ -1778,6 +2228,32 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                     Ok(map_command_output(out))
                 }
                 BrowserAction::Execute { script, .. } => {
+                    if let Some(persistence) = &persistence {
+                        let store = persistence.store.lock().map_err(|_| {
+                            ToolError::Other(anyhow::anyhow!("store mutex poisoned"))
+                        })?;
+                        let mode =
+                            effective_browser_mode(Some(&store), selected_browser_mode.as_deref())
+                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+                        let default_profile_id = if mode == "local" {
+                            store
+                                .get_setting(BROWSER_PREF_PROFILE)
+                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                                .filter(|profile| !profile.trim().is_empty())
+                        } else {
+                            None
+                        };
+                        drop(store);
+                        ensure_browser_ready_for_work(
+                            backend.as_ref(),
+                            &session_id,
+                            &cwd,
+                            &artifact_dir,
+                            mode,
+                            default_profile_id.as_deref(),
+                        )
+                        .map_err(ToolError::Other)?;
+                    }
                     let out = backend
                         .start_script(&session_id, &cwd, &artifact_dir, &script, timeout_secs)
                         .map_err(ToolError::Other)?;

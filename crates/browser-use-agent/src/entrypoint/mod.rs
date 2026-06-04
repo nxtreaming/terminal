@@ -17,8 +17,9 @@
 //!      [`provider::resolve_provider`] (**where `build_sampling_driver` is called**),
 //!   2. seed the environment workspace-context durable event before the first
 //!      turn ([`append_environment_context_event`]),
-//!   3. drive the [`TurnLoop`] to quiescence over a store-backed [`TurnState`] +
-//!      a [`TurnObserver`] that persists the run's result,
+//!   3. enter [`BrowserUseRuntime`] and drive the [`TurnLoop`] to quiescence over
+//!      a runtime-aware [`TurnState`] + a [`TurnObserver`] that persists the
+//!      run's result,
 //!   4. return the [`SessionId`].
 //!
 //! The run's prompt history is whatever is already in the session's durable log
@@ -37,15 +38,14 @@
 //!   never touch the network (they assert real-driver *construction* offline and
 //!   drive the loop only via the fake/scripted path).
 //!
-//! ## Phase-E seams (NOT yet wired)
-//! The agent crate has no production [`TurnState`]/[`TurnObserver`] for the live
-//! turn loop yet (only `compact::CompactingTurnState`, which needs a
-//! `ContextManager` + a `CompactionSampler`, and the test fakes). This facade
-//! provides minimal store-backed impls so it can actually drive a run today; the
-//! richer `ContextManager`-backed `TurnState` (token accounting, mid-turn
-//! compaction, pending steer queue), tools/dispatch fusion, goals, hooks,
-//! guardian, skills and personality context all remain Phase-E work. Each seam is
-//! marked inline with `// Phase-E seam:`.
+//! ## Runtime Boundary
+//! Public compatibility entrypoints (`run_session_with_config*`) are wrappers over
+//! [`BrowserUseRuntime`]. If a caller does not provide a runtime handle, this
+//! module creates a transient runtime attached to the session's SQLite journal,
+//! accepts the latest durable input into runtime state, and enters
+//! `RuntimeHandle::run_agent`. SQLite remains the replay/debug journal; runtime
+//! state decides live input, mailbox delivery, cancellation, and resource
+//! ownership.
 
 pub mod provider;
 
@@ -53,10 +53,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use browser_use_llm::schema::{ContentPart, Message, MessageRole};
-use browser_use_protocol::{EventRecord, SessionStatus};
+use browser_use_protocol::EventRecord;
+use browser_use_runtime::{
+    AcceptPromptInputRequest as RuntimeAcceptPromptInputRequest, AgentId as RuntimeAgentId,
+    BrowserUseRuntime, DrainAgentMailboxRequest as RuntimeDrainAgentMailboxRequest,
+    Durability as RuntimeDurability, LiveThreadPersistence,
+    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItem as RuntimeMailboxItem,
+    MailboxItemKind as RuntimeMailboxItemKind, RunAgentRequest as RuntimeRunAgentRequest,
+    RuntimeHandle, SessionId as RuntimeSessionId, SqliteJournal, StateIndex,
+};
 use browser_use_store::Store;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -77,6 +84,7 @@ use crate::context::{
 };
 use crate::decision::{AutoCompactTokenLimitScope, SamplingOutcome, TokenStatus};
 use crate::events::{names, session_done_payload, EventSink, PendingEvent, TurnCtx};
+use crate::live_executor::ensure_agent_attached as ensure_runtime_agent_attached;
 use crate::session::reconstruct::WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND;
 use crate::session::SessionId;
 use crate::session::SharedStore;
@@ -97,7 +105,7 @@ pub use provider::{
 };
 
 /// The shared, in-run conversation buffer that BOTH the loop's [`TurnState`] reads
-/// (via [`StoreTurnState::clone_history_for_prompt`]) AND the fused driver's
+/// (via [`LiveTurnState::clone_history_for_prompt`]) AND the fused driver's
 /// [`FusionRecorder`] writes (the assistant message + dispatched tool outputs).
 ///
 /// This is the load-bearing fusion seam: holding the same `Arc<Mutex<Vec<Message>>>`
@@ -195,6 +203,15 @@ enum MailboxDeliveryPhase {
     NextTurn,
 }
 
+impl MailboxDeliveryPhase {
+    fn to_runtime(self) -> RuntimeMailboxDeliveryPhase {
+        match self {
+            Self::CurrentTurn => RuntimeMailboxDeliveryPhase::CurrentTurn,
+            Self::NextTurn => RuntimeMailboxDeliveryPhase::NextTurn,
+        }
+    }
+}
+
 /// A [`TurnState`] backed by the session's durable event log, with REAL codex-
 /// parity token accounting + model-based compaction.
 ///
@@ -219,12 +236,14 @@ enum MailboxDeliveryPhase {
 ///   cleared (its content is now folded into the summary), so the next prompt is
 ///   small again and the loop continues.
 ///
-/// Pending input is store-backed: active follow-ups are committed into the
-/// durable log, while inter-agent mailbox messages are delivered through a
-/// Codex-style current-turn/next-turn phase gate.
-struct StoreTurnState {
+/// Pending input is runtime-backed when a [`RuntimeHandle`] is present: mailbox
+/// wakeups/drains come from the in-memory runtime queue, while SQLite remains the
+/// durable prompt/history projection. Store mailbox rows are kept only for the
+/// legacy no-runtime facade.
+struct LiveTurnState {
     store: SharedStore,
     session_id: SessionId,
+    runtime_handle: Option<RuntimeHandle>,
     /// Assistant turns + dispatched tool outputs recorded this run, so a follow-up
     /// prompt sees them. Shared (`Arc`) with the fused driver's [`FusionRecorder`]
     /// ([`BufferRecorder`]) so what the driver dispatches re-enters the next prompt.
@@ -235,7 +254,7 @@ struct StoreTurnState {
     context_window_tokens: i64,
     model_auto_compact_token_limit: Option<i64>,
     auto_compact_scope: AutoCompactTokenLimitScope,
-    auto_compact_window: Mutex<AutoCompactWindow>,
+    local_auto_compact_window: Mutex<AutoCompactWindow>,
     mailbox_delivery_phase: Mutex<MailboxDeliveryPhase>,
     pre_turn_replay_from_seq: Mutex<Option<i64>>,
     compact_prompt: String,
@@ -253,23 +272,24 @@ struct StoreTurnState {
     compacted: Mutex<Option<Vec<Message>>>,
 }
 
-impl StoreTurnState {
+impl LiveTurnState {
     /// Build the state over a SHARED recorded buffer. The same `Arc` is handed to
     /// the fused driver's recorder (so dispatched tool outputs land here and are
     /// re-sampled on the next iteration) and to this state (which reads it into
     /// every prompt). Pass a fresh buffer for the non-fused (`Fake`) path.
     ///
     /// Compaction is OFF by default (no sampler, `0` window). Enable it with
-    /// [`with_compaction`](StoreTurnState::with_compaction).
+    /// [`with_compaction`](LiveTurnState::with_compaction).
     fn new(store: SharedStore, session_id: SessionId, recorded: RecordedBuffer) -> Self {
         Self {
             store,
             session_id,
+            runtime_handle: None,
             recorded,
             context_window_tokens: 0,
             model_auto_compact_token_limit: None,
             auto_compact_scope: AutoCompactTokenLimitScope::Total,
-            auto_compact_window: Mutex::new(AutoCompactWindow::default()),
+            local_auto_compact_window: Mutex::new(AutoCompactWindow::default()),
             mailbox_delivery_phase: Mutex::new(MailboxDeliveryPhase::CurrentTurn),
             pre_turn_replay_from_seq: Mutex::new(None),
             compact_prompt: crate::compact::SUMMARIZATION_PROMPT.to_string(),
@@ -294,6 +314,16 @@ impl StoreTurnState {
         self.model_auto_compact_token_limit = configured_limit;
         self.auto_compact_scope = scope;
         self.compaction_sampler = Some(sampler);
+        self
+    }
+
+    fn with_runtime_handle(mut self, runtime_handle: Option<RuntimeHandle>) -> Self {
+        self.runtime_handle = runtime_handle;
+        self
+    }
+
+    fn with_mailbox_delivery_phase(mut self, delivery_phase: MailboxDeliveryPhase) -> Self {
+        self.mailbox_delivery_phase = Mutex::new(delivery_phase);
         self
     }
 
@@ -327,17 +357,30 @@ impl StoreTurnState {
     fn assemble_prompt_blocking(&self) -> Vec<Message> {
         let mut msgs = match self.compacted.lock().unwrap().as_ref() {
             Some(compacted) => compacted.clone(),
-            None => {
-                let session_id = self.session_id.as_str().to_string();
-                history_from_store(&self.store, &session_id)
-            }
+            None => self.durable_history_blocking(),
         };
         msgs.extend(self.recorded.lock().unwrap().iter().cloned());
         msgs
     }
 
+    fn runtime_session_id(&self) -> Option<RuntimeSessionId> {
+        RuntimeSessionId::from_string(self.session_id.as_str().to_string()).ok()
+    }
+
+    fn durable_events_blocking(&self) -> Vec<EventRecord> {
+        runtime_or_store_events(
+            self.runtime_handle.as_ref(),
+            &self.store,
+            self.session_id.as_str(),
+        )
+    }
+
+    fn durable_history_blocking(&self) -> Vec<Message> {
+        history_from_events(&self.durable_events_blocking())
+    }
+
     fn current_prompt_items_for_compaction(&self, mode: CompactionMode) -> Vec<Item> {
-        let events = events_from_store(&self.store, self.session_id.as_str());
+        let events = self.durable_events_blocking();
         match mode {
             CompactionMode::PreTurn => {
                 let replay_from = *self.pre_turn_replay_from_seq.lock().unwrap();
@@ -378,7 +421,7 @@ impl StoreTurnState {
     ///   the latest compaction checkpoint;
     /// - otherwise the whole-prompt local byte/token estimate.
     fn active_prompt_tokens_for_status(&self) -> ActivePromptTokens {
-        let events = events_from_store(&self.store, self.session_id.as_str());
+        let events = self.durable_events_blocking();
         let replay_from = *self.pre_turn_replay_from_seq.lock().unwrap();
         let events = events_through_seq(&events, replay_from);
         self.active_prompt_tokens_from_events(&events)
@@ -417,24 +460,87 @@ impl StoreTurnState {
         (self.context_window_tokens > 0).then_some(self.context_window_tokens)
     }
 
+    fn auto_compact_prefill_input_tokens(&self) -> Option<i64> {
+        if let (Some(runtime_handle), Some(runtime_session_id)) =
+            (self.runtime_handle.as_ref(), self.runtime_session_id())
+        {
+            if let Ok(prefill) =
+                runtime_handle.compaction_prefill_input_tokens_for_session(&runtime_session_id)
+            {
+                return prefill;
+            }
+        }
+        self.local_auto_compact_window
+            .lock()
+            .unwrap()
+            .prefill_input_tokens()
+    }
+
+    fn ensure_auto_compact_server_observed_prefill_from_usage(&self, usage: &TokenUsage) {
+        if let (Some(runtime_handle), Some(runtime_session_id)) =
+            (self.runtime_handle.as_ref(), self.runtime_session_id())
+        {
+            if runtime_handle
+                .record_server_observed_compaction_prefill_for_session(
+                    &runtime_session_id,
+                    usage.input,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.local_auto_compact_window
+            .lock()
+            .unwrap()
+            .ensure_server_observed_prefill_from_usage(usage);
+    }
+
+    fn set_auto_compact_estimated_prefill(&self, tokens: i64) {
+        if let (Some(runtime_handle), Some(runtime_session_id)) =
+            (self.runtime_handle.as_ref(), self.runtime_session_id())
+        {
+            if runtime_handle
+                .record_estimated_compaction_prefill_for_session(&runtime_session_id, tokens)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.local_auto_compact_window
+            .lock()
+            .unwrap()
+            .set_estimated_prefill(tokens);
+    }
+
+    fn start_next_auto_compact_window(&self) {
+        if let (Some(runtime_handle), Some(runtime_session_id)) =
+            (self.runtime_handle.as_ref(), self.runtime_session_id())
+        {
+            if runtime_handle
+                .start_next_compaction_window_for_session(&runtime_session_id)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.local_auto_compact_window.lock().unwrap().start_next();
+    }
+
     fn token_status_blocking(&self) -> TokenStatus {
         if self.compaction_sampler.is_none() {
             return TokenStatus::default();
         }
         let tokens = self.active_prompt_tokens_for_status();
-        let prefill = {
-            let mut window = self.auto_compact_window.lock().unwrap();
-            if tokens.provider_usage.is_some()
-                && matches!(
-                    self.auto_compact_scope,
-                    AutoCompactTokenLimitScope::BodyAfterPrefix
-                )
-            {
-                let usage = tokens.provider_usage.unwrap();
-                window.ensure_server_observed_prefill_from_usage(&usage);
-            }
-            window.prefill_input_tokens()
-        };
+        if let Some(usage) = tokens.provider_usage.as_ref().filter(|_| {
+            matches!(
+                self.auto_compact_scope,
+                AutoCompactTokenLimitScope::BodyAfterPrefix
+            )
+        }) {
+            self.ensure_auto_compact_server_observed_prefill_from_usage(usage);
+        }
+        let prefill = self.auto_compact_prefill_input_tokens();
         TokenStatus::from_codex_usage(
             tokens.active,
             prefill,
@@ -492,7 +598,7 @@ impl StoreTurnState {
 ///
 /// The fused [`ModelSamplingDriver`](crate::turn::sampling::ModelSamplingDriver)
 /// records the assistant message and each dispatched tool output through this; the
-/// same `Arc<Mutex<Vec<Message>>>` backs the run's [`StoreTurnState`], so those
+/// same `Arc<Mutex<Vec<Message>>>` backs the run's [`LiveTurnState`], so those
 /// recorded items are exactly what the loop re-samples on its next iteration
 /// (mirrors the test fakes in `turn/fusion_tests.rs`, where one `SharedConversation`
 /// is both the `TurnState` and the `FusionRecorder`).
@@ -600,7 +706,7 @@ fn build_summary_llm_request(
 ///
 /// [`CompactionSampler::summarize`] returns `impl Future` (native RPITIT), which
 /// is NOT object-safe, so `Arc<dyn CompactionSampler>` is impossible. The
-/// [`StoreTurnState`] holds the summary pass behind a trait object (it is built in
+/// [`LiveTurnState`] holds the summary pass behind a trait object (it is built in
 /// one of two branches — real vs. disabled — so a generic would fan out through
 /// `drive_run`), so this boxes the future to make it storable. A blanket impl
 /// makes every concrete [`CompactionSampler`] usable here, and a forwarding
@@ -718,9 +824,10 @@ fn effective_context_window_for_config(config: &ProviderRunConfig) -> Option<i64
 fn previous_model_compaction_for_config(
     store: &SharedStore,
     session_id: &SessionId,
+    runtime_handle: Option<&RuntimeHandle>,
     config: &ProviderRunConfig,
 ) -> Option<PreviousModelCompaction> {
-    let events = events_from_store(store, session_id.as_str());
+    let events = runtime_or_store_events(runtime_handle, store, session_id.as_str());
     let previous_model = latest_model_request_model(&events)?;
     if previous_model == config.model {
         return None;
@@ -747,8 +854,12 @@ fn history_from_store(store: &SharedStore, session_id: &str) -> Vec<Message> {
         let store = store.lock().expect("store mutex poisoned");
         store.events_for_session(session_id).unwrap_or_default()
     };
+    history_from_events(&events)
+}
+
+fn history_from_events(events: &[EventRecord]) -> Vec<Message> {
     // Pure reduce: durable events -> provider messages (the legacy currency).
-    let items = provider_messages_from_events(&events);
+    let items = provider_messages_from_events(events);
     // Pure lower: provider-message Values -> typed Messages for the request.
     ContextManager::new().lower_to_messages(&items)
 }
@@ -850,6 +961,13 @@ fn next_pending_active_followup(events: &[EventRecord]) -> Option<&EventRecord> 
         .iter()
         .filter(|event| event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT)
         .filter(|event| event.payload.get("pending_from_seq").is_none())
+        .filter(|event| {
+            !event
+                .payload
+                .get("runtime_mailbox_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
         .filter(|event| pending_after_next_tool_call_followup(events, event))
         .min_by_key(|event| event.seq)
 }
@@ -908,6 +1026,7 @@ fn drain_one_pending_active_followup(store: &SharedStore, session_id: &str) {
     );
 }
 
+#[cfg(test)]
 fn has_pending_agent_mail(store: &SharedStore, session_id: &str) -> bool {
     let Ok(store) = store.lock() else {
         return false;
@@ -918,6 +1037,7 @@ fn has_pending_agent_mail(store: &SharedStore, session_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn has_pending_trigger_turn_agent_mail(store: &SharedStore, session_id: &str) -> bool {
     let Ok(store) = store.lock() else {
         return false;
@@ -928,70 +1048,302 @@ fn has_pending_trigger_turn_agent_mail(store: &SharedStore, session_id: &str) ->
         .unwrap_or(false)
 }
 
-fn drain_agent_mailbox_as_pending_input(store: &SharedStore, session_id: &str) -> Vec<Message> {
-    let Ok(store) = store.lock() else {
+fn has_pending_runtime_agent_mail(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+    delivery_phase: MailboxDeliveryPhase,
+) -> bool {
+    let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.to_string()) else {
+        return false;
+    };
+    runtime_handle
+        .has_pending_agent_mail_for_session(&runtime_session_id, delivery_phase.to_runtime())
+        .unwrap_or(false)
+}
+
+fn has_pending_runtime_trigger_turn_agent_mail(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+    delivery_phase: MailboxDeliveryPhase,
+) -> bool {
+    let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.to_string()) else {
+        return false;
+    };
+    runtime_handle
+        .has_pending_trigger_turn_agent_mail_for_session(
+            &runtime_session_id,
+            delivery_phase.to_runtime(),
+        )
+        .unwrap_or(false)
+}
+
+fn has_pending_runtime_trigger_turn_agent_mail_any_phase(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+) -> bool {
+    has_pending_runtime_trigger_turn_agent_mail(
+        runtime_handle,
+        session_id,
+        MailboxDeliveryPhase::CurrentTurn,
+    ) || has_pending_runtime_trigger_turn_agent_mail(
+        runtime_handle,
+        session_id,
+        MailboxDeliveryPhase::NextTurn,
+    )
+}
+
+fn consume_runtime_prompt_input(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+    Ok(runtime_handle
+        .consume_prompt_input_for_session(&runtime_session_id)?
+        .consumed)
+}
+
+fn initial_runtime_mailbox_delivery_phase(
+    runtime_handle: Option<&RuntimeHandle>,
+    session_id: &str,
+) -> MailboxDeliveryPhase {
+    if runtime_handle
+        .map(|runtime_handle| {
+            has_pending_runtime_trigger_turn_agent_mail(
+                runtime_handle,
+                session_id,
+                MailboxDeliveryPhase::NextTurn,
+            )
+        })
+        .unwrap_or(false)
+    {
+        MailboxDeliveryPhase::NextTurn
+    } else {
+        MailboxDeliveryPhase::CurrentTurn
+    }
+}
+
+fn drain_runtime_agent_mailbox_as_pending_input(
+    runtime_handle: &RuntimeHandle,
+    store: &SharedStore,
+    session_id: &str,
+    delivery_phase: MailboxDeliveryPhase,
+) -> Vec<Message> {
+    let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.to_string()) else {
         return Vec::new();
     };
-    let messages = store
-        .drain_agent_messages_for_agent(session_id)
-        .unwrap_or_default();
-    messages
+    let response = match runtime_handle.drain_agent_mailbox(RuntimeDrainAgentMailboxRequest {
+        session_id: runtime_session_id,
+        delivery_phase: delivery_phase.to_runtime(),
+    }) {
+        Ok(response) => response,
+        Err(_) => return Vec::new(),
+    };
+    if response.mailbox_items.is_empty() {
+        return Vec::new();
+    }
+    let store_guard = store.lock().ok();
+    runtime_mailbox_items_as_pending_input(
+        runtime_handle,
+        store_guard.as_deref(),
+        session_id,
+        response.mailbox_items,
+    )
+}
+
+fn runtime_mailbox_items_as_pending_input(
+    runtime_handle: &RuntimeHandle,
+    store: Option<&Store>,
+    session_id: &str,
+    items: Vec<RuntimeMailboxItem>,
+) -> Vec<Message> {
+    items
         .into_iter()
-        .flat_map(|message| {
-            let author_path = display_agent_path_for_session(&store, &message.author_session_id)
-                .unwrap_or_else(|_| "/root".to_string());
-            let recipient_path = display_agent_path_for_session(&store, &message.target_session_id)
-                .unwrap_or_else(|_| "/root".to_string());
-            let content = message.content.clone();
-            let trigger_turn = message.trigger_turn;
-            if message.input_kind == "user_input" {
+        .flat_map(|item| {
+            let item_kind = item.kind.clone();
+            let author_session_id = item
+                .payload
+                .get("author_session_id")
+                .and_then(Value::as_str)
+                .or_else(|| item.payload.get("child_session_id").and_then(Value::as_str))
+                .unwrap_or_else(|| item.author_agent_id.as_str())
+                .to_string();
+            let target_session_id = item
+                .payload
+                .get("target_session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| item.target_agent_id.as_str())
+                .to_string();
+            let author_path = store
+                .and_then(|store| display_agent_path_for_session(store, &author_session_id).ok())
+                .or_else(|| {
+                    item.payload
+                        .get("author_path")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_else(|| author_session_id.clone());
+            let recipient_path = store
+                .and_then(|store| display_agent_path_for_session(store, &target_session_id).ok())
+                .or_else(|| {
+                    item.payload
+                        .get("target_path")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .or_else(|| item.target_path.clone())
+                .unwrap_or_else(|| target_session_id.clone());
+            let content = item.content.clone();
+            let trigger_turn = item.trigger_turn;
+
+            if item_kind == RuntimeMailboxItemKind::Followup || item.trigger_turn {
                 let cwd = store
-                    .load_session(&message.target_session_id)
-                    .ok()
-                    .flatten()
+                    .and_then(|store| store.load_session(session_id).ok().flatten())
                     .map(|session| session.cwd)
                     .unwrap_or_else(|| ".".to_string());
-                let payload = if let Some(items) = message.input_items.as_ref() {
-                    typed_user_input_payload_from_items_for_cwd(items, &cwd)
-                } else {
-                    typed_user_input_payload_from_text_for_cwd(&content, &cwd)
-                };
+                let payload = item
+                    .payload
+                    .get("input_items")
+                    .filter(|value| !value.is_null())
+                    .map(|items| typed_user_input_payload_from_items_for_cwd(items, &cwd))
+                    .unwrap_or_else(|| typed_user_input_payload_from_text_for_cwd(&content, &cwd));
                 if let Ok(payload) = payload {
-                    let _ = store.append_event(
-                        &message.target_session_id,
+                    let mut payload = payload;
+                    let pending_from_seq =
+                        item.payload.get("pending_from_seq").and_then(Value::as_i64);
+                    if let Some(pending_from_seq) = pending_from_seq {
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.insert(
+                                "pending_from_seq".to_string(),
+                                Value::from(pending_from_seq),
+                            );
+                        }
+                    }
+                    let committed_seq = match append_runtime_prompt_projection_event(
+                        runtime_handle,
+                        session_id,
                         names::SESSION_FOLLOWUP,
                         payload.clone(),
-                    );
+                    ) {
+                        Ok(committed_seq) => committed_seq,
+                        Err(_) => return Vec::new(),
+                    };
+                    if let (Some(pending_from_seq), Some(committed_seq)) =
+                        (pending_from_seq, committed_seq)
+                    {
+                        let _ = append_runtime_prompt_projection_event(
+                            runtime_handle,
+                            session_id,
+                            AGENT_TURN_QUEUE_DRAINED_EVENT,
+                            serde_json::json!({
+                                "phase": "runtime_mailbox",
+                                "session_messages": 1,
+                                "mailbox_messages": 1,
+                                "last_seq": committed_seq,
+                                "followup_seqs": [pending_from_seq],
+                                "runtime_mailbox_id": item.id,
+                                "runtime_mailbox_seq": item.seq,
+                            }),
+                        );
+                    }
                     return user_input_payload_to_messages(&payload);
                 }
-            } else {
-                let _ = store.append_event(
-                    &message.target_session_id,
-                    "agent.mailbox_input",
-                    serde_json::json!({
-                        "id": message.id,
-                        "author_session_id": message.author_session_id,
-                        "target_session_id": message.target_session_id,
-                        "author_path": author_path,
-                        "recipient_path": recipient_path,
-                        "content": content,
-                        "trigger_turn": trigger_turn,
-                    }),
-                );
             }
-            let envelope = serde_json::json!({
-                "author": author_path,
-                "recipient": recipient_path,
-                "other_recipients": [],
-                "content": content,
-                "trigger_turn": trigger_turn,
-            });
+
+            if append_runtime_prompt_projection_event(
+                runtime_handle,
+                session_id,
+                "agent.mailbox_input",
+                serde_json::json!({
+                    "id": item.id,
+                    "runtime_mailbox_seq": item.seq,
+                    "author_session_id": author_session_id.clone(),
+                    "target_session_id": target_session_id.clone(),
+                    "author_path": author_path.clone(),
+                    "recipient_path": recipient_path.clone(),
+                    "content": content.clone(),
+                    "trigger_turn": trigger_turn,
+                    "delivery_phase": item.delivery_phase,
+                    "kind": item_kind.clone(),
+                    "source": "runtime",
+                }),
+            )
+            .is_err()
+            {
+                return Vec::new();
+            }
+            let label = match item_kind {
+                RuntimeMailboxItemKind::Completion => "Subagent completion",
+                RuntimeMailboxItemKind::Notification => "Inter-agent notification",
+                RuntimeMailboxItemKind::Followup if trigger_turn => "Direct task from parent",
+                RuntimeMailboxItemKind::Followup => "Follow-up task",
+                RuntimeMailboxItemKind::Input if trigger_turn => "Direct task from parent",
+                RuntimeMailboxItemKind::Input => "Inter-agent message",
+            };
             vec![Message::new(
-                MessageRole::Assistant,
-                vec![ContentPart::text(envelope.to_string())],
+                MessageRole::User,
+                vec![ContentPart::text(format!(
+                    "{label} {author_path} to you {recipient_path}:\n{content}"
+                ))],
             )]
         })
         .collect()
+}
+
+fn append_runtime_prompt_projection_event(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+    event_type: &str,
+    payload: Value,
+) -> anyhow::Result<Option<i64>> {
+    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+    runtime_handle
+        .append_observed_session_event(
+            runtime_session_id,
+            event_type,
+            payload,
+            RuntimeDurability::Barrier,
+        )
+        .map(|append| append.seq)
+}
+
+fn append_runtime_or_store_event(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+    event_type: &str,
+    payload: Value,
+) -> anyhow::Result<Option<i64>> {
+    if let Some(runtime_handle) = runtime_handle {
+        let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+        return runtime_handle
+            .append_observed_session_event(
+                runtime_session_id,
+                event_type,
+                payload,
+                RuntimeDurability::Barrier,
+            )
+            .map(|append| append.seq);
+    }
+    let store = store.lock().expect("store mutex poisoned");
+    Ok(Some(
+        store.append_event(session_id, event_type, payload)?.seq,
+    ))
+}
+
+fn runtime_or_store_events(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+) -> Vec<EventRecord> {
+    let Some(runtime_handle) = runtime_handle else {
+        return events_from_store(store, session_id);
+    };
+    let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.to_string()) else {
+        return events_from_store(store, session_id);
+    };
+    runtime_handle
+        .events_for_session(&runtime_session_id)
+        .unwrap_or_default()
 }
 
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
@@ -1224,6 +1576,7 @@ fn insert_initial_context_before_last_real_user_or_summary(
 async fn run_compaction_with_retries(
     session_id: &SessionId,
     store: &SharedStore,
+    runtime_handle: Option<&RuntimeHandle>,
     history: &[Item],
     sampler: &dyn DynCompactionSampler,
     compact_prompt: &str,
@@ -1240,6 +1593,7 @@ async fn run_compaction_with_retries(
         match sampler.summarize(request, CancellationToken::new()).await {
             Ok(summary) => {
                 append_compaction_token_usage(
+                    runtime_handle,
                     store,
                     session_id.as_str(),
                     summary.token_usage.as_ref(),
@@ -1257,14 +1611,20 @@ async fn run_compaction_with_retries(
                     retries = 0;
                     continue;
                 }
-                append_context_window_full(store, session_id.as_str(), context_window);
-                append_model_turn_context_overflow(store, session_id.as_str());
+                append_context_window_full(
+                    runtime_handle,
+                    store,
+                    session_id.as_str(),
+                    context_window,
+                );
+                append_model_turn_context_overflow(runtime_handle, store, session_id.as_str());
                 return Err(AgentError::ContextWindowExceeded);
             }
             Err(AgentError::TurnAborted) => return Err(AgentError::TurnAborted),
             Err(error) if error.is_retryable() && retries < max_retries => {
                 retries += 1;
                 append_stream_error(
+                    runtime_handle,
                     store,
                     session_id.as_str(),
                     &format!("Reconnecting... {retries}/{max_retries}"),
@@ -1279,75 +1639,94 @@ async fn run_compaction_with_retries(
     }
 }
 
-fn append_model_turn_context_overflow(store: &SharedStore, session_id: &str) {
-    if let Ok(store) = store.lock() {
-        let _ = store.append_event(
-            session_id,
-            "model.turn.context_overflow",
-            json!({ "action": "compaction_failed" }),
-        );
-        let _ = store.append_event(
-            session_id,
-            names::MODEL_TURN_ERROR,
-            json!({
-                "error": "context window exceeded while compacting",
-                "code": "context_window_exceeded",
-                "recoverable": false,
-            }),
-        );
-    }
+fn append_model_turn_context_overflow(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+) {
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        "model.turn.context_overflow",
+        json!({ "action": "compaction_failed" }),
+    );
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        names::MODEL_TURN_ERROR,
+        json!({
+            "error": "context window exceeded while compacting",
+            "code": "context_window_exceeded",
+            "recoverable": false,
+        }),
+    );
 }
 
-fn append_stream_error(store: &SharedStore, session_id: &str, message: &str) {
-    if let Ok(store) = store.lock() {
-        let _ = store.append_event(
-            session_id,
-            names::STREAM_ERROR,
-            json!({ "message": message }),
-        );
-    }
+fn append_stream_error(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+    message: &str,
+) {
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        names::STREAM_ERROR,
+        json!({ "message": message }),
+    );
 }
 
-fn append_compaction_started(store: &SharedStore, session_id: &str, mode: CompactionMode) {
-    if let Ok(store) = store.lock() {
-        let _ = store.append_event(
-            session_id,
-            "session.compaction_started",
-            json!({
-                "reason": "token_budget",
-                "mode": compaction_mode_name(mode),
-            }),
-        );
-    }
+fn append_compaction_started(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+    mode: CompactionMode,
+) {
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        "session.compaction_started",
+        json!({
+            "reason": "token_budget",
+            "mode": compaction_mode_name(mode),
+        }),
+    );
 }
 
 fn append_compaction_failed(
+    runtime_handle: Option<&RuntimeHandle>,
     store: &SharedStore,
     session_id: &str,
     mode: CompactionMode,
     error: &AgentError,
 ) {
-    if let Ok(store) = store.lock() {
-        let _ = store.append_event(
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        "session.compaction_failed",
+        json!({
+            "reason": "token_budget",
+            "mode": compaction_mode_name(mode),
+            "error": error.to_string(),
+        }),
+    );
+    if !matches!(error, AgentError::ContextWindowExceeded) {
+        let _ = append_runtime_or_store_event(
+            runtime_handle,
+            store,
             session_id,
-            "session.compaction_failed",
+            names::MODEL_TURN_ERROR,
             json!({
-                "reason": "token_budget",
-                "mode": compaction_mode_name(mode),
                 "error": error.to_string(),
+                "code": compaction_error_code(error),
+                "recoverable": false,
             }),
         );
-        if !matches!(error, AgentError::ContextWindowExceeded) {
-            let _ = store.append_event(
-                session_id,
-                names::MODEL_TURN_ERROR,
-                json!({
-                    "error": error.to_string(),
-                    "code": compaction_error_code(error),
-                    "recoverable": false,
-                }),
-            );
-        }
     }
 }
 
@@ -1437,6 +1816,7 @@ fn token_count_payload_from_usage(
 }
 
 fn append_compaction_token_usage(
+    runtime_handle: Option<&RuntimeHandle>,
     store: &SharedStore,
     session_id: &str,
     usage: Option<&TokenUsage>,
@@ -1445,41 +1825,46 @@ fn append_compaction_token_usage(
     let Some(usage) = usage.filter(|usage| usage.total > 0) else {
         return;
     };
-    if let Ok(store) = store.lock() {
-        let events = store.events_for_session(session_id).unwrap_or_default();
-        let previous_total = latest_total_token_usage_value(&events);
-        let _ = store.append_event(
-            session_id,
-            names::TOKEN_COUNT,
-            token_count_payload_from_usage(usage, window, &previous_total),
-        );
-    }
+    let events = runtime_or_store_events(runtime_handle, store, session_id);
+    let previous_total = latest_total_token_usage_value(&events);
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        names::TOKEN_COUNT,
+        token_count_payload_from_usage(usage, window, &previous_total),
+    );
 }
 
-fn append_context_window_full(store: &SharedStore, session_id: &str, window: Option<i64>) {
+fn append_context_window_full(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+    window: Option<i64>,
+) {
     let Some(window) = window.filter(|window| *window > 0) else {
         return;
     };
-    if let Ok(store) = store.lock() {
-        let events = store.events_for_session(session_id).unwrap_or_default();
-        let previous_total = latest_total_token_usage_value(&events);
-        let previous_total_tokens = token_usage_total_tokens(&previous_total);
-        let delta = window.saturating_sub(previous_total_tokens).max(0);
-        let total_usage = token_usage_value_with_total(window);
-        let last_usage = token_usage_value_with_total(delta);
-        let _ = store.append_event(
-            session_id,
-            names::TOKEN_COUNT,
-            json!({
-                "info": {
-                    "total_token_usage": total_usage,
-                    "last_token_usage": last_usage,
-                    "model_context_window": window,
-                },
-                "turn_idx": 0,
-            }),
-        );
-    }
+    let events = runtime_or_store_events(runtime_handle, store, session_id);
+    let previous_total = latest_total_token_usage_value(&events);
+    let previous_total_tokens = token_usage_total_tokens(&previous_total);
+    let delta = window.saturating_sub(previous_total_tokens).max(0);
+    let total_usage = token_usage_value_with_total(window);
+    let last_usage = token_usage_value_with_total(delta);
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        names::TOKEN_COUNT,
+        json!({
+            "info": {
+                "total_token_usage": total_usage,
+                "last_token_usage": last_usage,
+                "model_context_window": window,
+            },
+            "turn_idx": 0,
+        }),
+    );
 }
 
 fn token_usage_value_with_total(total_tokens: i64) -> Value {
@@ -1549,7 +1934,7 @@ fn enrich_token_count_payload(
     payload
 }
 
-impl TurnState for StoreTurnState {
+impl TurnState for LiveTurnState {
     async fn clone_history_for_prompt(&self) -> Vec<Message> {
         // Once compacted, the prompt base is the compacted override (codex's
         // replaced history); otherwise it is the lowered durable log. The recorded
@@ -1560,11 +1945,24 @@ impl TurnState for StoreTurnState {
             return self.assemble_prompt_blocking();
         }
         let store = Arc::clone(&self.store);
+        let runtime_handle = self.runtime_handle.clone();
+        let runtime_session_id = self.runtime_session_id();
         let session_id = self.session_id.as_str().to_string();
         // The durable read is synchronous (rusqlite); run it off the async runtime.
-        let mut msgs = tokio::task::spawn_blocking(move || history_from_store(&store, &session_id))
-            .await
-            .unwrap_or_default();
+        let mut msgs = tokio::task::spawn_blocking(move || {
+            let events = match (runtime_handle.as_ref(), runtime_session_id.as_ref()) {
+                (Some(runtime_handle), Some(runtime_session_id)) => {
+                    match runtime_handle.events_for_session(runtime_session_id) {
+                        Ok(events) => events,
+                        Err(_) => Vec::new(),
+                    }
+                }
+                _ => return history_from_store(&store, &session_id),
+            };
+            history_from_events(&events)
+        })
+        .await
+        .unwrap_or_default();
         // The recorded buffer carries this run's assistant turns AND the fused
         // driver's dispatched tool outputs (both append through the same `Arc`), so
         // the next prompt sees everything produced so far.
@@ -1577,40 +1975,79 @@ impl TurnState for StoreTurnState {
     }
 
     async fn has_pending_input(&self) -> bool {
+        if let Some(runtime_handle) = self.runtime_handle.clone() {
+            let session_id = self.session_id.as_str().to_string();
+            let mailbox_delivery_phase = *self.mailbox_delivery_phase.lock().unwrap();
+            return tokio::task::spawn_blocking(move || match mailbox_delivery_phase {
+                MailboxDeliveryPhase::CurrentTurn => has_pending_runtime_agent_mail(
+                    &runtime_handle,
+                    &session_id,
+                    mailbox_delivery_phase,
+                ),
+                MailboxDeliveryPhase::NextTurn => has_pending_runtime_trigger_turn_agent_mail(
+                    &runtime_handle,
+                    &session_id,
+                    mailbox_delivery_phase,
+                ),
+            })
+            .await
+            .unwrap_or(false);
+        }
+
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
-        let mailbox_delivery_phase = *self.mailbox_delivery_phase.lock().unwrap();
-        tokio::task::spawn_blocking(move || {
-            has_pending_active_followup(&store, &session_id)
-                || (mailbox_delivery_phase == MailboxDeliveryPhase::CurrentTurn
-                    && has_pending_agent_mail(&store, &session_id))
-        })
-        .await
-        .unwrap_or(false)
+        tokio::task::spawn_blocking(move || has_pending_active_followup(&store, &session_id))
+            .await
+            .unwrap_or(false)
     }
 
     async fn take_pending_input(&self) -> Vec<Message> {
-        let store_for_followup = Arc::clone(&self.store);
-        let session_id_for_followup = self.session_id.as_str().to_string();
-        let followup_pending = tokio::task::spawn_blocking(move || {
-            has_pending_active_followup(&store_for_followup, &session_id_for_followup)
-        })
-        .await
-        .unwrap_or(false);
+        let runtime_backed = self.runtime_handle.is_some();
+        let followup_pending = if runtime_backed {
+            false
+        } else {
+            let store_for_followup = Arc::clone(&self.store);
+            let session_id_for_followup = self.session_id.as_str().to_string();
+            tokio::task::spawn_blocking(move || {
+                has_pending_active_followup(&store_for_followup, &session_id_for_followup)
+            })
+            .await
+            .unwrap_or(false)
+        };
         if followup_pending {
             *self.mailbox_delivery_phase.lock().unwrap() = MailboxDeliveryPhase::CurrentTurn;
         }
         let mailbox_delivery_phase = *self.mailbox_delivery_phase.lock().unwrap();
         if !followup_pending && mailbox_delivery_phase == MailboxDeliveryPhase::NextTurn {
-            return Vec::new();
+            if let Some(runtime_handle) = self.runtime_handle.as_ref() {
+                if !has_pending_runtime_trigger_turn_agent_mail(
+                    runtime_handle,
+                    self.session_id.as_str(),
+                    mailbox_delivery_phase,
+                ) {
+                    return Vec::new();
+                }
+            } else {
+                return Vec::new();
+            }
         }
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
+        let runtime_handle = self.runtime_handle.clone();
         tokio::task::spawn_blocking(move || {
             if followup_pending {
                 drain_one_pending_active_followup(&store, &session_id);
             }
-            drain_agent_mailbox_as_pending_input(&store, &session_id)
+            if let Some(runtime_handle) = runtime_handle {
+                drain_runtime_agent_mailbox_as_pending_input(
+                    &runtime_handle,
+                    &store,
+                    &session_id,
+                    mailbox_delivery_phase,
+                )
+            } else {
+                Vec::new()
+            }
         })
         .await
         .unwrap_or_default()
@@ -1630,6 +2067,10 @@ impl TurnState for StoreTurnState {
     }
 
     async fn defer_mailbox_delivery_to_next_turn(&self) {
+        if self.runtime_handle.is_some() {
+            *self.mailbox_delivery_phase.lock().unwrap() = MailboxDeliveryPhase::NextTurn;
+            return;
+        }
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
         let followup_pending =
@@ -1642,7 +2083,7 @@ impl TurnState for StoreTurnState {
     }
 }
 
-impl StoreTurnState {
+impl LiveTurnState {
     async fn compact_with_sampler(
         &self,
         mode: CompactionMode,
@@ -1652,7 +2093,12 @@ impl StoreTurnState {
         // `clone_history`): the durable log (or the prior compacted override) plus
         // this run's recorded turns.
         let items = self.current_prompt_items_for_compaction(mode);
-        append_compaction_started(&self.store, self.session_id.as_str(), mode);
+        append_compaction_started(
+            self.runtime_handle.as_ref(),
+            &self.store,
+            self.session_id.as_str(),
+            mode,
+        );
 
         // Model-based no-tools summary pass + codex-parity compacted-history
         // assembly (preserved recent user messages capped at 20k tokens + the
@@ -1661,6 +2107,7 @@ impl StoreTurnState {
         let compacted = match run_compaction_with_retries(
             &self.session_id,
             &self.store,
+            self.runtime_handle.as_ref(),
             &items,
             sampler.as_ref(),
             &self.compact_prompt,
@@ -1672,12 +2119,18 @@ impl StoreTurnState {
         {
             Ok(compacted) => compacted,
             Err(error) => {
-                append_compaction_failed(&self.store, self.session_id.as_str(), mode, &error);
+                append_compaction_failed(
+                    self.runtime_handle.as_ref(),
+                    &self.store,
+                    self.session_id.as_str(),
+                    mode,
+                    &error,
+                );
                 return Err(error);
             }
         };
 
-        let events = events_from_store(&self.store, self.session_id.as_str());
+        let events = self.durable_events_blocking();
         let initial_context = initial_context_messages_from_events(&events, None, true, true);
         let initial_context_already_in_history = matches!(mode, CompactionMode::MidTurn);
         let replay_from_seq = match mode {
@@ -1693,24 +2146,22 @@ impl StoreTurnState {
             compacted.items
         };
 
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            store
-                .append_event(
-                    self.session_id.as_str(),
-                    "session.compacted",
-                    compacted_event_payload(
-                        &compacted.summary_text,
-                        &replacement_messages,
-                        initial_context_already_in_history,
-                        replay_from_seq,
-                    ),
-                )
-                .map_err(|error| AgentError::Store(error.into()))?;
-        }
+        append_runtime_or_store_event(
+            self.runtime_handle.as_ref(),
+            &self.store,
+            self.session_id.as_str(),
+            "session.compacted",
+            compacted_event_payload(
+                &compacted.summary_text,
+                &replacement_messages,
+                initial_context_already_in_history,
+                replay_from_seq,
+            ),
+        )
+        .map_err(AgentError::Store)?;
 
         let active_after_compact = {
-            let lowered = history_from_store(&self.store, self.session_id.as_str());
+            let lowered = self.durable_history_blocking();
             let items = lowered
                 .iter()
                 .map(message_to_provider_item)
@@ -1721,33 +2172,26 @@ impl StoreTurnState {
             mgr.estimate_total_tokens()
                 .saturating_add(crate::compact::approx_token_count(&self.base_instructions) as i64)
         };
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            let previous_total = latest_total_token_usage_value(
-                &store
-                    .events_for_session(self.session_id.as_str())
-                    .unwrap_or_default(),
-            );
-            store
-                .append_event(
-                    self.session_id.as_str(),
-                    names::TOKEN_COUNT,
-                    recomputed_token_count_payload(
-                        active_after_compact,
-                        self.context_window(),
-                        &previous_total,
-                    ),
-                )
-                .map_err(|error| AgentError::Store(error.into()))?;
-        }
+        let previous_total = latest_total_token_usage_value(&self.durable_events_blocking());
+        append_runtime_or_store_event(
+            self.runtime_handle.as_ref(),
+            &self.store,
+            self.session_id.as_str(),
+            names::TOKEN_COUNT,
+            recomputed_token_count_payload(
+                active_after_compact,
+                self.context_window(),
+                &previous_total,
+            ),
+        )
+        .map_err(AgentError::Store)?;
         self.recorded.lock().unwrap().clear();
-        let mut window = self.auto_compact_window.lock().unwrap();
-        window.start_next();
+        self.start_next_auto_compact_window();
         if matches!(
             self.auto_compact_scope,
             AutoCompactTokenLimitScope::BodyAfterPrefix
         ) {
-            window.set_estimated_prefill(active_after_compact);
+            self.set_auto_compact_estimated_prefill(active_after_compact);
         }
         Ok(())
     }
@@ -2008,13 +2452,113 @@ impl EventSink for DiscardSink {
     fn emit(&self, _ev: PendingEvent) {}
 }
 
-/// Drive a loop run to quiescence with `driver`, over a store-backed state +
-/// observer. Returns the final assistant message (`None` if no text was produced).
+/// Drive a loop run to quiescence with `driver`, over a runtime-aware state and
+/// durable observer. Returns the final assistant message (`None` if no text was
+/// produced).
 ///
 /// `recorded` is the SHARED conversation buffer: for the real fused path it is the
 /// SAME `Arc` the driver's [`FusionRecorder`] writes (so dispatched tool outputs
 /// re-enter the next prompt). The state is built over it AFTER the driver so the
 /// driver/recorder and the loop read/write the one buffer.
+struct RuntimeTurnLoopDriver<Sd> {
+    store: SharedStore,
+    session_id: SessionId,
+    ctx: TurnCtx,
+    driver: Sd,
+    turn_has_fresh_input: bool,
+    recorded: RecordedBuffer,
+    compaction: Option<(
+        i64,
+        Option<i64>,
+        AutoCompactTokenLimitScope,
+        Arc<dyn DynCompactionSampler>,
+    )>,
+    current_model: Option<String>,
+    compact_prompt: Option<String>,
+    base_instructions: Option<String>,
+    developer_instructions: Option<String>,
+    previous_model_compaction: Option<PreviousModelCompaction>,
+    runtime_handle: RuntimeHandle,
+    cancel: CancellationToken,
+}
+
+impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
+    async fn run(self) -> Result<Option<String>, AgentError> {
+        let Self {
+            store,
+            session_id,
+            ctx,
+            driver,
+            turn_has_fresh_input,
+            recorded,
+            compaction,
+            current_model,
+            compact_prompt,
+            base_instructions,
+            developer_instructions,
+            previous_model_compaction,
+            runtime_handle,
+            cancel,
+        } = self;
+
+        let mailbox_delivery_phase =
+            initial_runtime_mailbox_delivery_phase(Some(&runtime_handle), session_id.as_str());
+        let state = LiveTurnState::new(Arc::clone(&store), session_id.clone(), recorded)
+            .with_runtime_handle(Some(runtime_handle.clone()))
+            .with_mailbox_delivery_phase(mailbox_delivery_phase);
+        // Enable REAL token accounting + model-based compaction when a sampler is
+        // available (the real backend path). The Fake/no-credential path passes `None`
+        // and keeps the inert (never-compacts) behavior.
+        let state = match compaction {
+            Some((window, configured_limit, scope, sampler)) => {
+                state.with_compaction(window, configured_limit, scope, sampler)
+            }
+            None => state,
+        }
+        .with_current_model(current_model.unwrap_or_default())
+        .with_compaction_prompt(
+            compact_prompt.unwrap_or_else(|| crate::compact::SUMMARIZATION_PROMPT.to_string()),
+        )
+        .with_compaction_instructions(
+            base_instructions.unwrap_or_else(|| crate::prompts::browser_agent_system_prompt()),
+            developer_instructions,
+        )
+        .with_previous_model_compaction(previous_model_compaction);
+
+        let pre_turn_replay_from_seq = if turn_has_fresh_input {
+            let events = state.durable_events_blocking();
+            latest_replay_seq_before_fresh_input(&events)
+        } else {
+            None
+        };
+        *state.pre_turn_replay_from_seq.lock().unwrap() = pre_turn_replay_from_seq;
+        state.compact_previous_model_downshift_if_needed().await?;
+        if state.token_status().await.token_limit_reached {
+            state.compact(CompactionMode::PreTurn).await?;
+        }
+        *state.pre_turn_replay_from_seq.lock().unwrap() = None;
+
+        // The observer persists the terminal agent message through the runtime so
+        // `session.done` is journaled and projected by the same live authority as
+        // model/tool events.
+        let sink: Arc<dyn EventSink> = Arc::new(RuntimeStoreSink {
+            runtime: runtime_handle,
+            store: Arc::clone(&store),
+            model_context_window: None,
+        });
+        let observer = StoreObserver::new(sink, session_id.as_str().to_string());
+
+        let turn_loop = TurnLoop::new(state, driver, observer);
+        let result = turn_loop
+            .run(ctx, turn_has_fresh_input, cancel.clone())
+            .await;
+        if result.is_ok() {
+            ensure_fallback_capture_recording(&store, session_id.as_str());
+        }
+        result
+    }
+}
+
 async fn drive_run<Sd: SamplingDriver>(
     store: SharedStore,
     session_id: SessionId,
@@ -2033,90 +2577,27 @@ async fn drive_run<Sd: SamplingDriver>(
     base_instructions: Option<String>,
     developer_instructions: Option<String>,
     previous_model_compaction: Option<PreviousModelCompaction>,
+    runtime_handle: RuntimeHandle,
     cancel: CancellationToken,
 ) -> Result<Option<String>, AgentError> {
-    let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded);
-    // Enable REAL token accounting + model-based compaction when a sampler is
-    // available (the real backend path). The Fake/no-credential path passes `None`
-    // and keeps the inert (never-compacts) behavior.
-    let state = match compaction {
-        Some((window, configured_limit, scope, sampler)) => {
-            state.with_compaction(window, configured_limit, scope, sampler)
-        }
-        None => state,
-    }
-    .with_current_model(current_model.unwrap_or_default())
-    .with_compaction_prompt(
-        compact_prompt.unwrap_or_else(|| crate::compact::SUMMARIZATION_PROMPT.to_string()),
-    )
-    .with_compaction_instructions(
-        base_instructions.unwrap_or_else(|| crate::prompts::browser_agent_system_prompt()),
+    RuntimeTurnLoopDriver {
+        store,
+        session_id,
+        ctx,
+        driver,
+        turn_has_fresh_input,
+        recorded,
+        compaction,
+        current_model,
+        compact_prompt,
+        base_instructions,
         developer_instructions,
-    )
-    .with_previous_model_compaction(previous_model_compaction);
-
-    let pre_turn_replay_from_seq = if turn_has_fresh_input {
-        let events = events_from_store(&store, session_id.as_str());
-        latest_replay_seq_before_fresh_input(&events)
-    } else {
-        None
-    };
-    *state.pre_turn_replay_from_seq.lock().unwrap() = pre_turn_replay_from_seq;
-    state.compact_previous_model_downshift_if_needed().await?;
-    if state.token_status().await.token_limit_reached {
-        state.compact(CompactionMode::PreTurn).await?;
+        previous_model_compaction,
+        runtime_handle,
+        cancel,
     }
-    *state.pre_turn_replay_from_seq.lock().unwrap() = None;
-
-    // The observer persists the terminal agent message through a synchronous
-    // durable sink over the SharedStore. (The async `events::StoreSink` writer
-    // needs sole ownership of the Store, which the facade does not have — it keeps
-    // a SharedStore clone — so a small shared-lock adapter is used instead.)
-    let sink: Arc<dyn EventSink> = make_ui_sink(Arc::clone(&store));
-    let observer = StoreObserver::new(sink, session_id.as_str().to_string());
-
-    let turn_loop = TurnLoop::new(state, driver, observer);
-    let cancel_monitor =
-        spawn_store_cancel_monitor(Arc::clone(&store), session_id.clone(), cancel.clone());
-    let result = turn_loop
-        .run(ctx, turn_has_fresh_input, cancel.clone())
-        .await;
-    cancel_monitor.abort();
-    if result.is_ok() {
-        ensure_fallback_capture_recording(&store, session_id.as_str());
-    }
-    result
-}
-
-fn spawn_store_cancel_monitor(
-    store: SharedStore,
-    session_id: SessionId,
-    cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if cancel.is_cancelled() {
-                return;
-            }
-            let store = Arc::clone(&store);
-            let session_id = session_id.as_str().to_string();
-            let should_cancel = tokio::task::spawn_blocking(move || {
-                let store = store.lock().expect("store mutex poisoned");
-                store
-                    .load_session(&session_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|session| session.status == SessionStatus::Cancelled)
-            })
-            .await
-            .unwrap_or(false);
-            if should_cancel {
-                cancel.cancel();
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
+    .run()
+    .await
 }
 
 /// Build the durable UI sink for loop lifecycle events.
@@ -2125,10 +2606,7 @@ fn spawn_store_cancel_monitor(
 /// which the facade does not have (the caller keeps the `SharedStore`). So the
 /// lifecycle observer persists through a small synchronous adapter over the
 /// `SharedStore` instead.
-fn make_ui_sink(store: SharedStore) -> Arc<dyn EventSink> {
-    make_ui_sink_with_context_window(store, None)
-}
-
+#[cfg(test)]
 fn make_ui_sink_with_context_window(
     store: SharedStore,
     model_context_window: Option<i64>,
@@ -2145,11 +2623,13 @@ fn make_ui_sink_with_context_window(
 /// shared handle, so this adapter appends events directly under the shared lock.
 /// Best-effort: append errors are swallowed (the loop's return value also carries
 /// the result), matching the infallible-fan-out contract of [`EventSink::emit`].
+#[cfg(test)]
 struct SharedStoreSink {
     store: SharedStore,
     model_context_window: Option<i64>,
 }
 
+#[cfg(test)]
 impl EventSink for SharedStoreSink {
     fn emit(&self, ev: PendingEvent) {
         if let Ok(store) = self.store.lock() {
@@ -2162,6 +2642,56 @@ impl EventSink for SharedStoreSink {
             };
             let _ = store.append_event(&ev.session_id, &ev.event_type, payload);
         }
+    }
+}
+
+/// Runtime-backed protocol-event sink.
+///
+/// This is the live-runtime cutover point for model/tool events: callers that
+/// have a [`RuntimeHandle`] make the runtime perform the journal append and
+/// publish a live event. The SQLite row remains byte-shape-compatible with the
+/// old store sink because `append_observed_session_event` writes the original
+/// `event_type` and payload, not a runtime envelope.
+struct RuntimeStoreSink {
+    runtime: RuntimeHandle,
+    store: SharedStore,
+    model_context_window: Option<i64>,
+}
+
+impl EventSink for RuntimeStoreSink {
+    fn emit(&self, ev: PendingEvent) {
+        let payload = if ev.event_type == names::TOKEN_COUNT {
+            if let Ok(store) = self.store.lock() {
+                let events = store.events_for_session(&ev.session_id).unwrap_or_default();
+                let previous_total = latest_total_token_usage_value(&events);
+                enrich_token_count_payload(ev.payload, &previous_total, self.model_context_window)
+            } else {
+                ev.payload
+            }
+        } else {
+            ev.payload
+        };
+        let Ok(session_id) = RuntimeSessionId::from_string(ev.session_id) else {
+            return;
+        };
+        let _ = self.runtime.append_observed_session_event(
+            session_id,
+            &ev.event_type,
+            payload,
+            durability_for_protocol_event(&ev.event_type),
+        );
+    }
+}
+
+fn durability_for_protocol_event(event_type: &str) -> RuntimeDurability {
+    if event_type.ends_with(".output_delta")
+        || event_type == "tool.output_delta"
+        || event_type == "model.stream_delta"
+        || event_type == "model.thinking_delta"
+    {
+        RuntimeDurability::BestEffort
+    } else {
+        RuntimeDurability::Barrier
     }
 }
 
@@ -2193,21 +2723,153 @@ pub async fn run_session_with_config_with_cancel(
     config: ProviderRunConfig,
     cancel: CancellationToken,
 ) -> anyhow::Result<SessionId> {
-    let session_id = SessionId(session_id.to_string());
-    loop {
-        run_session_once_with_config_with_cancel(
-            Arc::clone(&store),
-            session_id.clone(),
-            config.clone(),
-            cancel.clone(),
+    run_session_with_config_with_cancel_and_runtime(store, session_id, config, cancel, None).await
+}
+
+pub async fn run_session_with_config_with_cancel_and_runtime(
+    store: SharedStore,
+    session_id: &str,
+    config: ProviderRunConfig,
+    cancel: CancellationToken,
+    runtime_handle: Option<RuntimeHandle>,
+) -> anyhow::Result<SessionId> {
+    let runtime_handle = match runtime_handle {
+        Some(runtime_handle) => runtime_handle,
+        None => transient_runtime_for_store_session(&store, session_id, &config)?,
+    };
+    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+    let request = RuntimeRunAgentRequest::new(runtime_session_id)
+        .with_input_source("run_session_with_config_with_cancel_and_runtime")
+        .with_cancellation_token(cancel.clone());
+    let response = runtime_handle
+        .run_agent(
+            request,
+            RuntimeTurnDriver::new(store, session_id, config, cancel, runtime_handle.clone()).run(),
         )
         .await?;
+    Ok(response.output)
+}
 
-        if cancel.is_cancelled()
-            || !has_pending_trigger_turn_agent_mail(&store, session_id.as_str())
-        {
-            return Ok(session_id);
+fn transient_runtime_for_store_session(
+    store: &SharedStore,
+    session_id: &str,
+    config: &ProviderRunConfig,
+) -> anyhow::Result<RuntimeHandle> {
+    let state_dir = {
+        let store_guard = store.lock().expect("store mutex poisoned");
+        store_guard.state_dir().to_path_buf()
+    };
+    let journal = Arc::new(SqliteJournal::open(&state_dir)?);
+    let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+    let state_index: Arc<dyn StateIndex> = journal;
+    let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+    {
+        let store_guard = store.lock().expect("store mutex poisoned");
+        ensure_runtime_agent_attached(
+            &runtime_handle,
+            &store_guard,
+            session_id,
+            config
+                .options
+                .multi_agent_v2
+                .max_concurrent_threads_per_session,
+        )?;
+        accept_latest_durable_prompt_input(&runtime_handle, session_id)?;
+    }
+    Ok(runtime_handle)
+}
+
+fn accept_latest_durable_prompt_input(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let Some(event) = latest_runtime_durable_prompt_input_event(runtime_handle, session_id)? else {
+        return Ok(());
+    };
+    runtime_handle.accept_prompt_input(RuntimeAcceptPromptInputRequest {
+        target_agent_id: RuntimeAgentId::from_string(session_id.to_string())?,
+        source_event_seq: Some(event.seq),
+        payload: json!({
+            "source": "durable_prompt_input",
+            "event_type": event.event_type,
+        }),
+    })?;
+    Ok(())
+}
+
+fn latest_runtime_durable_prompt_input_event(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+) -> anyhow::Result<Option<EventRecord>> {
+    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+    Ok(runtime_handle
+        .events_for_session(&runtime_session_id)?
+        .into_iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup" | "agent.mailbox_input"
+            )
+        }))
+}
+
+/// Runtime-owned turn driver boundary.
+///
+/// The driver still reuses the existing model/tool loop implementation, but all
+/// live callers enter through `RuntimeHandle::run_agent` before this driver is
+/// polled. Prompt reconstruction still reads the durable journal for replayable
+/// transcript history; fresh input, mailbox delivery, cancellation, and resources
+/// are runtime-owned.
+pub struct RuntimeTurnDriver {
+    store: SharedStore,
+    session_id: SessionId,
+    config: ProviderRunConfig,
+    cancel: CancellationToken,
+    runtime_handle: RuntimeHandle,
+}
+
+impl RuntimeTurnDriver {
+    pub fn new(
+        store: SharedStore,
+        session_id: impl Into<String>,
+        config: ProviderRunConfig,
+        cancel: CancellationToken,
+        runtime_handle: RuntimeHandle,
+    ) -> Self {
+        Self {
+            store,
+            session_id: SessionId(session_id.into()),
+            config,
+            cancel,
+            runtime_handle,
         }
+    }
+
+    pub async fn run(self) -> anyhow::Result<SessionId> {
+        loop {
+            self.run_once().await?;
+
+            let has_pending_trigger_turn_mail =
+                has_pending_runtime_trigger_turn_agent_mail_any_phase(
+                    &self.runtime_handle,
+                    self.session_id.as_str(),
+                );
+            if self.cancel.is_cancelled() || !has_pending_trigger_turn_mail {
+                return Ok(self.session_id);
+            }
+        }
+    }
+
+    async fn run_once(&self) -> anyhow::Result<()> {
+        run_session_once_with_config_with_cancel(
+            Arc::clone(&self.store),
+            self.session_id.clone(),
+            self.config.clone(),
+            self.cancel.clone(),
+            self.runtime_handle.clone(),
+        )
+        .await
     }
 }
 
@@ -2216,12 +2878,13 @@ async fn run_session_once_with_config_with_cancel(
     session_id: SessionId,
     config: ProviderRunConfig,
     cancel: CancellationToken,
+    runtime_handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
     let ctx = turn_ctx(&session_id, &config);
 
     // The single in-run conversation buffer, shared (by `Arc`) between the fused
     // driver's `FusionRecorder` (which records the assistant message + dispatched
-    // tool outputs) and the loop's `StoreTurnState` (which reads it into each
+    // tool outputs) and the loop's `LiveTurnState` (which reads it into each
     // prompt). Built FIRST so the recorder can be attached to the driver below and
     // the SAME buffer handed to `drive_run` for the state — closing the fusion loop.
     let recorded: RecordedBuffer = Arc::new(Mutex::new(Vec::new()));
@@ -2232,8 +2895,11 @@ async fn run_session_once_with_config_with_cancel(
     //     recorder writing into `recorded`, so model tool-calls EXECUTE and their
     //     outputs re-enter the prompt.
     let model_context_window = effective_context_window_for_config(&config);
-    let driver_sink: Arc<dyn EventSink> =
-        make_ui_sink_with_context_window(Arc::clone(&store), model_context_window);
+    let driver_sink: Arc<dyn EventSink> = Arc::new(RuntimeStoreSink {
+        runtime: runtime_handle.clone(),
+        store: Arc::clone(&store),
+        model_context_window,
+    });
     let fusion_recorder: Arc<dyn FusionRecorder> = Arc::new(BufferRecorder {
         buffer: Arc::clone(&recorded),
     });
@@ -2268,6 +2934,7 @@ async fn run_session_once_with_config_with_cancel(
         user_input_ctx,
         tool_cwd,
         tool_artifact_root,
+        Some(runtime_handle.clone()),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -2288,12 +2955,10 @@ async fn run_session_once_with_config_with_cancel(
     }
 
     // The run drives over the session's existing durable history (the prompt the
-    // caller already seeded). Fresh user input is sampled before queued steer
-    // unless the reason this run exists is already-buffered mailbox mail; that
-    // case matches Codex's "next turn" delivery and must drain immediately.
-    let pending_mail_at_start = has_pending_agent_mail(&store, session_id.as_str());
-    let turn_has_fresh_input =
-        log_has_user_input(&store, session_id.as_str()) && !pending_mail_at_start;
+    // caller already seeded). Runtime-backed callers own the live "fresh input"
+    // fact explicitly (`agent.input.accepted` -> `agent.input.consumed`), while
+    // SQLite remains the transcript/replay source.
+    let turn_has_fresh_input = consume_runtime_prompt_input(&runtime_handle, session_id.as_str())?;
 
     // (3) drive the loop to quiescence with the resolved driver. The SAME
     //     `recorded` buffer the recorder writes is handed to the state, so the
@@ -2312,8 +2977,12 @@ async fn run_session_once_with_config_with_cancel(
             let auto_compact_limit = metadata.auto_compact_token_limit_with_override(
                 config.options.model_auto_compact_token_limit,
             );
-            let previous_model_compaction =
-                previous_model_compaction_for_config(&store, &session_id, &config);
+            let previous_model_compaction = previous_model_compaction_for_config(
+                &store,
+                &session_id,
+                Some(&runtime_handle),
+                &config,
+            );
             let compaction_sampler = {
                 let store_guard = store.lock().expect("store mutex poisoned");
                 build_compaction_sampler(&config, Some(&store_guard))
@@ -2339,6 +3008,7 @@ async fn run_session_once_with_config_with_cancel(
                 Some(base_instructions_for_config(&config)),
                 config.options.developer_instructions.clone(),
                 previous_model_compaction,
+                runtime_handle.clone(),
                 cancel.clone(),
             )
             .await?;
@@ -2363,6 +3033,7 @@ async fn run_session_once_with_config_with_cancel(
                 None,
                 None,
                 None,
+                runtime_handle.clone(),
                 cancel.clone(),
             )
             .await?;
@@ -2370,23 +3041,6 @@ async fn run_session_once_with_config_with_cancel(
     }
 
     Ok(())
-}
-
-/// True iff the session's durable log already contains a real user turn
-/// (`session.input`), used to seed the loop's initial drain gate.
-fn log_has_user_input(store: &SharedStore, session_id: &str) -> bool {
-    let store = store.lock().expect("store mutex poisoned");
-    store
-        .events_for_session(session_id)
-        .map(|events| {
-            events.iter().any(|e| {
-                matches!(
-                    e.event_type.as_str(),
-                    "session.input" | "agent.mailbox_input"
-                )
-            })
-        })
-        .unwrap_or(false)
 }
 
 /// The retry budget for the sampling driver (see [`DEFAULT_STREAM_MAX_RETRIES`]).
@@ -2462,7 +3116,16 @@ mod tests {
     use crate::config_overrides::MultiAgentV2Options;
     use crate::config_overrides::ProviderBackend;
     use crate::config_overrides::ProviderRunConfig;
+    use browser_use_runtime::{
+        AgentId as RuntimeAgentId, AttachRootAgentRequest, BrowserUseRuntime, CreateThreadRequest,
+        Durability as RuntimeDurability, JournalAppend, JournalReader, JournalSink,
+        LiveThreadPersistence, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
+        MailboxItemKind as RuntimeMailboxItemKind, MemoryJournal, RuntimeEvent,
+        SendAgentMessageRequest as RuntimeSendAgentMessageRequest, SessionId as RuntimeSessionId,
+        SpawnChildRequest, SpawnEdge, SpawnEdgeStatus, SqliteJournal, StateIndex,
+    };
     use browser_use_store::Store;
+    use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -2477,6 +3140,112 @@ mod tests {
             .expect("create session")
             .id;
         (dir, Arc::new(Mutex::new(store)), session_id)
+    }
+
+    #[derive(Clone, Default)]
+    struct ReadFailingJournal {
+        inner: MemoryJournal,
+    }
+
+    impl JournalSink for ReadFailingJournal {
+        fn append_runtime_event(&self, event: &RuntimeEvent) -> anyhow::Result<JournalAppend> {
+            self.inner.append_runtime_event(event)
+        }
+
+        fn append_session_event(
+            &self,
+            session_id: &RuntimeSessionId,
+            event_type: &str,
+            payload: Value,
+            durability: RuntimeDurability,
+        ) -> anyhow::Result<JournalAppend> {
+            self.inner
+                .append_session_event(session_id, event_type, payload, durability)
+        }
+
+        fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl JournalReader for ReadFailingJournal {
+        fn load_session(
+            &self,
+            session_id: &RuntimeSessionId,
+        ) -> anyhow::Result<Option<browser_use_protocol::SessionMeta>> {
+            self.inner.load_session(session_id)
+        }
+
+        fn list_sessions(&self) -> anyhow::Result<Vec<browser_use_protocol::SessionMeta>> {
+            self.inner.list_sessions()
+        }
+
+        fn events_for_session(
+            &self,
+            _session_id: &RuntimeSessionId,
+        ) -> anyhow::Result<Vec<EventRecord>> {
+            Err(anyhow::anyhow!("forced runtime read failure"))
+        }
+
+        fn events_after_seq(
+            &self,
+            _session_id: &RuntimeSessionId,
+            _after_seq: i64,
+        ) -> anyhow::Result<Vec<EventRecord>> {
+            Err(anyhow::anyhow!("forced runtime read failure"))
+        }
+    }
+
+    impl LiveThreadPersistence for ReadFailingJournal {
+        fn create_thread(
+            &self,
+            request: CreateThreadRequest,
+        ) -> anyhow::Result<browser_use_protocol::SessionMeta> {
+            self.inner.create_thread(request)
+        }
+    }
+
+    impl StateIndex for ReadFailingJournal {
+        fn open_spawn_edge(&self, edge: SpawnEdge) -> anyhow::Result<()> {
+            self.inner.open_spawn_edge(edge)
+        }
+
+        fn finish_spawn_edge(
+            &self,
+            child_session_id: &RuntimeSessionId,
+            status: SpawnEdgeStatus,
+        ) -> anyhow::Result<()> {
+            self.inner.finish_spawn_edge(child_session_id, status)
+        }
+
+        fn close_spawn_edge(
+            &self,
+            child_session_id: &RuntimeSessionId,
+            reason: &str,
+        ) -> anyhow::Result<()> {
+            self.inner.close_spawn_edge(child_session_id, reason)
+        }
+
+        fn list_children(
+            &self,
+            parent_session_id: &RuntimeSessionId,
+        ) -> anyhow::Result<Vec<SpawnEdge>> {
+            self.inner.list_children(parent_session_id)
+        }
+
+        fn list_descendants(
+            &self,
+            root_session_id: &RuntimeSessionId,
+        ) -> anyhow::Result<Vec<SpawnEdge>> {
+            self.inner.list_descendants(root_session_id)
+        }
+    }
+
+    fn runtime_with_read_failing_journal() -> RuntimeHandle {
+        let journal = Arc::new(ReadFailingJournal::default());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        BrowserUseRuntime::new(persistence, state_index).handle()
     }
 
     fn events(store: &SharedStore, session_id: &str) -> Vec<browser_use_protocol::EventRecord> {
@@ -2737,12 +3506,67 @@ mod tests {
             log.iter().any(|e| e.event_type == "workspace.context"),
             "expected a seeded workspace.context event"
         );
+        assert!(
+            log.iter().any(|e| e.event_type == "agent.started"
+                && e.payload
+                    .get("payload")
+                    .and_then(|payload| payload.get("runtime_owned"))
+                    .and_then(Value::as_bool)
+                    == Some(true)),
+            "compat facade must enter BrowserUseRuntime before driving"
+        );
+        assert!(
+            log.iter().any(|e| e.event_type == "agent.turn.completed"
+                && e.payload
+                    .get("payload")
+                    .and_then(|payload| payload.get("runtime_owned"))
+                    .and_then(Value::as_bool)
+                    == Some(true)),
+            "compat facade must complete through BrowserUseRuntime"
+        );
         // the terminal agent message was persisted as the visible session result.
         assert!(
             log.iter().any(|e| e.event_type == "session.done"
                 && e.payload.get("result").and_then(|v| v.as_str()) == Some("hi from fake")),
             "expected the fake assistant reply persisted; log={log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn config_facade_with_runtime_handle_enters_runtime_run_agent() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "do a thing").await;
+        let journal = Arc::new(SqliteJournal::open(dir.path()).expect("sqlite journal"));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).expect("session id"),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "do a thing".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+
+        let id = run_session_with_config_with_cancel_and_runtime(
+            Arc::clone(&store),
+            &session_id,
+            fake_config(),
+            CancellationToken::new(),
+            Some(runtime),
+        )
+        .await
+        .expect("runtime-backed config facade must run");
+        assert_eq!(id.as_str(), session_id);
+
+        let event_types = events(&store, &session_id)
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"agent.started".to_string()));
+        assert!(event_types.contains(&"agent.turn.started".to_string()));
+        assert!(event_types.contains(&"agent.turn.completed".to_string()));
     }
 
     #[tokio::test]
@@ -2796,7 +3620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_facade_drains_trigger_turn_mail_at_run_start() {
+    async fn config_facade_does_not_drain_store_trigger_turn_mail_without_runtime() {
         let (_dir, store, root_id) = store_with_session();
         {
             let store = store.lock().expect("store mutex poisoned");
@@ -2816,13 +3640,16 @@ mod tests {
 
         run_session_with_config(Arc::clone(&store), &root_id, fake_config())
             .await
-            .expect("facade must run with queued trigger-turn mail");
+            .expect("facade must ignore Store-only queued trigger-turn mail");
 
-        assert!(!has_pending_agent_mail(&store, &root_id));
+        assert!(
+            has_pending_agent_mail(&store, &root_id),
+            "Store trigger-turn mail is replay/debug state unless the runtime mailbox delivers it"
+        );
         let log = events(&store, &root_id);
         assert!(log
             .iter()
-            .any(|event| event.event_type == "agent.mailbox_input"));
+            .all(|event| event.event_type != "agent.mailbox_input"));
     }
 
     /// The codex backend is a REAL provider again: with codex OAuth creds in the
@@ -2878,7 +3705,7 @@ mod tests {
                 .expect("append");
         }
 
-        let state = StoreTurnState::new(Arc::clone(&store), sid, Arc::new(Mutex::new(Vec::new())));
+        let state = LiveTurnState::new(Arc::clone(&store), sid, Arc::new(Mutex::new(Vec::new())));
         let before = state.clone_history_for_prompt().await;
         assert!(
             !before.is_empty(),
@@ -2901,6 +3728,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_turn_state_reads_history_from_runtime_journal_first() {
+        let (_dir, store, session_id) = store_with_session();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    names::SESSION_INPUT,
+                    serde_json::json!({ "text": "store only text" }),
+                )
+                .expect("append store input");
+        }
+
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let runtime_session_id =
+            RuntimeSessionId::from_string(session_id.clone()).expect("runtime session id");
+        journal
+            .create_thread(CreateThreadRequest {
+                session_id: Some(runtime_session_id.clone()),
+                parent_session_id: None,
+                cwd: std::path::PathBuf::from("/work"),
+                artifact_root: None,
+                agent_path: None,
+                nickname: None,
+                role: None,
+            })
+            .expect("create runtime thread");
+        let runtime = runtime.handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: runtime_session_id.clone(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "runtime text".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        runtime
+            .append_observed_session_event(
+                runtime_session_id,
+                names::SESSION_INPUT,
+                serde_json::json!({ "text": "runtime journal text" }),
+                RuntimeDurability::Barrier,
+            )
+            .expect("append runtime input");
+
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime));
+
+        let prompt_text = state
+            .clone_history_for_prompt()
+            .await
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt_text.contains("runtime journal text"));
+        assert!(
+            !prompt_text.contains("store only text"),
+            "runtime-backed prompt history should come from RuntimeHandle::events_for_session first"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_state_read_failure_does_not_fall_back_to_store_history() {
+        let (_dir, store, session_id) = store_with_session();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    names::SESSION_INPUT,
+                    serde_json::json!({ "text": "store text must not leak" }),
+                )
+                .expect("append store input");
+        }
+
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime_with_read_failing_journal()));
+
+        let prompt_text = state
+            .clone_history_for_prompt()
+            .await
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !prompt_text.contains("store text must not leak"),
+            "runtime-backed prompt history must not fall back to Store when runtime journal reads fail"
+        );
+    }
+
+    #[test]
+    fn transient_runtime_accepts_initial_input_from_runtime_journal() {
+        let (dir, store, session_id) = store_with_session();
+        let input_seq = {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    names::SESSION_INPUT,
+                    serde_json::json!({ "text": "runtime accepted input" }),
+                )
+                .expect("append store input")
+                .seq
+        };
+
+        let journal = Arc::new(browser_use_runtime::SqliteJournal::open(dir.path()).unwrap());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime_handle
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+
+        accept_latest_durable_prompt_input(&runtime_handle, &session_id)
+            .expect("accept runtime input");
+
+        let accepted = events(&store, &session_id)
+            .into_iter()
+            .find(|event| event.event_type == "agent.input.accepted")
+            .expect("agent input accepted event");
+        assert_eq!(accepted.payload["payload"]["source_event_seq"], input_seq);
+    }
+
+    #[tokio::test]
     async fn pending_active_followup_drains_into_history_once() {
         let (_dir, store, session_id) = store_with_session();
         seed_user_input(&store, &session_id, "initial").await;
@@ -2919,7 +3894,7 @@ mod tests {
                 .seq
         };
 
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -2970,6 +3945,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_backed_active_followup_drains_from_mailbox_not_store_marker() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        let pending_seq = {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                    serde_json::json!({
+                        "text": "runtime steer",
+                        "delivery": FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL,
+                        "runtime_mailbox_id": "pending",
+                    }),
+                )
+                .expect("pending followup")
+                .seq
+        };
+
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        runtime
+            .send_agent_message(RuntimeSendAgentMessageRequest {
+                author_agent_id: RuntimeAgentId::from_string(session_id.clone()).unwrap(),
+                target_agent_id: RuntimeAgentId::from_string(session_id.clone()).unwrap(),
+                content: "runtime steer".to_string(),
+                trigger_turn: true,
+                kind: RuntimeMailboxItemKind::Followup,
+                delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+                payload: serde_json::json!({
+                    "pending_from_seq": pending_seq,
+                    "source": "test",
+                }),
+            })
+            .expect("enqueue runtime followup");
+
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime));
+
+        assert!(state.has_pending_input().await);
+        let drained = state.take_pending_input().await;
+        assert_eq!(drained.len(), 1);
+        assert!(!state.has_pending_input().await);
+
+        let log = events(&store, &session_id);
+        let committed = log
+            .iter()
+            .filter(|event| event.event_type == names::SESSION_FOLLOWUP)
+            .collect::<Vec<_>>();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(
+            committed[0]
+                .payload
+                .get("pending_from_seq")
+                .and_then(Value::as_i64),
+            Some(pending_seq)
+        );
+        assert!(log.iter().any(|event| {
+            event.event_type == AGENT_TURN_QUEUE_DRAINED_EVENT
+                && event
+                    .payload
+                    .get("followup_seqs")
+                    .and_then(Value::as_array)
+                    .is_some_and(|seqs| seqs.iter().any(|seq| seq.as_i64() == Some(pending_seq)))
+        }));
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_deferral_ignores_store_active_followup_marker() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                    serde_json::json!({
+                        "text": "store marker should not control runtime",
+                        "delivery": FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL,
+                    }),
+                )
+                .expect("pending followup");
+        }
+
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        runtime
+            .send_agent_message(RuntimeSendAgentMessageRequest {
+                author_agent_id: RuntimeAgentId::from_string(session_id.clone()).unwrap(),
+                target_agent_id: RuntimeAgentId::from_string(session_id.clone()).unwrap(),
+                content: "runtime current-turn steer".to_string(),
+                trigger_turn: true,
+                kind: RuntimeMailboxItemKind::Followup,
+                delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+                payload: serde_json::json!({ "source": "test" }),
+            })
+            .expect("enqueue runtime followup");
+
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime));
+
+        assert!(state.has_pending_input().await);
+        state.defer_mailbox_delivery_to_next_turn().await;
+        assert!(
+            !state.has_pending_input().await,
+            "runtime deferral should not let store follow-up markers keep current-turn delivery open"
+        );
+        assert!(
+            state.take_pending_input().await.is_empty(),
+            "deferred runtime mail should wait for the outer runtime driver restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_turn_observer_publishes_session_done_through_runtime() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        let mut projected = runtime.subscribe_projected();
+
+        let id = run_session_with_config_with_cancel_and_runtime(
+            Arc::clone(&store),
+            &session_id,
+            fake_config(),
+            CancellationToken::new(),
+            Some(runtime),
+        )
+        .await
+        .expect("runtime-backed run");
+        assert_eq!(id.0, session_id);
+
+        let mut saw_session_done = false;
+        for _ in 0..16 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_millis(250), projected.recv())
+                    .await
+                    .expect("runtime projected event")
+                    .expect("runtime event");
+            if event.payload.get("event_type").and_then(Value::as_str) == Some(names::SESSION_DONE)
+            {
+                saw_session_done = true;
+                break;
+            }
+        }
+        assert!(
+            saw_session_done,
+            "runtime-backed terminal observer must publish session.done through runtime projection"
+        );
+    }
+
+    #[tokio::test]
     async fn token_status_prefers_provider_usage_over_whole_prompt_estimate() {
         let (_dir, store, session_id) = store_with_session();
         seed_user_input(&store, &session_id, &"x".repeat(2_000)).await;
@@ -2977,9 +4149,8 @@ mod tests {
 
         let recorded = Arc::new(Mutex::new(vec![assistant_text_message("done")]));
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
-        let state =
-            StoreTurnState::new(Arc::clone(&store), SessionId(session_id.clone()), recorded)
-                .with_compaction(1_000, Some(300), AutoCompactTokenLimitScope::Total, sampler);
+        let state = LiveTurnState::new(Arc::clone(&store), SessionId(session_id.clone()), recorded)
+            .with_compaction(1_000, Some(300), AutoCompactTokenLimitScope::Total, sampler);
 
         let status = state.token_status().await;
         assert_eq!(
@@ -2998,7 +4169,7 @@ mod tests {
         seed_user_input(&store, &session_id, &"x".repeat(2_000)).await;
 
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3036,7 +4207,7 @@ mod tests {
         }
 
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3107,7 +4278,7 @@ mod tests {
 
         let recorded = Arc::new(Mutex::new(vec![assistant_text_message("done")]));
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::clone(&recorded),
@@ -3141,13 +4312,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_backed_body_after_prefix_prefill_lives_on_agent_thread() {
+        let (_dir, store, session_id) = store_with_session();
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let runtime_session_id =
+            RuntimeSessionId::from_string(session_id.clone()).expect("runtime session id");
+        journal
+            .create_thread(CreateThreadRequest {
+                session_id: Some(runtime_session_id.clone()),
+                parent_session_id: None,
+                cwd: std::path::PathBuf::from("/work"),
+                artifact_root: None,
+                agent_path: None,
+                nickname: None,
+                role: None,
+            })
+            .expect("create runtime thread");
+        let runtime = runtime.handle();
+        let root = runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: runtime_session_id.clone(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "initial request".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        runtime
+            .append_observed_session_event(
+                runtime_session_id.clone(),
+                names::SESSION_INPUT,
+                serde_json::json!({ "text": "initial request" }),
+                RuntimeDurability::Barrier,
+            )
+            .expect("append runtime input");
+        runtime
+            .append_observed_session_event(
+                runtime_session_id,
+                names::TOKEN_COUNT,
+                serde_json::json!({
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 80,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 20,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 100,
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 80,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 20,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 100,
+                        },
+                        "model_context_window": 1_000,
+                    },
+                    "turn_idx": 0,
+                }),
+                RuntimeDurability::Barrier,
+            )
+            .expect("append runtime token count");
+
+        let recorded = Arc::new(Mutex::new(vec![assistant_text_message("done")]));
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::clone(&recorded),
+        )
+        .with_runtime_handle(Some(runtime))
+        .with_compaction(
+            1_000,
+            Some(50),
+            AutoCompactTokenLimitScope::BodyAfterPrefix,
+            sampler,
+        );
+
+        let status = state.token_status().await;
+        assert_eq!(status.auto_compact_scope_tokens, 20);
+        let live = root.live_state_snapshot();
+        assert_eq!(live.compaction_prefill_input_tokens, Some(80));
+        assert_eq!(
+            live.compaction_prefill_source.as_deref(),
+            Some("server_observed")
+        );
+    }
+
+    #[tokio::test]
     async fn body_after_prefix_uses_effective_context_window_for_full_guard() {
         let (_dir, store, session_id) = store_with_session();
         seed_user_input(&store, &session_id, "initial request").await;
         seed_token_count_usage(&store, &session_id, 95, 0, 95);
 
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3178,7 +4436,7 @@ mod tests {
         seed_user_input(&store, &session_id, "please compact this session").await;
 
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3254,7 +4512,7 @@ mod tests {
         seed_user_input(&store, &session_id, "please compact before the turn").await;
 
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3317,7 +4575,7 @@ mod tests {
         let fresh_seq = append_user_input(&store, &session_id, "fresh request");
 
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3373,7 +4631,7 @@ mod tests {
         seed_token_count(&store, &session_id, 900);
 
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3424,7 +4682,7 @@ mod tests {
                 total: 50,
             },
         });
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3467,6 +4725,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_backed_compaction_publishes_checkpoint_through_runtime() -> anyhow::Result<()>
+    {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "please compact").await;
+        let journal = Arc::new(SqliteJournal::open(dir.path())?);
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime_handle.attach_root_agent(AttachRootAgentRequest {
+            session_id: RuntimeSessionId::from_string(session_id.clone())?,
+            cwd: std::path::PathBuf::from("/work"),
+            task: "please compact".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let mut projection = runtime_handle.subscribe_projected();
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, None, AutoCompactTokenLimitScope::Total, sampler)
+        .with_runtime_handle(Some(runtime_handle.clone()));
+
+        state.compact(CompactionMode::MidTurn).await?;
+
+        let mut saw_compacted = false;
+        for _ in 0..6 {
+            let event = projection.recv().await?;
+            if event.payload["event_type"] == "session.compacted" {
+                saw_compacted = true;
+                break;
+            }
+        }
+        assert!(
+            saw_compacted,
+            "runtime-backed compaction should publish session.compacted through the runtime event bus"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn compaction_retries_retryable_summary_failures() {
         let (_dir, store, session_id) = store_with_session();
         seed_user_input(&store, &session_id, "please compact").await;
@@ -3474,7 +4775,7 @@ mod tests {
         let sampler: Arc<dyn DynCompactionSampler> = Arc::new(FlakySummarySampler {
             attempts: AtomicUsize::new(0),
         });
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3512,6 +4813,7 @@ mod tests {
         let compacted = run_compaction_with_retries(
             &SessionId(session_id.clone()),
             &store,
+            None,
             &[
                 serde_json::json!({"role": "user", "content": [{"type": "text", "text": "old request"}]}),
                 serde_json::json!({"role": "user", "content": [{"type": "text", "text": "new request"}]}),
@@ -3544,6 +4846,7 @@ mod tests {
         let err = run_compaction_with_retries(
             &SessionId(session_id.clone()),
             &store,
+            None,
             &[],
             sampler.as_ref(),
             crate::compact::SUMMARIZATION_PROMPT,
@@ -3584,7 +4887,7 @@ mod tests {
             Arc::new(StaticSummarySampler("current model handoff"));
         let previous_sampler: Arc<dyn DynCompactionSampler> =
             Arc::new(StaticSummarySampler("previous model handoff"));
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3628,7 +4931,7 @@ mod tests {
 
         let sampler = Arc::new(CapturingSummarySampler::new("handoff"));
         let sampler_dyn: Arc<dyn DynCompactionSampler> = sampler.clone();
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3678,7 +4981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_turn_state_drains_agent_mailbox_as_pending_input() {
+    async fn store_mailbox_rows_are_not_live_pending_input_without_runtime() {
         let (_dir, store, root_id) = store_with_session();
         let child_id = {
             let store = store.lock().expect("store mutex poisoned");
@@ -3697,34 +5000,275 @@ mod tests {
             child.id
         };
 
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(root_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
         );
+        assert!(
+            !state.has_pending_input().await,
+            "SQLite mailbox rows are durable replay/debug data, not live wakeup state"
+        );
+        let drained = state.take_pending_input().await;
+        assert!(
+            drained.is_empty(),
+            "Store mailbox rows must not be drained into live model input without a runtime"
+        );
+        assert!(!state.has_pending_input().await);
+        assert!(has_pending_agent_mail(&store, &root_id));
+
+        let root_events = events(&store, &root_id);
+        assert!(
+            root_events
+                .iter()
+                .all(|event| event.event_type != "agent.mailbox_input"),
+            "live mailbox input projection is runtime-owned"
+        );
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            let messages = store.messages_for_agent(&root_id).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].author_session_id, child_id);
+            assert_eq!(messages[0].target_session_id, root_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_state_drains_runtime_mailbox_without_store_mail() {
+        let (dir, store, root_id) = store_with_session();
+        let journal = Arc::new(browser_use_runtime::SqliteJournal::open(dir.path()).unwrap());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        let root_runtime_id = RuntimeSessionId::from_string(root_id.clone()).unwrap();
+        let root = runtime_handle
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: root_runtime_id,
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .unwrap();
+        let child = runtime_handle
+            .spawn_child(SpawnChildRequest {
+                parent_agent_id: root.agent_id().clone(),
+                child_agent_id: Some(RuntimeAgentId::from_string("child-agent").unwrap()),
+                child_session_id: None,
+                task_name: "worker".to_string(),
+                message: "inspect".to_string(),
+                nickname: Some("Atlas".to_string()),
+                role: Some("explorer".to_string()),
+            })
+            .unwrap();
+        runtime_handle
+            .send_agent_message(RuntimeSendAgentMessageRequest {
+                author_agent_id: child.agent_id().clone(),
+                target_agent_id: root.agent_id().clone(),
+                content: "runtime-only child update".to_string(),
+                trigger_turn: false,
+                kind: RuntimeMailboxItemKind::Input,
+                delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+                payload: json!({"source": "test"}),
+            })
+            .unwrap();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            assert!(
+                store.messages_for_agent(&root_id).unwrap().is_empty(),
+                "runtime mailbox delivery must not rely on agent_messages rows"
+            );
+        }
+
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(root_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime_handle.clone()));
         assert!(state.has_pending_input().await);
         let drained = state.take_pending_input().await;
         assert_eq!(drained.len(), 1);
         assert!(!state.has_pending_input().await);
 
-        assert_eq!(drained[0].role, MessageRole::Assistant);
         let ContentPart::Text { text } = &drained[0].content[0] else {
-            panic!("mailbox input should be a text envelope");
+            panic!("mailbox input should be direct task text");
         };
-        let envelope: serde_json::Value =
-            serde_json::from_str(text).expect("mailbox envelope json");
-        assert_eq!(envelope["author"], "/root/worker");
-        assert_eq!(envelope["recipient"], "/root");
-        assert_eq!(envelope["content"], "child update");
-        assert_eq!(envelope["trigger_turn"], false);
+        assert_eq!(
+            text,
+            "Inter-agent message /root/worker to you /root:\nruntime-only child update"
+        );
 
         let root_events = events(&store, &root_id);
-        let mailbox_event = root_events
+        assert!(root_events
+            .iter()
+            .any(|event| event.event_type == "mailbox.consumed"));
+        let mailbox_input = root_events
             .iter()
             .find(|event| event.event_type == "agent.mailbox_input")
-            .expect("mailbox input event");
-        assert_eq!(mailbox_event.payload["author_session_id"], child_id);
-        assert_eq!(mailbox_event.payload["target_session_id"], root_id);
+            .expect("mailbox projection event");
+        assert_eq!(mailbox_input.payload["source"], "runtime");
+        assert_eq!(
+            mailbox_input.payload["content"],
+            "runtime-only child update"
+        );
+    }
+
+    #[test]
+    fn runtime_mailbox_projection_failure_does_not_enter_prompt() {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let runtime_handle = runtime.handle();
+        let author = RuntimeAgentId::from_string("author").unwrap();
+        let target = RuntimeAgentId::from_string("target").unwrap();
+        let drained = runtime_mailbox_items_as_pending_input(
+            &runtime_handle,
+            None,
+            "",
+            vec![RuntimeMailboxItem {
+                seq: 1,
+                id: "mail-1".to_string(),
+                kind: RuntimeMailboxItemKind::Input,
+                author_agent_id: author,
+                target_agent_id: target,
+                target_path: Some("/root".to_string()),
+                content: "should not be visible".to_string(),
+                trigger_turn: false,
+                delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+                payload: json!({}),
+            }],
+        );
+
+        assert!(
+            drained.is_empty(),
+            "mailbox content must not enter the prompt when its projection append fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_next_turn_completion_mail_does_not_reopen_parent_turn() {
+        let (dir, store, root_id) = store_with_session();
+        let journal = Arc::new(browser_use_runtime::SqliteJournal::open(dir.path()).unwrap());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        let root = runtime_handle
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(root_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .unwrap();
+        let child = runtime_handle
+            .spawn_child(SpawnChildRequest {
+                parent_agent_id: root.agent_id().clone(),
+                child_agent_id: Some(RuntimeAgentId::from_string("child-agent").unwrap()),
+                child_session_id: None,
+                task_name: "worker".to_string(),
+                message: "inspect".to_string(),
+                nickname: Some("Atlas".to_string()),
+                role: Some("explorer".to_string()),
+            })
+            .unwrap();
+
+        runtime_handle
+            .send_agent_message(RuntimeSendAgentMessageRequest {
+                author_agent_id: child.agent_id().clone(),
+                target_agent_id: root.agent_id().clone(),
+                content: "child finished".to_string(),
+                trigger_turn: false,
+                kind: RuntimeMailboxItemKind::Completion,
+                delivery_phase: RuntimeMailboxDeliveryPhase::NextTurn,
+                payload: json!({"source": "test"}),
+            })
+            .unwrap();
+
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(root_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime_handle.clone()))
+        .with_mailbox_delivery_phase(MailboxDeliveryPhase::NextTurn);
+
+        assert!(
+            !state.has_pending_input().await,
+            "completion mail is non-triggering and must not auto-run the parent"
+        );
+        assert!(state.take_pending_input().await.is_empty());
+        assert_eq!(
+            runtime_handle
+                .pending_agent_mail_for_session(root.session_id())
+                .unwrap()
+                .len(),
+            1,
+            "non-triggering completion mail should remain visible for wait/status flows"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_next_turn_trigger_mail_reopens_target_turn() {
+        let (dir, store, root_id) = store_with_session();
+        let journal = Arc::new(browser_use_runtime::SqliteJournal::open(dir.path()).unwrap());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        let root = runtime_handle
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(root_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .unwrap();
+        let child = runtime_handle
+            .spawn_child(SpawnChildRequest {
+                parent_agent_id: root.agent_id().clone(),
+                child_agent_id: Some(RuntimeAgentId::from_string("child-agent").unwrap()),
+                child_session_id: None,
+                task_name: "worker".to_string(),
+                message: "inspect".to_string(),
+                nickname: Some("Atlas".to_string()),
+                role: Some("explorer".to_string()),
+            })
+            .unwrap();
+
+        runtime_handle
+            .send_agent_message(RuntimeSendAgentMessageRequest {
+                author_agent_id: root.agent_id().clone(),
+                target_agent_id: child.agent_id().clone(),
+                content: "continue with a deeper pass".to_string(),
+                trigger_turn: true,
+                kind: RuntimeMailboxItemKind::Followup,
+                delivery_phase: RuntimeMailboxDeliveryPhase::NextTurn,
+                payload: json!({"source": "test"}),
+            })
+            .unwrap();
+
+        assert_eq!(
+            initial_runtime_mailbox_delivery_phase(
+                Some(&runtime_handle),
+                child.session_id().as_str()
+            ),
+            MailboxDeliveryPhase::NextTurn
+        );
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(child.session_id().as_str().to_string()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime_handle.clone()))
+        .with_mailbox_delivery_phase(MailboxDeliveryPhase::NextTurn);
+
+        assert!(state.has_pending_input().await);
+        let drained = state.take_pending_input().await;
+        assert_eq!(drained.len(), 1);
+        assert!(
+            runtime_handle
+                .pending_agent_mail_for_session(child.session_id())
+                .unwrap()
+                .is_empty(),
+            "triggering follow-up should drain from the runtime mailbox"
+        );
     }
 
     #[tokio::test]
@@ -3746,7 +5290,7 @@ mod tests {
                 .expect("agent message");
         }
 
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(root_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3766,13 +5310,17 @@ mod tests {
             assert_eq!(store.messages_for_agent(&root_id).unwrap().len(), 1);
         }
 
-        let next_turn_state = StoreTurnState::new(
+        let next_turn_state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(root_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
         );
-        assert!(next_turn_state.has_pending_input().await);
-        assert_eq!(next_turn_state.take_pending_input().await.len(), 1);
+        assert!(
+            !next_turn_state.has_pending_input().await,
+            "the next live turn still needs the runtime mailbox to deliver Store-backed mail"
+        );
+        assert!(next_turn_state.take_pending_input().await.is_empty());
+        assert!(has_pending_agent_mail(&store, &root_id));
     }
 
     #[tokio::test]
@@ -3794,7 +5342,7 @@ mod tests {
                 .expect("agent message");
         }
 
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(root_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3827,7 +5375,7 @@ mod tests {
                 .expect("agent message");
         }
 
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(root_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
@@ -3852,8 +5400,14 @@ mod tests {
             "active follow-up input should reopen the current turn mailbox"
         );
         let drained = state.take_pending_input().await;
-        assert_eq!(drained.len(), 1);
-        assert!(!has_pending_agent_mail(&store, &root_id));
+        assert!(
+            drained.is_empty(),
+            "Store-only active follow-up commits journal input but must not synthesize mailbox messages"
+        );
+        assert!(
+            has_pending_agent_mail(&store, &root_id),
+            "operator follow-up should not implicitly drain Store mailbox rows"
+        );
 
         let log = events(&store, &root_id);
         assert!(log
@@ -3861,7 +5415,7 @@ mod tests {
             .any(|event| event.event_type == names::SESSION_FOLLOWUP));
         assert!(log
             .iter()
-            .any(|event| event.event_type == "agent.mailbox_input"));
+            .all(|event| event.event_type != "agent.mailbox_input"));
     }
 
     struct CancelAwareDriver;
@@ -3878,25 +5432,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drive_run_observes_store_cancel_requests() {
-        let (_dir, store, session_id) = store_with_session();
+    async fn drive_run_observes_runtime_cancel_token() {
+        let (dir, store, session_id) = store_with_session();
         seed_user_input(&store, &session_id, "long task").await;
+        let journal = Arc::new(SqliteJournal::open(dir.path()).expect("sqlite journal"));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime_handle
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).expect("session id"),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "long task".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach runtime root");
         let sid = SessionId(session_id.clone());
         let config = fake_config();
         let ctx = turn_ctx(&sid, &config);
-        let store_for_cancel = Arc::clone(&store);
-        let session_for_cancel = session_id.clone();
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
 
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let store = store_for_cancel.lock().expect("store mutex poisoned");
-            store
-                .request_cancel(&session_for_cancel, "test cancellation")
-                .expect("request cancel");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            cancel_for_task.cancel();
         });
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
             drive_run(
                 Arc::clone(&store),
                 sid,
@@ -3910,24 +5473,25 @@ mod tests {
                 None,
                 None,
                 None,
-                CancellationToken::new(),
+                runtime_handle,
+                cancel,
             ),
         )
         .await
-        .expect("cancel monitor should abort the hanging driver")
+        .expect("runtime cancel token should abort the hanging driver")
         .expect("turn abort should be a graceful run result");
         assert_eq!(result, None);
 
         let log = events(&store, &session_id);
         assert!(log
             .iter()
-            .any(|event| event.event_type == "session.cancel_requested"));
+            .all(|event| event.event_type != "session.cancel_requested"));
     }
 
     // -----------------------------------------------------------------------
     // Fusion seam: a scripted tool-call drives a REAL registry dispatch, and the
     // loop re-samples with the tool output in the next prompt — exactly the wiring
-    // `run_session_with_config` assembles (BufferRecorder + StoreTurnState sharing
+    // `run_session_with_config` assembles (BufferRecorder + LiveTurnState sharing
     // one buffer + a fused ModelSamplingDriver), but driven offline by a scripted
     // transport instead of a live ModelClient (so the test is network-free).
     // -----------------------------------------------------------------------
@@ -3999,7 +5563,7 @@ mod tests {
     /// Iteration 1's scripted model response emits a `shell` echo tool-call; the
     /// fused driver dispatches it THROUGH the real registry+orchestrator and the
     /// `BufferRecorder` writes the assistant message + tool output into the SAME
-    /// buffer the `StoreTurnState` reads. Iteration 2 (whose prompt is built from
+    /// buffer the `LiveTurnState` reads. Iteration 2 (whose prompt is built from
     /// that buffer) emits only text, so the loop completes. Proves the entrypoint's
     /// fusion seam: scripted tool-call → real dispatch → re-sample sees the output.
     #[tokio::test]
@@ -4012,7 +5576,7 @@ mod tests {
         let recorder: Arc<dyn FusionRecorder> = Arc::new(BufferRecorder {
             buffer: Arc::clone(&recorded),
         });
-        let state = StoreTurnState::new(
+        let state = LiveTurnState::new(
             Arc::clone(&store),
             SessionId(session_id.clone()),
             Arc::clone(&recorded),

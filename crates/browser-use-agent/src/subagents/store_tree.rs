@@ -519,6 +519,8 @@ pub fn final_statuses_for_v1_wait(store: &Store, targets: &[&str]) -> Result<Map
 
 /// The most recent task-bearing message for an agent: the later of its latest
 /// `session.followup`/`session.input` event text and its latest inbox message.
+/// Runtime-backed mailboxes journal `mailbox.enqueued` on the target session,
+/// so those events are also treated as inbox messages.
 ///
 /// Verbatim port of legacy `last_task_message_for_agent` (lib.rs:23211): scan the
 /// event log in reverse for the newest `session.followup`/`session.input` with a
@@ -541,12 +543,27 @@ pub fn last_task_message_for_agent(store: &Store, session_id: &str) -> Result<Op
         .into_iter()
         .last()
         .map(|message| (message.created_ms, message.content));
-    Ok(match (latest_event_message, latest_mail_message) {
-        (Some(event), Some(mail)) => Some(if mail.0 >= event.0 { mail.1 } else { event.1 }),
-        (Some(event), None) => Some(event.1),
-        (None, Some(mail)) => Some(mail.1),
-        (None, None) => None,
-    })
+    let latest_runtime_mail_message = events.iter().rev().find_map(|event| {
+        (event.event_type == "mailbox.enqueued")
+            .then(|| {
+                event
+                    .payload
+                    .pointer("/payload/mailbox_item/content")
+                    .or_else(|| event.payload.pointer("/mailbox_item/content"))
+                    .and_then(Value::as_str)
+            })
+            .flatten()
+            .map(|text| (event.ts_ms, text.to_string()))
+    });
+    Ok([
+        latest_event_message,
+        latest_mail_message,
+        latest_runtime_mail_message,
+    ]
+    .into_iter()
+    .flatten()
+    .max_by_key(|(ts_ms, _)| *ts_ms)
+    .map(|(_, text)| text))
 }
 
 #[cfg(test)]

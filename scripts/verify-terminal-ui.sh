@@ -8,6 +8,11 @@ cd "$ROOT"
 mkdir -p "$ARTIFACT_DIR"
 export BUT_TELEMETRY=0
 
+CURRENT_NOFILE="$(ulimit -n || true)"
+if [[ "$CURRENT_NOFILE" != "unlimited" && "$CURRENT_NOFILE" -lt 4096 ]]; then
+  ulimit -n 4096 2>/dev/null || true
+fi
+
 echo "== cargo fmt =="
 cargo fmt --check
 

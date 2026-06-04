@@ -74,37 +74,33 @@ async fn spawn_succeeds_below_depth_limit() {
 }
 
 #[tokio::test]
-async fn v2_concurrent_thread_cap_counts_only_subagents() {
-    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(1));
+async fn v2_concurrent_thread_cap_counts_root_like_codex() {
+    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(2));
     let parent = parent_ctx("/root", 0);
     manager
         .spawn(spawn_args("first", "ok"), &parent)
         .await
-        .expect("root does not count against the subagent cap");
+        .expect("cap 2 allows root plus one spawned agent");
     let err = manager
         .spawn(spawn_args("second", "no room"), &parent)
         .await
-        .expect_err("second child exceeds cap 1");
-    assert!(err
-        .to_string()
-        .contains("max_concurrent_threads_per_session limit reached (1)"));
+        .expect_err("second child exceeds cap 2 because root consumes one slot");
+    assert!(err.to_string().contains("agent limit reached"));
 
-    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(2));
+    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(3));
     manager
         .spawn(spawn_args("first", "ok"), &parent)
         .await
-        .expect("first child fits under cap 2");
+        .expect("first child fits under cap 3");
     manager
         .spawn(spawn_args("second", "ok"), &parent)
         .await
-        .expect("second child fits under cap 2");
+        .expect("second child fits under cap 3");
     let err = manager
         .spawn(spawn_args("third", "no room"), &parent)
         .await
-        .expect_err("third child exceeds cap 2");
-    assert!(err
-        .to_string()
-        .contains("max_concurrent_threads_per_session limit reached (2)"));
+        .expect_err("third child exceeds cap 3 because root consumes one slot");
+    assert!(err.to_string().contains("agent limit reached"));
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +433,6 @@ fn deserialize_model_style_args() {
         "agent_type": "worker",
         "model": "fast",
         "reasoning_effort": "high",
-        "service_tier": "priority",
         "fork_turns": "all"
     });
     let args = SpawnAgentArgs::from_value(value).expect("valid args");
@@ -445,6 +440,21 @@ fn deserialize_model_style_args() {
     assert_eq!(args.task_name, "do_thing");
     assert_eq!(args.role_name(), Some("worker"));
     assert_eq!(args.fork_turns_mode().unwrap(), ForkTurns::All);
+}
+
+#[test]
+fn deserialize_rejects_non_codex_v2_service_tier() {
+    let value = serde_json::json!({
+        "message": "do the thing",
+        "task_name": "do_thing",
+        "service_tier": "priority"
+    });
+
+    let err = SpawnAgentArgs::from_value(value).expect_err("service_tier is not a v2 argument");
+    assert!(
+        err.contains("unknown field") && err.contains("service_tier"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -461,10 +471,15 @@ fn fork_turns_parses_none_all_numeric() {
 }
 
 #[tokio::test]
-async fn full_history_spawn_rejects_agent_model_reasoning_overrides() {
-    let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
+async fn full_history_spawn_metadata_overrides_become_non_forked_role_spawn() {
+    let spawner = Arc::new(RecordingSpawner::default());
+    let manager = SubagentManager::with_config(
+        spawner.clone(),
+        RoleRegistry::new(),
+        DEFAULT_AGENT_MAX_DEPTH,
+    );
     let parent = parent_ctx("/root", 0);
-    let err = manager
+    let handle = manager
         .spawn(
             SpawnAgentArgs::from_value(serde_json::json!({
                 "message": "do it",
@@ -476,12 +491,39 @@ async fn full_history_spawn_rejects_agent_model_reasoning_overrides() {
             &parent,
         )
         .await
-        .expect_err("full-history fork must reject role/model/reasoning overrides");
-    assert!(
-        err.0.contains("Full-history forked agents inherit"),
-        "unexpected error: {}",
-        err.0
+        .expect("metadata override should normalize instead of failing");
+    assert_eq!(handle.agent_path, "/root/worker");
+    let specs = spawner.specs.lock().unwrap();
+    let spec = specs.last().expect("recorded spec");
+    assert_eq!(spec.fork_turns.as_deref(), Some("none"));
+    assert_eq!(spec.config.role.as_deref(), Some("explorer"));
+}
+
+#[tokio::test]
+async fn omitted_fork_turns_with_agent_type_normalizes_instead_of_failing() {
+    let spawner = Arc::new(RecordingSpawner::default());
+    let manager = SubagentManager::with_config(
+        spawner.clone(),
+        RoleRegistry::new(),
+        DEFAULT_AGENT_MAX_DEPTH,
     );
+    let parent = parent_ctx("/root", 0);
+    let args = SpawnAgentArgs::from_value(serde_json::json!({
+        "message": "inspect disk usage",
+        "task_name": "home_large_dirs",
+        "agent_type": "explorer"
+    }))
+    .expect("valid args");
+
+    let handle = manager
+        .spawn(args, &parent)
+        .await
+        .expect("omitted fork_turns with agent_type should normalize instead of failing");
+    assert_eq!(handle.agent_path, "/root/home_large_dirs");
+    let specs = spawner.specs.lock().unwrap();
+    let spec = specs.last().expect("recorded spec");
+    assert_eq!(spec.fork_turns.as_deref(), Some("none"));
+    assert_eq!(spec.config.role.as_deref(), Some("explorer"));
 }
 
 #[test]
@@ -539,6 +581,7 @@ fn tool_spec_has_codex_name_and_required_params() {
     assert!(required.iter().any(|v| v == "message"));
     // additionalProperties: false (deny extras at the schema level too).
     assert_eq!(spec["parameters"]["additionalProperties"], false);
+    assert!(spec["parameters"]["properties"]["service_tier"].is_null());
 }
 
 #[tokio::test]
@@ -563,7 +606,7 @@ async fn spawn_rejects_invalid_overrides() {
 }
 
 #[tokio::test]
-async fn spawn_validates_model_reasoning_and_service_tier_like_codex() {
+async fn spawn_validates_model_reasoning_and_internal_service_tier() {
     let spawner = Arc::new(RecordingSpawner::default());
     let manager = SubagentManager::with_config(
         spawner.clone(),

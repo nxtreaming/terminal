@@ -6,6 +6,7 @@ members = [
   "crates/browser-use-llm",
   "crates/browser-use-providers",
   "crates/browser-use-python-worker",
+  "crates/browser-use-runtime",
   "crates/browser-use-protocol",
   "crates/browser-use-store",
   "crates/browser-use-tui",

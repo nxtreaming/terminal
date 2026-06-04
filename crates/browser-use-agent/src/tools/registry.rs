@@ -651,7 +651,7 @@ pub mod definitions {
     pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
     const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str =
         "Tools for spawning and managing sub-agents.";
-    const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
+    const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed. If you set `agent_type`, `model`, or `reasoning_effort`, also set `fork_turns` to `none` or a positive integer; full-history forks inherit those fields.";
     const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str = "Optional model override for the new agent. Leave unset to inherit the same model as the parent, which is the preferred default. Only set this when the user explicitly asks for a different model or the task clearly requires one.";
     const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
         "Optional service tier override for the new agent. Leave unset unless the user explicitly asks for one.";
@@ -664,6 +664,7 @@ pub mod definitions {
         pub include_usage_hint: bool,
         pub usage_hint_text: Option<String>,
         pub max_concurrent_threads_per_session: Option<usize>,
+        pub is_spawned_subagent: bool,
     }
 
     impl Default for SpawnAgentDefinitionOptions {
@@ -678,6 +679,7 @@ pub mod definitions {
                 include_usage_hint: false,
                 usage_hint_text: None,
                 max_concurrent_threads_per_session: None,
+                is_spawned_subagent: false,
             }
         }
     }
@@ -775,6 +777,10 @@ pub mod definitions {
                     },
                     "cwd": { "type": "string", "description": "Working directory (defaults to the session cwd)." },
                     "timeout_ms": { "type": "integer", "description": "Per-command timeout in milliseconds." },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Maximum number of tokens to return. Excess output will be truncated."
+                    },
                     "env": {
                         "type": "object",
                         "additionalProperties": { "type": "string" },
@@ -1225,6 +1231,17 @@ to the single frame that proves the task succeeded."
         })
     }
 
+    fn spawned_subagent_concurrency_guidance(limit: Option<usize>) -> String {
+        limit
+            .map(|limit| {
+                let spawned_limit = limit.saturating_sub(1);
+                format!(
+                    " This session is configured with `max_concurrent_threads_per_session = {limit}`; the root agent counts toward that cap, so at most {spawned_limit} spawned subagent(s) may be open concurrently. If that spawned-subagent cap is already reached, wait for an existing subagent to finish and close it before spawning another, or spawn fewer subagents."
+                )
+            })
+            .unwrap_or_default()
+    }
+
     fn spawn_agent_description_v2(options: &SpawnAgentDefinitionOptions) -> String {
         let available_models_description = if options.hide_agent_type_model_reasoning {
             ""
@@ -1234,14 +1251,8 @@ to the single frame that proves the task succeeded."
                 .as_deref()
                 .unwrap_or("")
         };
-        let concurrency_guidance = options
-            .max_concurrent_threads_per_session
-            .map(|limit| {
-                format!(
-                    " This session is configured with `max_concurrent_threads_per_session = {limit}` for concurrently open agent threads."
-                )
-            })
-            .unwrap_or_default();
+        let concurrency_guidance =
+            spawned_subagent_concurrency_guidance(options.max_concurrent_threads_per_session);
         let mut description = format!(
             r#"
         {}
@@ -1251,6 +1262,8 @@ The spawned agent will have the same tools as you and the ability to spawn its o
 {SPAWN_AGENT_INHERITED_MODEL_GUIDANCE}
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
+When the user asks you to spawn subagents to research, compare, inspect, or report back on something, spawn the subagents, then call `wait_agent` and synthesize their returned mailbox results. Do not end with only a list of spawned agents or "I'll wait when you want" unless the user explicitly asked for background-only work.
+If multiple spawned agents are expected to contribute to the answer, keep waiting and integrating mailbox updates until the requested comparison/summary is complete or every spawned agent has finished/failed.
 {concurrency_guidance}"#,
             available_models_description
         );
@@ -1265,6 +1278,9 @@ The new agent's canonical task name will be provided to it along with the messag
                 description.push_str(usage_hint);
             }
         }
+        if options.is_spawned_subagent {
+            description.push_str("\nYou are already a subagent. Do not use spawn_agent merely because inherited parent history asked for agents. Only use spawn_agent if your direct current subagent task explicitly asks you to delegate further.");
+        }
         description
     }
 
@@ -1277,10 +1293,13 @@ The new agent's canonical task name will be provided to it along with the messag
                 .as_deref()
                 .unwrap_or("")
         };
+        let concurrency_guidance =
+            spawned_subagent_concurrency_guidance(options.max_concurrent_threads_per_session);
         let mut description = format!(
             r#"
         {}
 This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
+{concurrency_guidance}
 
 Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.
 Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
@@ -1566,13 +1585,6 @@ Agent-role guidance below only helps choose which agent to use after spawning is
                     "description": "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
                 }),
             );
-            properties.insert(
-                "service_tier".to_string(),
-                json!({
-                    "type": "string",
-                    "description": SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION
-                }),
-            );
         }
         ToolDefinition {
             name: "spawn_agent".to_string(),
@@ -1656,16 +1668,18 @@ Agent-role guidance below only helps choose which agent to use after spawning is
     /// `multi_agents_v2/wait.rs`: targetless mailbox wait.
     pub fn wait_agent() -> ToolDefinition {
         wait_agent_with_timeouts(WaitAgentDefinitionOptions {
-            default_timeout_ms: 30_000,
-            min_timeout_ms: 10_000,
+            default_timeout_ms: 300_000,
+            min_timeout_ms: 1,
             max_timeout_ms: 3_600_000,
         })
     }
 
     pub fn wait_agent_with_timeouts(options: WaitAgentDefinitionOptions) -> ToolDefinition {
+        let max_timeout_ms = options.max_timeout_ms.max(1);
+        let min_timeout_ms = options.min_timeout_ms.clamp(1, max_timeout_ms);
         ToolDefinition {
             name: "wait_agent".to_string(),
-            description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any), or a timeout summary if no mailbox update arrives before the deadline."
+            description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any), or a timeout summary if no mailbox update arrives before the deadline. Use this after spawning agents when the user expects their findings, comparison, or final synthesis; after it completes, consume the mailbox update in the next model step and continue waiting if more spawned agents still need to report."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1675,8 +1689,8 @@ Agent-role guidance below only helps choose which agent to use after spawning is
                         "description": format!(
                             "Optional timeout in milliseconds. Defaults to {}, min {}, max {}.",
                             options.default_timeout_ms,
-                            options.min_timeout_ms,
-                            options.max_timeout_ms
+                            min_timeout_ms,
+                            max_timeout_ms
                         )
                     }
                 },

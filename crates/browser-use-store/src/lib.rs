@@ -29,6 +29,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         7,
         include_str!("../migrations/0007_events_session_type_seq.sql"),
     ),
+    (
+        8,
+        include_str!("../migrations/0008_agent_message_consumed.sql"),
+    ),
 ];
 
 pub struct Store {
@@ -165,6 +169,41 @@ impl Store {
         Self::open_with_optional_notifier(state_dir, None)
     }
 
+    /// Open an ephemeral store over an in-memory SQLite connection.
+    ///
+    /// This keeps the legacy `Store` API available to compatibility callers
+    /// without creating `state.db`. Files/artifacts still use `state_dir` so
+    /// tool outputs have a real filesystem home.
+    pub fn open_in_memory(state_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_in_memory_with_optional_notifier(state_dir, None)
+    }
+
+    pub fn open_in_memory_with_optional_notifier(
+        state_dir: impl AsRef<Path>,
+        notifier: Option<StoreNotifier>,
+    ) -> Result<Self> {
+        let state_dir = resolve_state_dir(state_dir);
+        std::fs::create_dir_all(&state_dir)
+            .with_context(|| format!("create state dir {}", state_dir.display()))?;
+        std::fs::create_dir_all(state_dir.join("artifacts")).with_context(|| {
+            format!(
+                "create artifact dir {}",
+                state_dir.join("artifacts").display()
+            )
+        })?;
+        let conn = Connection::open_in_memory().context("open in-memory state database")?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.execute_batch("PRAGMA busy_timeout = 30000;")?;
+        let store = Self {
+            state_dir,
+            conn,
+            notifier,
+            notification_state: Arc::new(StoreNotificationState::default()),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
     pub fn open_with_notifier(
         state_dir: impl AsRef<Path>,
         notifier: StoreNotifier,
@@ -286,7 +325,22 @@ impl Store {
         self.create_session_with_id_and_artifact_root(parent_id, cwd, artifact_root, id)
     }
 
-    fn create_session_with_id_and_artifact_root(
+    pub fn create_session_with_id_and_artifact_root(
+        &self,
+        parent_id: Option<&str>,
+        cwd: impl AsRef<Path>,
+        artifact_root: impl AsRef<Path>,
+        id: impl Into<String>,
+    ) -> Result<SessionMeta> {
+        self.create_session_with_id_and_artifact_root_inner(
+            parent_id,
+            cwd,
+            artifact_root,
+            id.into(),
+        )
+    }
+
+    fn create_session_with_id_and_artifact_root_inner(
         &self,
         parent_id: Option<&str>,
         cwd: impl AsRef<Path>,
@@ -872,7 +926,7 @@ impl Store {
 
     pub fn messages_for_agent(&self, target_session_id: &str) -> Result<Vec<AgentMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, author_session_id, target_session_id, content, input_items, input_kind, trigger_turn, created_ms FROM agent_messages WHERE target_session_id = ?1 ORDER BY created_ms ASC, id ASC",
+            "SELECT id, author_session_id, target_session_id, content, input_items, input_kind, trigger_turn, created_ms FROM agent_messages WHERE target_session_id = ?1 AND consumed_ms IS NULL ORDER BY created_ms ASC, id ASC",
         )?;
         let rows = stmt
             .query_map(params![target_session_id], row_to_agent_message)?
@@ -890,11 +944,12 @@ impl Store {
         if messages.is_empty() {
             return Ok(messages);
         }
+        let consumed_ms = now_ms();
         let tx = self.conn.unchecked_transaction()?;
         for message in &messages {
             tx.execute(
-                "DELETE FROM agent_messages WHERE id = ?1",
-                params![message.id],
+                "UPDATE agent_messages SET consumed_ms = ?2 WHERE id = ?1 AND consumed_ms IS NULL",
+                params![message.id, consumed_ms],
             )?;
         }
         tx.commit()?;
@@ -1199,9 +1254,16 @@ fn status_for_event(event_type: &str, payload: &Value) -> Option<SessionStatus> 
     match event_type {
         "session.input" => Some(SessionStatus::Running),
         "session.followup" => Some(SessionStatus::Running),
+        "agent.mailbox_input" => Some(SessionStatus::Running),
+        "agent.run.started" => Some(SessionStatus::Running),
         "session.done" => Some(SessionStatus::Done),
         "session.failed" => Some(SessionStatus::Failed),
         "session.cancelled" => Some(SessionStatus::Cancelled),
+        "agent.closed"
+            if payload.get("cancelled_active_run").and_then(Value::as_bool) == Some(true) =>
+        {
+            Some(SessionStatus::Cancelled)
+        }
         "session.status" => payload
             .get("status")
             .and_then(Value::as_str)
@@ -1337,6 +1399,41 @@ mod tests {
     }
 
     #[test]
+    fn subagent_input_events_mark_session_running() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, "/tmp")?;
+        let child = store.create_child_session(
+            &parent.id,
+            "/tmp",
+            Some("/root/worker"),
+            Some("worker"),
+            Some("default"),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.mailbox_input",
+            serde_json::json!({"content": "direct task"}),
+        )?;
+        assert_eq!(
+            store.load_session(&child.id)?.map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+
+        store.set_status(&child.id, SessionStatus::Created)?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({"run_id": "run-1"}),
+        )?;
+        assert_eq!(
+            store.load_session(&child.id)?.map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn can_read_and_wait_for_events_after_seq() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -1451,6 +1548,30 @@ mod tests {
         let events = store.events_for_session(&session.id)?;
         assert_eq!(events[2].event_type, "session.cancel_requested");
         assert_eq!(events[3].event_type, "session.cancelled");
+        Ok(())
+    }
+
+    #[test]
+    fn agent_closed_with_active_cancel_projects_cancelled_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, "/tmp")?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "start child"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "agent.closed",
+            serde_json::json!({
+                "reason": "closed by close_agent",
+                "cancelled_active_run": true,
+            }),
+        )?;
+
+        let session = store.load_session(&session.id)?.expect("session");
+        assert_eq!(session.status, SessionStatus::Cancelled);
         Ok(())
     }
 
@@ -1691,6 +1812,12 @@ mod tests {
         let drained = store.drain_agent_messages_for_agent(&child.id)?;
         assert_eq!(drained, messages);
         assert!(store.messages_for_agent(&child.id)?.is_empty());
+        let retained: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM agent_messages WHERE target_session_id = ?1 AND consumed_ms IS NOT NULL",
+            params![child.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained, 1);
         assert!(store.drain_agent_messages_for_agent(&child.id)?.is_empty());
         Ok(())
     }

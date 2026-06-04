@@ -154,6 +154,13 @@ def assert_no_stripped_line(text: str, expected: str, context: str) -> None:
         raise AssertionError(f"{context}: unexpected stripped line {expected!r}\n\n{text}")
 
 
+def assert_no_command_row(text: str, command: str, context: str) -> None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == command or stripped.startswith(f"{command} "):
+            raise AssertionError(f"{context}: unexpected command row {command!r}\n\n{text}")
+
+
 def assert_count(text: str, needle: str, expected: int, context: str) -> None:
     count = text.count(needle)
     if count != expected:
@@ -537,22 +544,36 @@ def smoke_interactive_terminal(binary: Path) -> None:
         tmux_send(session, "/")
         palette = wait_for(session, "/model", "slash-palette-open")
         assert_contains(palette, "/task", "slash palette should show the first product action")
+        assert_contains(palette, "/profile", "slash palette should expose the default profile setting")
+        assert_not_contains(palette, "/plan", "slash palette should not expose removed Plan mode")
         assert_not_contains(palette, "/mode ", "slash palette should not expose collaboration mode")
-        assert_not_contains(palette, "/plan", "slash palette should not expose Plan mode")
         assert_contains(palette, "/model", "slash palette should show the model command in the visible window")
-        assert_contains(palette, "/goal", "slash palette should expose goal management")
         assert_not_contains(palette, "choose collaboration mode", "slash palette should not expose collaboration mode")
         assert_not_contains(palette, "/plan", "slash palette should not expose Plan mode")
         assert_contains(palette, "↑↓ navigate", "slash palette footer should be visible")
+        assert_no_command_row(palette, "/mode", "slash palette should not expose collaboration mode")
+        assert_not_contains(palette, "/plan", "slash palette should not expose Plan mode")
         assert_not_contains(palette, "/auth", "slash palette overflows extra actions into filtering")
         assert_not_contains(palette, "filter actions", "slash palette should not show a redundant filter prompt")
         assert_first_content_near_top(palette, 2, "slash palette should not be pushed down by previous viewport state")
+        tmux_send_literal(session, "goal")
+        goal_actions = wait_for(session, "> goal", "slash-palette-goal-filtered")
+        assert_contains(goal_actions, "/goal", "slash palette should find goal management through filtering")
+        assert_not_contains(goal_actions, "/model", "slash palette should hide non-matching model command")
+        tmux_send(session, "C-u")
+        wait_for(session, "/model", "slash-palette-filter-cleared-after-goal")
         tmux_send_literal(session, "auth")
         auth_actions = wait_for(session, "> auth", "slash-palette-auth-filtered")
         assert_contains(auth_actions, "/auth", "slash palette should find auth through filtering")
         assert_not_contains(auth_actions, "/model", "slash palette should hide non-matching model command")
         tmux_send(session, "C-u")
         wait_for(session, "/model", "slash-palette-filter-cleared")
+        tmux_send_literal(session, "sync")
+        sync_actions = wait_for(session, "> sync", "slash-palette-sync-filtered")
+        assert_contains(sync_actions, "/sync-cookies", "slash palette should find cookie sync through filtering")
+        assert_not_contains(sync_actions, "/model", "slash palette should hide non-matching model command")
+        tmux_send(session, "C-u")
+        wait_for(session, "/model", "slash-palette-filter-cleared-after-sync")
         tmux_send_literal(session, "bro")
         actions = wait_for(session, "> bro", "slash-palette-filtered")
         assert_contains(actions, "/browser", "slash palette should show matching command")
@@ -932,6 +953,11 @@ def smoke_escape_pauses_running_session(binary: Path) -> None:
             session,
             "What should the model do differently? If something went wrong, please use /feedback :)",
             "escape-paused",
+        )
+        paused = wait_for(
+            session,
+            "Ask a follow-up",
+            "escape-paused-followup",
         )
         assert_contains(paused, "Ask a follow-up", "paused session should restore follow-up composer")
         assert_contains(paused, "• Conversation paused", "single escape should commit a paused transcript row")

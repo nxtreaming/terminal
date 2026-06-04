@@ -1,18 +1,18 @@
 //! Model-callable subagent orchestration tools.
 //!
-//! These are thin handlers over the durable Store-backed agent tree when a live
-//! session store is available, falling back to the in-memory [`SubagentManager`]
-//! for isolated/no-store runs. The manager still owns spawn, role application,
-//! depth enforcement, the fallback live-agent registry, the EVENT-NOTIFY
-//! mailbox, and the [`ChildSpawner`](crate::subagents::ChildSpawner) seam.
+//! These are thin handlers over the live [`RuntimeHandle`] when one is present.
+//! The durable store is used to resolve/list the replayable agent tree and to
+//! keep the SQLite postmortem complete; it is not a live mailbox/wakeup
+//! authority. Isolated no-store tests still fall back to the in-memory
+//! [`SubagentManager`].
 //!
 //! Parity:
 //! - tool names + arg shapes: codex `multi_agents_spec.rs` (`spawn_agent`,
 //!   `wait_agent`, `send_input`, `send_message`, `followup_task`, `list_agents`,
 //!   `close_agent`).
-//! - lifecycle: a spawn enqueues a child through the manager and emits
-//!   `subagent.spawned`; Store-backed messaging persists `agent.message` rows
-//!   and mailbox entries; close updates the durable child edge where available.
+//! - lifecycle: spawn creates a runtime child thread and journals the edge;
+//!   send/followup/wait use the runtime mailbox; close updates runtime state and
+//!   the durable child edge.
 //!
 //! Each handler implements the [`ToolRuntime`] stack ONCE (like `done`): no
 //! sandbox, no approval, never denied — they route through the orchestrator on
@@ -22,7 +22,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use browser_use_store::{Store, StoreNotificationWatcher};
+use browser_use_runtime::{
+    AgentId as RuntimeAgentId, AgentTarget as RuntimeAgentTarget,
+    AgentThreadStatus as RuntimeAgentThreadStatus, CloseAgentRequest as RuntimeCloseAgentRequest,
+    Durability as RuntimeDurability, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
+    MailboxItemKind as RuntimeMailboxItemKind, RuntimeHandle,
+    SendAgentMessageRequest as RuntimeSendAgentMessageRequest, SessionId as RuntimeSessionId,
+    WaitAgentOutcome as RuntimeWaitAgentOutcome,
+};
+use browser_use_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
@@ -42,9 +50,8 @@ use crate::subagents::manager::{ParentContext, SubagentManager};
 use crate::subagents::spawn::{check_spawn_depth, SpawnAgentArgs};
 use crate::subagents::{
     cleanup_agent_runtime_state_for_agent_subtree, display_agent_path_for_session,
-    final_statuses_for_v1_wait, last_task_message_for_agent, local_agent_status_value,
-    resolve_agent_path_v2, resolve_agent_reference_in_tree_v2, session_was_interrupted,
-    store_collect_agent_tree, store_resolve_agent_reference_in_tree,
+    last_task_message_for_agent, local_agent_status_value, resolve_agent_path_v2,
+    resolve_agent_reference_in_tree_v2, session_was_interrupted, store_collect_agent_tree,
     store_resolve_agent_reference_in_tree_v2, store_root_session_id,
 };
 use crate::tools::runtime::{
@@ -98,9 +105,12 @@ pub struct SubagentToolDeps {
     /// Per-session runtime cleanup used by close_agent to tear down resources
     /// that live outside the durable store, such as unified exec sessions.
     pub cleanup_session_runtime: Option<Arc<dyn Fn(&str) -> usize + Send + Sync>>,
-    /// Serializes the durable store limit check with the in-memory manager
-    /// reservation. Store-backed child creation is synchronous before the runner
-    /// returns, so the next spawn sees the just-created child in the store.
+    /// Optional live runtime control plane. When present, v2 wait_agent uses the
+    /// watch-backed runtime mailbox instead of polling SQLite notifications.
+    pub runtime_handle: Option<RuntimeHandle>,
+    /// Serializes the durable store capacity check with child creation. The
+    /// strict Codex-aligned default rejects over-capacity spawns immediately;
+    /// it does not wait for Store notifications or hidden queue release.
     pub spawn_gate: Arc<tokio::sync::Mutex<()>>,
     pub wait_timeouts: WaitAgentTimeoutOptions,
     pub hide_spawn_agent_metadata: bool,
@@ -385,31 +395,6 @@ fn emit_collab_resume_end(
             "status": status,
         }),
     );
-}
-
-fn check_store_thread_limit(deps: &SubagentToolDeps) -> Result<(), ToolError> {
-    let Some(limit) = deps.max_concurrent_threads_per_session else {
-        return Ok(());
-    };
-    let Some(shared_store) = deps.store.as_ref() else {
-        return Ok(());
-    };
-    let store = shared_store
-        .lock()
-        .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-    let root_id = store_root_session_id(&store, &deps.session_id)
-        .map_err(|err| tool_err("resolve root session failed", err))?;
-    let live_threads = store_collect_agent_tree(&store, &root_id)
-        .map_err(|err| tool_err("collect agent tree failed", err))?
-        .into_iter()
-        .filter(|agent| agent.status != "closed")
-        .count();
-    if live_threads >= limit {
-        return Err(ToolError::Other(anyhow::anyhow!(
-            "max_concurrent_threads_per_session limit reached ({limit})"
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -746,46 +731,20 @@ fn tool_err(context: &str, err: impl std::fmt::Display) -> ToolError {
     ToolError::Other(anyhow::anyhow!("{context}: {err}"))
 }
 
-fn parent_can_receive_completion_mail(
-    store: &browser_use_store::Store,
-    parent_session_id: &str,
-) -> anyhow::Result<bool> {
-    let Some(parent) = store.load_session(parent_session_id)? else {
-        return Ok(false);
-    };
-    if !parent.status.is_active() {
-        return Ok(false);
-    }
-    if store
-        .agent_summary_for_child(parent_session_id)?
-        .is_some_and(|agent| agent.status == "closed")
-    {
-        return Ok(false);
-    }
-    Ok(true)
+fn runtime_status_is_active(status: &RuntimeAgentThreadStatus) -> bool {
+    matches!(
+        status,
+        RuntimeAgentThreadStatus::Queued
+            | RuntimeAgentThreadStatus::Running
+            | RuntimeAgentThreadStatus::Cancelling
+    )
 }
 
-fn format_completion_notification(agent_path: &str, status: &str, payload: &Value) -> String {
-    let agent_status = match status {
-        "done" => json!({
-            "completed": payload.get("result").cloned().unwrap_or(Value::Null),
-        }),
-        "failed" => json!({
-            "errored": payload
-                .get("failure")
-                .and_then(Value::as_str)
-                .unwrap_or("agent failed"),
-        }),
-        "cancelled" => json!("shutdown"),
-        _ => json!("not_found"),
-    };
-    format!(
-        "<subagent_notification>\n{}\n</subagent_notification>",
-        json!({
-            "agent_path": agent_path,
-            "status": agent_status,
-        })
-    )
+fn runtime_agent_is_active(runtime: &RuntimeHandle, agent_id: &RuntimeAgentId) -> bool {
+    runtime
+        .snapshot_agent(agent_id)
+        .map(|snapshot| runtime_status_is_active(&snapshot.status))
+        .unwrap_or(false)
 }
 
 pub(crate) fn store_completion_handler(
@@ -861,16 +820,6 @@ pub(crate) fn store_completion_handler(
                 "payload": payload.clone(),
             }),
         )?;
-        if parent_can_receive_completion_mail(&store, &parent_session_id)? {
-            let child_path = display_agent_path_for_session(&store, &child_session_id)?;
-            let notification = format_completion_notification(&child_path, status, &payload);
-            store.send_agent_message(
-                &child_session_id,
-                &parent_session_id,
-                &notification,
-                false,
-            )?;
-        }
         Ok(())
     })
 }
@@ -885,25 +834,41 @@ fn parent_has_child_terminal_event_for_run(
         .events_for_session(parent_session_id)?
         .iter()
         .any(|event| {
-            matches!(
+            if !matches!(
                 event.event_type.as_str(),
                 "agent.completed" | "agent.failed"
-            ) && event
+            ) {
+                return false;
+            }
+            if event
                 .payload
                 .get("child_session_id")
+                .or_else(|| event.payload.pointer("/payload/child_session_id"))
                 .and_then(Value::as_str)
-                == Some(child_session_id)
-                && match run_id {
-                    Some(run_id) => {
-                        event
-                            .payload
-                            .get("run_id")
-                            .or_else(|| event.payload.pointer("/payload/run_id"))
-                            .and_then(Value::as_str)
-                            == Some(run_id)
-                    }
-                    None => true,
+                != Some(child_session_id)
+            {
+                return false;
+            }
+            if event
+                .payload
+                .get("runtime_owned")
+                .or_else(|| event.payload.pointer("/payload/runtime_owned"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return true;
+            }
+            match run_id {
+                Some(run_id) => {
+                    event
+                        .payload
+                        .get("run_id")
+                        .or_else(|| event.payload.pointer("/payload/run_id"))
+                        .and_then(Value::as_str)
+                        == Some(run_id)
                 }
+                None => true,
+            }
         }))
 }
 
@@ -1038,6 +1003,32 @@ fn store_message_tool(
     trigger_turn: bool,
     interrupt: bool,
 ) -> Result<Option<StoreDelivery>, ToolError> {
+    if message.trim().is_empty() {
+        return Err(ToolError::Other(anyhow::anyhow!(
+            "Empty message can't be sent to an agent"
+        )));
+    }
+    if let Some(delivery) = runtime_message_tool(deps, target, message, trigger_turn, interrupt)? {
+        return Ok(Some(delivery));
+    }
+    if deps.store.is_some() {
+        return Err(ToolError::Other(anyhow::anyhow!(
+            "subagent messaging requires a live runtime mailbox; Store-backed send is replay-only"
+        )));
+    }
+    Ok(None)
+}
+
+fn runtime_message_tool(
+    deps: &SubagentToolDeps,
+    target: &str,
+    message: &str,
+    trigger_turn: bool,
+    interrupt: bool,
+) -> Result<Option<StoreDelivery>, ToolError> {
+    let Some(runtime) = deps.runtime_handle.as_ref() else {
+        return Ok(None);
+    };
     let Some(shared_store) = deps.store.as_ref() else {
         return Ok(None);
     };
@@ -1047,7 +1038,7 @@ fn store_message_tool(
         )));
     }
 
-    let (delivery, wake_request) = {
+    let (delivery, wake_request, author_path) = {
         let store = shared_store
             .lock()
             .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
@@ -1061,48 +1052,28 @@ fn store_message_tool(
                 "Tasks can't be assigned to the root agent"
             )));
         }
+        let runtime_target_agent_id = RuntimeAgentId::from_string(target.session_id.clone())
+            .map_err(|err| tool_err("invalid runtime target agent id", err))?;
+        let target_is_runtime_active = runtime_agent_is_active(runtime, &runtime_target_agent_id);
         let target_status = store
             .load_session(&target.session_id)
             .map_err(|err| tool_err("load target agent failed", err))?
             .map(|session| session.status);
         if interrupt
-            && target_status
-                .as_ref()
-                .is_some_and(browser_use_protocol::SessionStatus::is_active)
+            && (target_is_runtime_active
+                || target_status
+                    .as_ref()
+                    .is_some_and(browser_use_protocol::SessionStatus::is_active))
         {
-            store
-                .request_cancel(&target.session_id, "interrupted by send_input")
+            let runtime_session_id = RuntimeSessionId::from_string(target.session_id.clone())
+                .map_err(|err| tool_err("invalid runtime target session id", err))?;
+            let _ = runtime
+                .request_cancel_run(&runtime_session_id)
                 .map_err(|err| tool_err("interrupt target agent failed", err))?;
         }
-        let msg = store
-            .send_agent_message(&deps.session_id, &target.session_id, message, trigger_turn)
-            .map_err(|err| tool_err("send agent message failed", err))?;
         let author_path = display_agent_path_for_session(&store, &deps.session_id)
             .map_err(|err| tool_err("resolve author path failed", err))?;
-        store
-            .append_event(
-                &deps.session_id,
-                "agent.message",
-                json!({
-                    "id": msg.id,
-                    "author_session_id": msg.author_session_id,
-                    "target_session_id": msg.target_session_id,
-                    "author_path": author_path,
-                    "recipient_path": target.agent_path,
-                    "child_session_id": target.session_id,
-                    "content": msg.content,
-                    "input_items": msg.input_items,
-                    "input_kind": msg.input_kind,
-                    "trigger_turn": msg.trigger_turn,
-                    "interrupt": interrupt,
-                }),
-            )
-            .map_err(|err| tool_err("record agent message failed", err))?;
-        let target_is_running = store
-            .load_session(&target.session_id)
-            .map_err(|err| tool_err("load target agent failed", err))?
-            .is_some_and(|session| session.status == browser_use_protocol::SessionStatus::Running);
-        let wake_request = if trigger_turn && !target_is_running {
+        let wake_request = if trigger_turn && !target_is_runtime_active {
             if let Some(summary) = target.summary.as_ref() {
                 let run_id = browser_use_store::new_thread_id();
                 let run_config = latest_child_run_config(&store, &target.session_id)?;
@@ -1133,23 +1104,67 @@ fn store_message_tool(
                 .summary
                 .as_ref()
                 .and_then(|summary| summary.agent_role.clone()),
-            message_id: msg.id,
+            message_id: String::new(),
         };
-        (delivery, wake_request)
+        (delivery, wake_request, author_path)
     };
-    if let (Some(runner), Some(request)) = (deps.child_runner.as_ref(), wake_request) {
-        if interrupt {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            store
-                .set_status(
-                    &request.child_session_id,
-                    browser_use_protocol::SessionStatus::Created,
-                )
-                .map_err(|err| tool_err("reset interrupted target agent failed", err))?;
+
+    let author_agent_id = RuntimeAgentId::from_string(deps.session_id.clone())
+        .map_err(|err| tool_err("invalid runtime author agent id", err))?;
+    let target_agent_id = RuntimeAgentId::from_string(delivery.agent_id.clone())
+        .map_err(|err| tool_err("invalid runtime target agent id", err))?;
+    let kind = if trigger_turn {
+        RuntimeMailboxItemKind::Followup
+    } else {
+        RuntimeMailboxItemKind::Input
+    };
+    let response = match runtime.send_agent_message(RuntimeSendAgentMessageRequest {
+        author_agent_id,
+        target_agent_id,
+        content: message.to_string(),
+        trigger_turn,
+        kind,
+        delivery_phase: RuntimeMailboxDeliveryPhase::NextTurn,
+        payload: json!({
+            "agent_path": delivery.agent_path.clone(),
+            "tool": if trigger_turn { "followup_task" } else { "send_message" },
+            "author_session_id": deps.session_id,
+            "target_session_id": delivery.agent_id.clone(),
+            "author_path": author_path.clone(),
+        }),
+    }) {
+        Ok(response) => response,
+        Err(error) => {
+            if error.to_string().contains("unknown agent") {
+                return Ok(None);
+            }
+            return Err(tool_err("runtime send agent message failed", error));
         }
+    };
+    let mut delivery = delivery;
+    delivery.message_id = response.mailbox_item.id.clone();
+    let session_id = RuntimeSessionId::from_string(deps.session_id.clone())
+        .map_err(|err| tool_err("invalid runtime author session id", err))?;
+    runtime
+        .append_observed_session_event(
+            session_id,
+            "agent.message",
+            json!({
+                "id": response.mailbox_item.id,
+                "author_session_id": deps.session_id,
+                "target_session_id": delivery.agent_id.clone(),
+                "author_path": author_path,
+                "recipient_path": delivery.agent_path.clone(),
+                "child_session_id": delivery.agent_id.clone(),
+                "content": message,
+                "trigger_turn": trigger_turn,
+                "interrupt": interrupt,
+                "runtime_mailbox_seq": response.mailbox_item.seq,
+            }),
+            RuntimeDurability::Barrier,
+        )
+        .map_err(|err| tool_err("record runtime agent message failed", err))?;
+    if let (Some(runner), Some(request)) = (deps.child_runner.as_ref(), wake_request) {
         runner
             .run(request)
             .map_err(|err| tool_err("trigger target agent failed", err))?;
@@ -1217,6 +1232,34 @@ fn store_message_tool_v1(
     input_items: Option<Value>,
     interrupt: bool,
 ) -> Result<Option<StoreDelivery>, ToolError> {
+    if message.trim().is_empty() {
+        return Err(ToolError::Other(anyhow::anyhow!(
+            "Empty message can't be sent to an agent"
+        )));
+    }
+    if let Some(delivery) =
+        runtime_message_tool_v1(deps, target, message, input_items.clone(), interrupt)?
+    {
+        return Ok(Some(delivery));
+    }
+    if deps.store.is_some() {
+        return Err(ToolError::Other(anyhow::anyhow!(
+            "send_input requires a live runtime mailbox; Store-backed send is replay-only"
+        )));
+    }
+    Ok(None)
+}
+
+fn runtime_message_tool_v1(
+    deps: &SubagentToolDeps,
+    target: &str,
+    message: &str,
+    input_items: Option<Value>,
+    interrupt: bool,
+) -> Result<Option<StoreDelivery>, ToolError> {
+    let Some(runtime) = deps.runtime_handle.as_ref() else {
+        return Ok(None);
+    };
     let Some(shared_store) = deps.store.as_ref() else {
         return Ok(None);
     };
@@ -1227,7 +1270,7 @@ fn store_message_tool_v1(
         )));
     }
 
-    let (delivery, wake_request) = {
+    let (delivery, wake_request, author_path, recipient_path) = {
         let store = shared_store
             .lock()
             .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
@@ -1235,51 +1278,24 @@ fn store_message_tool_v1(
             .load_session(target)
             .map_err(|err| tool_err("load target agent failed", err))?
             .ok_or_else(|| ToolError::Other(anyhow::anyhow!("agent with id {target} not found")))?;
-        if interrupt && target_session.status.is_active() {
-            store
-                .request_cancel(target, "interrupted by send_input")
+        let runtime_target_agent_id = RuntimeAgentId::from_string(target.to_string())
+            .map_err(|err| tool_err("invalid runtime target agent id", err))?;
+        let target_is_runtime_active = runtime_agent_is_active(runtime, &runtime_target_agent_id);
+        if interrupt && (target_is_runtime_active || target_session.status.is_active()) {
+            let runtime_session_id = RuntimeSessionId::from_string(target.to_string())
+                .map_err(|err| tool_err("invalid runtime target session id", err))?;
+            let _ = runtime
+                .request_cancel_run(&runtime_session_id)
                 .map_err(|err| tool_err("interrupt target agent failed", err))?;
         }
-        let msg = store
-            .send_agent_message_with_input_items(
-                &deps.session_id,
-                target,
-                message,
-                input_items.clone(),
-                true,
-            )
-            .map_err(|err| tool_err("send agent message failed", err))?;
         let author_path = display_agent_path_for_session(&store, &deps.session_id)
             .map_err(|err| tool_err("resolve author path failed", err))?;
         let recipient_path = display_agent_path_for_session(&store, target)
             .map_err(|err| tool_err("resolve recipient path failed", err))?;
-        store
-            .append_event(
-                &deps.session_id,
-                "agent.message",
-                json!({
-                    "id": msg.id,
-                    "author_session_id": msg.author_session_id,
-                    "target_session_id": msg.target_session_id,
-                    "author_path": author_path,
-                    "recipient_path": recipient_path,
-                    "child_session_id": target,
-                    "content": msg.content,
-                    "input_items": msg.input_items,
-                    "input_kind": msg.input_kind,
-                    "trigger_turn": msg.trigger_turn,
-                    "interrupt": interrupt,
-                }),
-            )
-            .map_err(|err| tool_err("record agent message failed", err))?;
-        let target_is_running = store
-            .load_session(target)
-            .map_err(|err| tool_err("load target agent failed", err))?
-            .is_some_and(|session| session.status == browser_use_protocol::SessionStatus::Running);
         let summary = store
             .agent_summary_for_child(target)
             .map_err(|err| tool_err("load target child edge failed", err))?;
-        let wake_request = if !target_is_running {
+        let wake_request = if !target_is_runtime_active {
             if let Some(summary) = summary.as_ref() {
                 let run_id = browser_use_store::new_thread_id();
                 let run_config = latest_child_run_config(&store, target)?;
@@ -1299,34 +1315,71 @@ fn store_message_tool_v1(
         } else {
             None
         };
-        (
-            StoreDelivery {
-                agent_path: recipient_path,
-                agent_id: target.to_string(),
-                nickname: summary
-                    .as_ref()
-                    .and_then(|summary| summary.agent_nickname.clone()),
-                role: summary
-                    .as_ref()
-                    .and_then(|summary| summary.agent_role.clone()),
-                message_id: msg.id,
-            },
-            wake_request,
-        )
+        let delivery = StoreDelivery {
+            agent_path: recipient_path.clone(),
+            agent_id: target.to_string(),
+            nickname: summary
+                .as_ref()
+                .and_then(|summary| summary.agent_nickname.clone()),
+            role: summary
+                .as_ref()
+                .and_then(|summary| summary.agent_role.clone()),
+            message_id: String::new(),
+        };
+        (delivery, wake_request, author_path, recipient_path)
     };
-    if let (Some(runner), Some(request)) = (deps.child_runner.as_ref(), wake_request) {
-        if interrupt {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            store
-                .set_status(
-                    &request.child_session_id,
-                    browser_use_protocol::SessionStatus::Created,
-                )
-                .map_err(|err| tool_err("reset interrupted target agent failed", err))?;
+
+    let response = match runtime.send_agent_message(RuntimeSendAgentMessageRequest {
+        author_agent_id: RuntimeAgentId::from_string(deps.session_id.clone())
+            .map_err(|err| tool_err("invalid runtime author agent id", err))?,
+        target_agent_id: RuntimeAgentId::from_string(delivery.agent_id.clone())
+            .map_err(|err| tool_err("invalid runtime target agent id", err))?,
+        content: message.to_string(),
+        trigger_turn: true,
+        kind: RuntimeMailboxItemKind::Followup,
+        delivery_phase: RuntimeMailboxDeliveryPhase::NextTurn,
+        payload: json!({
+            "tool": "send_input",
+            "author_session_id": deps.session_id,
+            "target_session_id": delivery.agent_id.clone(),
+            "author_path": author_path.clone(),
+            "target_path": recipient_path.clone(),
+            "input_items": input_items.clone(),
+        }),
+    }) {
+        Ok(response) => response,
+        Err(error) => {
+            if error.to_string().contains("unknown agent") {
+                return Ok(None);
+            }
+            return Err(tool_err("runtime send input failed", error));
         }
+    };
+    let mut delivery = delivery;
+    delivery.message_id = response.mailbox_item.id.clone();
+    runtime
+        .append_observed_session_event(
+            RuntimeSessionId::from_string(deps.session_id.clone())
+                .map_err(|err| tool_err("invalid runtime author session id", err))?,
+            "agent.message",
+            json!({
+                "id": response.mailbox_item.id,
+                "author_session_id": deps.session_id,
+                "target_session_id": delivery.agent_id.clone(),
+                "author_path": author_path,
+                "recipient_path": delivery.agent_path.clone(),
+                "child_session_id": delivery.agent_id.clone(),
+                "content": message,
+                "input_items": input_items.clone(),
+                "input_kind": if input_items.is_some() { "items" } else { "text" },
+                "trigger_turn": true,
+                "interrupt": interrupt,
+                "runtime_mailbox_seq": response.mailbox_item.seq,
+            }),
+            RuntimeDurability::Barrier,
+        )
+        .map_err(|err| tool_err("record runtime send_input failed", err))?;
+    if let (Some(runner), Some(request)) = (deps.child_runner.as_ref(), wake_request) {
         runner
             .run(request)
             .map_err(|err| tool_err("trigger target agent failed", err))?;
@@ -1483,140 +1536,107 @@ fn store_list_agents(
     Ok(Some(ok_output(json!({ "agents": agents }))))
 }
 
-async fn store_wait_agent(
+async fn runtime_wait_agent(
     deps: &SubagentToolDeps,
-    agent_path: Option<&str>,
     timeout: Duration,
 ) -> Result<Option<ExecOutput>, ToolError> {
-    let Some(shared_store) = deps.store.as_ref() else {
+    let Some(runtime) = deps.runtime_handle.as_ref() else {
         return Ok(None);
     };
-    let (watcher, mut cursor) = store_notification_watcher(shared_store)?;
-    let deadline = Instant::now() + timeout;
-    if let Some(target) = agent_path {
-        let (target_id, target_path) = {
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            let resolved = store_resolve_agent_reference_in_tree(&store, &deps.session_id, target)
-                .map_err(|err| tool_err("resolve agent target failed", err))?
-                .ok_or_else(|| {
-                    ToolError::Other(anyhow::anyhow!("live agent path `{target}` not found"))
-                })?;
-            (resolved.session_id, resolved.agent_path)
-        };
-        loop {
-            let status = {
-                let store = shared_store
-                    .lock()
-                    .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-                let statuses = final_statuses_for_v1_wait(&store, &[target_id.as_str()])
-                    .map_err(|err| tool_err("read target status failed", err))?;
-                statuses.values().next().cloned()
-            };
-            if let Some(status) = status {
-                return Ok(Some(ok_output(json!({
-                    "agent_path": target_path,
-                    "agent_id": target_id,
-                    "status": status,
-                    "timed_out": false,
-                }))));
-            }
-            if Instant::now() >= deadline
-                || !wait_for_store_change(&watcher, &mut cursor, deadline).await?
-            {
-                return Ok(Some(ok_output(json!({
-                    "agent_path": target_path,
-                    "agent_id": target_id,
-                    "status": "running",
-                    "timed_out": true,
-                }))));
-            }
-        }
-    }
-
-    loop {
-        let has_mail = {
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            !store
-                .messages_for_agent(&deps.session_id)
-                .map_err(|err| tool_err("read agent mailbox failed", err))?
-                .is_empty()
-        };
-        if has_mail {
-            return Ok(Some(ok_output(json!({
-                "message": "Wait completed.",
-                "timed_out": false,
-            }))));
-        }
-        if Instant::now() >= deadline
-            || !wait_for_store_change(&watcher, &mut cursor, deadline).await?
-        {
-            return Ok(Some(ok_output(json!({
-                "message": "Wait timed out.",
-                "timed_out": true,
-            }))));
-        }
-    }
+    let parent_agent_id = RuntimeAgentId::from_string(deps.session_id.clone())
+        .map_err(|err| tool_err("invalid runtime parent agent id", err))?;
+    let outcome = runtime
+        .wait_agent(&parent_agent_id, RuntimeAgentTarget::Any, timeout)
+        .await
+        .map_err(|err| tool_err("runtime wait_agent failed", err))?;
+    let output = match outcome {
+        RuntimeWaitAgentOutcome::Completed(item) => ok_output(json!({
+            "message": "Wait completed.",
+            "timed_out": false,
+            "mailbox_seq": item.seq,
+            "author_agent_id": item.author_agent_id.as_str(),
+        })),
+        RuntimeWaitAgentOutcome::TimedOut => ok_output(json!({
+            "message": "Wait timed out.",
+            "timed_out": true,
+        })),
+    };
+    Ok(Some(output))
 }
 
-async fn store_wait_agent_v1(
+async fn runtime_wait_agent_v1(
     deps: &SubagentToolDeps,
     targets: &[String],
     timeout: Duration,
 ) -> Result<Option<ExecOutput>, ToolError> {
-    let Some(shared_store) = deps.store.as_ref() else {
+    let Some(runtime) = deps.runtime_handle.as_ref() else {
         return Ok(None);
     };
-    let (watcher, mut cursor) = store_notification_watcher(shared_store)?;
-    let target_refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
-    let deadline = Instant::now() + timeout;
-    loop {
-        let statuses = {
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            final_statuses_for_v1_wait(&store, &target_refs)
-                .map_err(|err| tool_err("read target statuses failed", err))?
-        };
-        if !statuses.is_empty() || Instant::now() >= deadline {
-            return Ok(Some(ok_output(json!({
-                "status": Value::Object(statuses.clone()),
-                "timed_out": statuses.is_empty(),
-            }))));
+    let parent_agent_id = RuntimeAgentId::from_string(deps.session_id.clone())
+        .map_err(|err| tool_err("invalid runtime parent agent id", err))?;
+    let target = match targets {
+        [] => RuntimeAgentTarget::Any,
+        [target] => RuntimeAgentTarget::AgentId(
+            RuntimeAgentId::from_string(legacy_agent_id_target(target)?.to_string())
+                .map_err(|err| tool_err("invalid runtime wait target", err))?,
+        ),
+        _ => {
+            return Err(ToolError::Other(anyhow::anyhow!(
+                "runtime-backed wait_agent accepts at most one target; omit targets to wait for any child"
+            )));
         }
-        if !wait_for_store_change(&watcher, &mut cursor, deadline).await? {
-            return Ok(Some(ok_output(json!({
-                "status": {},
-                "timed_out": true,
-            }))));
+    };
+    let outcome = runtime
+        .wait_agent(&parent_agent_id, target, timeout)
+        .await
+        .map_err(|err| tool_err("runtime wait_agent failed", err))?;
+    let output = match outcome {
+        RuntimeWaitAgentOutcome::Completed(item) => {
+            let key = item
+                .payload
+                .get("agent_path")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| item.author_agent_id.as_str())
+                .to_string();
+            let result = item
+                .payload
+                .get("result")
+                .cloned()
+                .unwrap_or_else(|| Value::String(item.content.clone()));
+            let status = if item.payload.get("success").and_then(Value::as_bool) == Some(false) {
+                json!({ "errored": result })
+            } else {
+                json!({ "completed": result })
+            };
+            ok_output(json!({
+                "status": { key: status },
+                "timed_out": false,
+                "mailbox_seq": item.seq,
+                "author_agent_id": item.author_agent_id.as_str(),
+            }))
         }
-    }
+        RuntimeWaitAgentOutcome::TimedOut => ok_output(json!({
+            "status": {},
+            "timed_out": true,
+        })),
+    };
+    Ok(Some(output))
 }
 
 fn wait_timeout(
     requested_ms: Option<i64>,
     options: WaitAgentTimeoutOptions,
 ) -> Result<Duration, ToolError> {
-    let timeout_ms = match requested_ms {
-        Some(ms) if ms < options.min_timeout_ms => {
-            return Err(ToolError::Other(anyhow::anyhow!(
-                "timeout_ms must be at least {}",
-                options.min_timeout_ms
-            )));
-        }
-        Some(ms) if ms > options.max_timeout_ms => {
-            return Err(ToolError::Other(anyhow::anyhow!(
-                "timeout_ms must be at most {}",
-                options.max_timeout_ms
-            )));
-        }
-        Some(ms) => ms as u64,
-        None => options.default_timeout_ms as u64,
-    };
-    Ok(Duration::from_millis(timeout_ms))
+    let timeout_ms = requested_ms.unwrap_or(options.default_timeout_ms);
+    if timeout_ms <= 0 {
+        return Err(ToolError::Other(anyhow::anyhow!(
+            "timeout_ms must be greater than zero"
+        )));
+    }
+    let max_timeout_ms = options.max_timeout_ms.max(1);
+    let min_timeout_ms = options.min_timeout_ms.clamp(1, max_timeout_ms);
+    let timeout_ms = timeout_ms.clamp(min_timeout_ms, max_timeout_ms);
+    Ok(Duration::from_millis(timeout_ms as u64))
 }
 
 fn wait_timeout_v1(
@@ -1633,49 +1653,24 @@ fn wait_timeout_v1(
     Ok(Duration::from_millis(timeout_ms as u64))
 }
 
-fn store_notification_watcher(
-    shared_store: &SharedStore,
-) -> Result<(StoreNotificationWatcher, u64), ToolError> {
-    let store = shared_store
-        .lock()
-        .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-    let watcher = store.notification_watcher();
-    let cursor = watcher.cursor();
-    Ok((watcher, cursor))
-}
-
-async fn wait_for_store_change(
-    watcher: &StoreNotificationWatcher,
-    cursor: &mut u64,
-    deadline: Instant,
-) -> Result<bool, ToolError> {
-    if Instant::now() >= deadline {
-        return Ok(false);
-    }
-    let timeout = deadline.saturating_duration_since(Instant::now());
-    let wait_cursor = *cursor;
-    let watcher = watcher.clone();
-    let (changed, next_cursor) = tokio::task::spawn_blocking(move || {
-        let changed = watcher.wait_for_change(wait_cursor, timeout);
-        let next_cursor = watcher.cursor();
-        (changed, next_cursor)
-    })
-    .await
-    .map_err(|err| ToolError::Other(anyhow::anyhow!("store notification wait failed: {err}")))?;
-    *cursor = next_cursor;
-    Ok(changed)
-}
-
 fn wait_finished_payload(output: &ExecOutput) -> Value {
     let body = serde_json::from_str::<Value>(&output.stdout).unwrap_or(Value::Null);
-    json!({
-        "timed_out": body
-            .get("timed_out")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        "status": body.get("status").cloned(),
-        "message": body.get("message").cloned(),
-    })
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "timed_out".to_string(),
+        Value::Bool(
+            body.get("timed_out")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    if let Some(status) = body.get("status") {
+        payload.insert("status".to_string(), status.clone());
+    }
+    if let Some(message) = body.get("message") {
+        payload.insert("message".to_string(), message.clone());
+    }
+    Value::Object(payload)
 }
 
 fn store_close_agent(
@@ -1740,6 +1735,86 @@ fn store_close_agent(
     }))))
 }
 
+fn runtime_close_agent(
+    deps: &SubagentToolDeps,
+    target: &str,
+    legacy_target_by_id: bool,
+) -> Result<Option<ExecOutput>, ToolError> {
+    let Some(runtime) = deps.runtime_handle.as_ref() else {
+        return Ok(None);
+    };
+    let Some(shared_store) = deps.store.as_ref() else {
+        return Ok(None);
+    };
+    let (target_session_id, previous_status) = {
+        let store = shared_store
+            .lock()
+            .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
+        let target_session_id = if legacy_target_by_id {
+            let target_id = legacy_agent_id_target(target)?;
+            let child = store
+                .load_session(target_id)
+                .map_err(|err| tool_err("load close target failed", err))?
+                .ok_or_else(|| {
+                    ToolError::Other(anyhow::anyhow!("agent with id {target_id} not found"))
+                })?;
+            if child.parent_id.is_none() {
+                return Err(ToolError::Other(anyhow::anyhow!(
+                    "root is not a spawned agent"
+                )));
+            }
+            target_id.to_string()
+        } else {
+            let target = store_resolve_agent_reference_in_tree_v2(&store, &deps.session_id, target)
+                .map_err(|err| tool_err("resolve close target failed", err))?
+                .ok_or_else(|| {
+                    ToolError::Other(anyhow::anyhow!("live agent path `{target}` not found"))
+                })?;
+            if target.is_root {
+                return Err(ToolError::Other(anyhow::anyhow!(
+                    "root is not a spawned agent"
+                )));
+            }
+            target.session_id
+        };
+        let child = store
+            .load_session(&target_session_id)
+            .map_err(|err| tool_err("load close target failed", err))?
+            .ok_or_else(|| {
+                ToolError::Other(anyhow::anyhow!(
+                    "unknown child session id: {target_session_id}"
+                ))
+            })?;
+        let summary = store
+            .agent_summary_for_child(&target_session_id)
+            .map_err(|err| tool_err("load child edge failed", err))?
+            .ok_or_else(|| {
+                ToolError::Other(anyhow::anyhow!(
+                    "unknown child agent edge for session id: {target_session_id}"
+                ))
+            })?;
+        let previous_status = local_agent_status_value(&store, &child, Some(&summary))
+            .map_err(|err| tool_err("read previous status failed", err))?;
+        (target_session_id, previous_status)
+    };
+    let agent_id = RuntimeAgentId::from_string(target_session_id.clone())
+        .map_err(|err| tool_err("invalid runtime close target id", err))?;
+    match runtime.close_agent(RuntimeCloseAgentRequest {
+        agent_id,
+        reason: "closed by close_agent".to_string(),
+    }) {
+        Ok(()) => Ok(Some(ok_output(json!({
+            "previous_status": previous_status,
+        })))),
+        Err(error) => {
+            if error.to_string().contains("unknown agent") {
+                return Ok(None);
+            }
+            Err(tool_err("runtime close_agent failed", error))
+        }
+    }
+}
+
 fn store_close_agent_v1(
     deps: &SubagentToolDeps,
     target: &str,
@@ -1761,6 +1836,11 @@ fn store_close_agent_v1(
         .ok_or_else(|| ToolError::Other(anyhow::anyhow!("root is not a spawned agent")))?;
     let previous_status = local_agent_status_value(&store, &child, Some(&summary))
         .map_err(|err| tool_err("read previous status failed", err))?;
+    if summary.status == "closed" {
+        return Ok(Some(ok_output(json!({
+            "previous_status": previous_status,
+        }))));
+    }
     let _cleaned_runtime =
         cleanup_agent_runtime_state_for_agent_subtree(&store, target, |session_id| {
             cleanup_runtime_for_session(deps, session_id)
@@ -1792,8 +1872,8 @@ fn store_close_agent_v1(
 /// The `spawn_agent` tool: delegate a task to a freshly-spawned child agent.
 ///
 /// The model's args are [`SpawnAgentArgs`] (`task_name` + `message`, with the
-/// optional `agent_type` / `model` / `reasoning_effort` / `service_tier` /
-/// `fork_turns` overrides). On success it returns the new child's
+/// optional `agent_type` / `model` / `reasoning_effort` / `fork_turns`
+/// overrides). On success it returns the new child's
 /// `{ agent_path, agent_id }` so the model can later `wait_agent` / `send_input`.
 pub struct SpawnAgentTool {
     deps: SubagentToolDeps,
@@ -1832,7 +1912,6 @@ impl ToolRuntime<SpawnAgentArgs, ExecOutput> for SpawnAgentTool {
         ctx: &ToolCtx,
     ) -> Result<ExecOutput, ToolError> {
         let _spawn_gate = self.deps.spawn_gate.lock().await;
-        check_store_thread_limit(&self.deps)?;
         let mut args = req.clone();
         args.input_is_inter_agent_communication = true;
         let prompt = args.message.clone();
@@ -1994,7 +2073,6 @@ impl ToolRuntime<SpawnAgentV1Request, ExecOutput> for SpawnAgentV1Tool {
         ctx: &ToolCtx,
     ) -> Result<ExecOutput, ToolError> {
         let _spawn_gate = self.deps.spawn_gate.lock().await;
-        check_store_thread_limit(&self.deps)?;
         reject_legacy_depth_limit(&self.deps)?;
         let input = legacy_input_payload(req.message.as_deref(), req.items.as_deref())?;
         let args = SpawnAgentArgs {
@@ -2166,18 +2244,23 @@ impl ToolRuntime<WaitAgentRequest, ExecOutput> for WaitAgentTool {
                 "tool": "wait_agent",
             }),
         );
-        if self.deps.store.is_some() {
-            let output = store_wait_agent(&self.deps, None, timeout)
+        if self.deps.runtime_handle.is_some() {
+            let output = runtime_wait_agent(&self.deps, timeout)
                 .await?
                 .ok_or_else(|| {
                     ToolError::Other(anyhow::anyhow!(
-                        "store-backed wait unexpectedly unavailable"
+                        "runtime-backed wait unexpectedly unavailable"
                     ))
                 })?;
             emit_collab_waiting_end(&self.deps, ctx, serde_json::Map::new(), Vec::new());
             self.deps
                 .emit("agent.wait.finished", wait_finished_payload(&output));
             return Ok(output);
+        }
+        if self.deps.store.is_some() {
+            return Err(ToolError::Other(anyhow::anyhow!(
+                "wait_agent requires a live runtime mailbox; Store-backed wait is replay-only"
+            )));
         }
         let woken = self.deps.manager.wait_any(timeout).await;
         let output = ok_output(json!({
@@ -2248,13 +2331,18 @@ impl ToolRuntime<WaitAgentV1Request, ExecOutput> for WaitAgentV1Tool {
                 "tool": "wait_agent",
             }),
         );
-        if let Some(output) = store_wait_agent_v1(&self.deps, &req.targets, timeout).await? {
+        if let Some(output) = runtime_wait_agent_v1(&self.deps, &req.targets, timeout).await? {
             let (statuses, agent_statuses) =
                 wait_final_event_statuses(&self.deps, &req.targets, &output);
             emit_collab_waiting_end(&self.deps, ctx, statuses, agent_statuses);
             self.deps
                 .emit("agent.wait.finished", wait_finished_payload(&output));
             return Ok(output);
+        }
+        if self.deps.store.is_some() {
+            return Err(ToolError::Other(anyhow::anyhow!(
+                "wait_agent requires a live runtime mailbox; Store-backed wait is replay-only"
+            )));
         }
         let deadline = Instant::now() + timeout;
         loop {
@@ -2878,6 +2966,24 @@ impl CloseAgentTool {
     async fn run_close(&self, target: &str, ctx: &ToolCtx) -> Result<ExecOutput, ToolError> {
         let event_target = self.event_target(target)?;
         emit_collab_close_begin(&self.deps, ctx, &event_target.thread_id);
+        if let Some(output) = runtime_close_agent(&self.deps, target, self.legacy_target_by_id)? {
+            emit_collab_close_end(
+                &self.deps,
+                ctx,
+                &event_target,
+                event_target
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| Value::String("not_found".to_string())),
+            );
+            self.deps.emit(
+                "subagent.closed",
+                json!({
+                    "target": target,
+                }),
+            );
+            return Ok(output);
+        }
         let store_output = if self.legacy_target_by_id {
             store_close_agent_v1(&self.deps, target)?
         } else {

@@ -40,7 +40,7 @@ use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
 use crate::tools::unified_exec::{
     SpawnProcessRequest, UnifiedExecEventEmitter, UnifiedExecManager,
     WriteStdinRequest as UnifiedWriteStdinRequest, DEFAULT_EXEC_YIELD_TIME_MS,
-    DEFAULT_WRITE_STDIN_YIELD_TIME_MS,
+    DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_WRITE_STDIN_YIELD_TIME_MS,
 };
 
 /// Default per-command timeout in milliseconds.
@@ -97,6 +97,10 @@ pub struct ShellRequest {
     /// of the inherited environment (codex `ExecParams.env`).
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Maximum model-visible output tokens. Defaults to the same budget used by
+    /// `exec_command`.
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
 }
 
 impl ShellRequest {
@@ -112,6 +116,7 @@ impl ShellRequest {
             cwd: None,
             timeout_ms: None,
             env: HashMap::new(),
+            max_output_tokens: None,
         }
     }
 
@@ -119,6 +124,23 @@ impl ShellRequest {
     fn effective_timeout_ms(&self) -> u64 {
         self.timeout_ms.unwrap_or(DEFAULT_SHELL_COMMAND_TIMEOUT_MS)
     }
+}
+
+fn truncate_model_text(text: &str, max_output_tokens: Option<usize>) -> String {
+    let byte_budget = max_output_tokens
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+        .saturating_mul(4);
+    if text.len() <= byte_budget {
+        return text.to_string();
+    }
+    if byte_budget == 0 {
+        return String::new();
+    }
+    let mut end = byte_budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…\n", &text[..end])
 }
 
 /// A simple, conservative denylist of obviously destructive commands.
@@ -544,7 +566,7 @@ impl ToolRuntime<ShellRequest, ExecOutput> for ShellTool {
                 env: req.env.clone(),
                 tty: false,
                 yield_time_ms: DEFAULT_WRITE_STDIN_YIELD_TIME_MS,
-                max_output_tokens: None,
+                max_output_tokens: req.max_output_tokens,
                 timeout_ms: Some(timeout_ms),
                 kill_on_cancel: true,
                 call_id: ctx.call_id.clone(),
@@ -559,8 +581,8 @@ impl ToolRuntime<ShellRequest, ExecOutput> for ShellTool {
         }
         Ok(ExecOutput {
             exit_code: snapshot.exit_code.unwrap_or(0),
-            stdout: snapshot.stdout,
-            stderr,
+            stdout: truncate_model_text(&snapshot.stdout, req.max_output_tokens),
+            stderr: truncate_model_text(&stderr, req.max_output_tokens),
         })
     }
 }

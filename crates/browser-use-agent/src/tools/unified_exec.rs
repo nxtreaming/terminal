@@ -581,6 +581,11 @@ impl UnifiedExecManager {
                         std::future::pending::<()>().await;
                     }
                 } => {
+                    // Cancellation returns a live snapshot without killing the
+                    // process. Give the blocking reader one small grace window
+                    // to copy bytes the child already wrote before the cancel
+                    // signal won this select branch.
+                    tokio::time::sleep(Duration::from_millis(TRAILING_OUTPUT_GRACE_MS)).await;
                     let snap = process.snapshot_since_cursor(advance_cursor, start.elapsed()).await;
                     if snap.running {
                         process.emit_waiting();

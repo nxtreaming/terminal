@@ -61,6 +61,32 @@ fn simple_user_assistant_turn() {
 }
 
 #[test]
+fn inter_agent_mailbox_input_renders_as_direct_parent_task() {
+    let events = vec![event(
+        1,
+        "agent.mailbox_input",
+        json!({
+            "author_path": "/root",
+            "recipient_path": "/root/dev_env",
+            "content": "Inspect the dev environment only.",
+            "trigger_turn": true,
+        }),
+    )];
+
+    let messages = provider_messages_from_events(&events);
+
+    assert_eq!(messages.len(), 1, "messages: {messages:#?}");
+    assert_eq!(
+        messages[0].get("role").and_then(Value::as_str),
+        Some("user")
+    );
+    assert_eq!(
+        messages[0].get("content").and_then(Value::as_str),
+        Some("Direct task from parent /root to you /root/dev_env:\nInspect the dev environment only.")
+    );
+}
+
+#[test]
 fn turn_with_tool_call_and_output() {
     let events = vec![
         event(1, "session.input", json!({ "text": "run the tool" })),

@@ -1296,16 +1296,23 @@ fn inter_agent_provider_message_from_event(event: &EventRecord) -> Option<Value>
         .and_then(Value::as_bool)
         .unwrap_or(false);
     Some(serde_json::json!({
-        "role": "assistant",
-        "phase": "commentary",
-        "content": serde_json::to_string(&serde_json::json!({
-            "author": author,
-            "recipient": recipient,
-            "other_recipients": [],
-            "content": content,
-            "trigger_turn": trigger_turn,
-        })).ok()?,
+        "role": "user",
+        "content": inter_agent_prompt_text(author, recipient, content, trigger_turn),
     }))
+}
+
+fn inter_agent_prompt_text(
+    author: &str,
+    recipient: &str,
+    content: &str,
+    trigger_turn: bool,
+) -> String {
+    let label = if trigger_turn {
+        "Direct task from parent"
+    } else {
+        "Inter-agent message"
+    };
+    format!("{label} {author} to you {recipient}:\n{content}")
 }
 
 fn is_v1_subagent_notification_event(event: &EventRecord, content: &str) -> bool {

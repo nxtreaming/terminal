@@ -238,6 +238,13 @@ fn retryable_err(msg: &str) -> LlmError {
     e
 }
 
+fn provider_error(message: &str) -> Result<LlmEvent, LlmError> {
+    Ok(LlmEvent::ProviderError {
+        message: message.to_string(),
+        retryable: false,
+    })
+}
+
 // ---- (1) text deltas + tool call -> follow_up + emitted events ------------
 
 #[tokio::test]
@@ -472,6 +479,49 @@ async fn non_retryable_error_fails_without_retrying() {
         opens.load(Ordering::SeqCst),
         1,
         "non-retryable errors must not be retried"
+    );
+}
+
+#[tokio::test]
+async fn streamed_provider_error_fails_turn_after_emitting_stream_error() {
+    let (transport, opens) =
+        ScriptedTransport::new(vec![OpenScript::Stream(vec![provider_error(
+            "provider exploded",
+        )])]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink.clone(), 5);
+
+    let err = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect_err("in-stream provider errors must fail the turn");
+
+    assert!(matches!(err, AgentError::Provider(_)), "got {err:?}");
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    let events = sink.events.lock().expect("recording sink poisoned");
+    assert!(events.iter().any(|event| {
+        event.event_type == names::STREAM_ERROR
+            && event.payload["message"].as_str() == Some("provider exploded")
+    }));
+}
+
+#[tokio::test]
+async fn streamed_context_window_provider_error_maps_to_context_window_exceeded() {
+    let (transport, _opens) =
+        ScriptedTransport::new(vec![OpenScript::Stream(vec![provider_error(
+            "Your input exceeds the context window of this model.",
+        )])]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink, 5);
+
+    let err = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect_err("context-window provider events must fail the turn");
+
+    assert!(
+        matches!(err, AgentError::ContextWindowExceeded),
+        "got {err:?}"
     );
 }
 

@@ -919,7 +919,11 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
             "agent.completed" => push_activity(&mut activity, "subagent finished"),
             "agent.failed" => push_activity(&mut activity, "subagent failed"),
             "agent.cancelled" => push_activity(&mut activity, "subagent stopped"),
-            "agent.resumed" => push_activity(&mut activity, "subagent resumed"),
+            "agent.resumed" => {
+                if !is_replay_materialization_event(event) {
+                    push_activity(&mut activity, "subagent resumed");
+                }
+            }
             _ => {}
         }
     }
@@ -935,6 +939,21 @@ fn has_later_event(
     events[current_idx.saturating_add(1)..]
         .iter()
         .any(|event| event.session_id == session_id && event.event_type == event_type)
+}
+
+fn is_replay_materialization_event(event: &EventRecord) -> bool {
+    event
+        .payload
+        .get("materialized_from_replay")
+        .or_else(|| {
+            event
+                .payload
+                .get("payload")
+                .and_then(Value::as_object)
+                .and_then(|payload| payload.get("materialized_from_replay"))
+        })
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn push_activity(activity: &mut Vec<String>, item: impl Into<String>) {

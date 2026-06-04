@@ -77,6 +77,26 @@ tasks:
         echo "  unset LLM_BROWSER_ANTHROPIC_API_KEY LLM_BROWSER_OPENAI_API_KEY LLM_BROWSER_OPENAI_COMPAT_API_KEY LLM_BROWSER_DEEPSEEK_API_KEY"
         echo "  (Codex login at ~/.codex/auth.json is left intact — global Codex auth.)"
 
+  reset:profile:
+    aliases:
+      - profile:reset
+      - reset-profile
+    desc: Clear the saved default local Chrome profile
+    silent: true
+    cmds:
+      - |
+        set -eu
+
+        state_dir="${STATE_DIR:-$HOME/.browser-use-terminal}"
+        db="$state_dir/state.db"
+
+        if [ -f "$db" ]; then
+          sqlite3 "$db" "DELETE FROM app_settings WHERE key IN ('browser.preference.profile', 'browser.preference.profile_label');"
+          echo "profile reset: $db"
+        else
+          echo "no existing state.db at $db — nothing to reset"
+        fi
+
   auth:clear:
     aliases:
       - clear-auth
