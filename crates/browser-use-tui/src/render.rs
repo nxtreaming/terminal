@@ -1731,11 +1731,12 @@ fn composer_status_line(
         spans.push(status_separator());
         spans.push(Span::styled(goal, muted()));
     }
-    spans.push(status_separator());
-    spans.extend(context_bar_spans(
-        usage.context_tokens.unwrap_or(0),
-        usage.context_budget_tokens,
-    ));
+    if let (Some(context_tokens), Some(context_budget_tokens)) =
+        (usage.context_tokens, usage.context_budget_tokens)
+    {
+        spans.push(status_separator());
+        spans.extend(context_bar_spans(context_tokens, context_budget_tokens));
+    }
     if usage.cost_usd > 0.0 {
         spans.push(status_separator());
         spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
@@ -1809,8 +1810,8 @@ fn slash_palette_item_description(_app: &App, item: &palette::PaletteItem) -> &'
     item.description
 }
 
-/// Fallback budget for older sessions that predate Codex-style `token_count`
-/// events with model context-window metadata.
+/// Fallback budget for context-surface attribution in older sessions that
+/// predate Codex-style `token_count` events with model context-window metadata.
 const FALLBACK_CONTEXT_BUDGET_TOKENS: i64 = 60_000;
 
 /// Width, in cells, of the filled/empty context bar.
@@ -1819,11 +1820,9 @@ const CONTEXT_BAR_WIDTH: usize = 10;
 /// A plain context bar — solid `█` fill over a `░` track — followed by the
 /// `used/budget` token counts. Turns red as the conversation nears the
 /// compaction budget.
-fn context_bar_spans(used_tokens: i64, budget_tokens: Option<i64>) -> Vec<Span<'static>> {
+fn context_bar_spans(used_tokens: i64, budget_tokens: i64) -> Vec<Span<'static>> {
     let used_tokens = used_tokens.max(0);
-    let budget_tokens = budget_tokens
-        .filter(|tokens| *tokens > 0)
-        .unwrap_or(FALLBACK_CONTEXT_BUDGET_TOKENS);
+    let budget_tokens = budget_tokens.max(1);
     let ratio = (used_tokens as f64 / budget_tokens as f64).clamp(0.0, 1.0);
     let fill_style = if ratio >= 0.9 { failed() } else { accent() };
 
@@ -1859,8 +1858,8 @@ fn spans_text_width(spans: &[Span<'_>]) -> usize {
 }
 
 /// Per-session token and cost totals. Codex-style `token_count` events are the
-/// source of truth for context occupancy; legacy `model.usage` remains a
-/// fallback for old sessions and the cost source.
+/// source of truth for context occupancy; legacy `model.usage` remains only
+/// the cost source.
 struct SessionUsage {
     /// Prompt tokens of the most recent model turn — i.e. current context occupancy.
     context_tokens: Option<i64>,
@@ -1878,19 +1877,18 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
     let Some(session) = state.current_session.as_ref() else {
         return usage;
     };
-    let mut legacy_context_tokens = None;
     for event in app.cached_events_for_session(&session.id) {
         match event.event_type.as_str() {
             "token_count" => {
                 let Some(info) = event.payload.get("info").filter(|info| info.is_object()) else {
                     continue;
                 };
-                if let Some(total_tokens) = info
+                if let Some(input_tokens) = info
                     .get("last_token_usage")
-                    .and_then(|usage| usage.get("total_tokens"))
+                    .and_then(|usage| usage.get("input_tokens"))
                     .and_then(serde_json::Value::as_i64)
                 {
-                    usage.context_tokens = Some(total_tokens);
+                    usage.context_tokens = Some(input_tokens.max(0));
                 }
                 if let Some(model_context_window) = info
                     .get("model_context_window")
@@ -1901,13 +1899,6 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
                 }
             }
             "model.usage" => {
-                if let Some(input_tokens) = event
-                    .payload
-                    .get("input_tokens")
-                    .and_then(serde_json::Value::as_i64)
-                {
-                    legacy_context_tokens = Some(input_tokens);
-                }
                 if let Some(cost) = event
                     .payload
                     .get("cost_usd")
@@ -1918,9 +1909,6 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
             }
             _ => {}
         }
-    }
-    if usage.context_tokens.is_none() {
-        usage.context_tokens = legacy_context_tokens;
     }
     usage
 }

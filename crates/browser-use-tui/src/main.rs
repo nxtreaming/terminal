@@ -11198,8 +11198,11 @@ mod redesign_tests {
         assert!(completed_screen.contains("inspect top alignment"));
         assert!(!completed_screen.contains("• answer"));
         assert!(!completed_screen.contains("• done"));
-        // Footer status bar surfaces the active model and a context-fill bar.
-        assert!(completed_screen.contains("24.5k/60k"));
+        // Legacy model.usage still contributes cost, but it no longer fabricates
+        // a 60k context meter before Codex-style token_count metadata exists.
+        assert!(completed_screen.contains("$0.0731"));
+        assert!(!completed_screen.contains("24.5k/60k"));
+        assert!(!completed_screen.contains("context left"));
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
         let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
         assert!(composer_row > result_row);
@@ -11232,11 +11235,11 @@ mod redesign_tests {
             serde_json::json!({
                 "info": {
                     "last_token_usage": {
-                        "input_tokens": 0,
+                        "input_tokens": 12345,
                         "cached_input_tokens": 0,
-                        "output_tokens": 0,
-                        "reasoning_output_tokens": 0,
-                        "total_tokens": 12345
+                        "output_tokens": 4000,
+                        "reasoning_output_tokens": 1000,
+                        "total_tokens": 17345
                     },
                     "total_token_usage": {
                         "input_tokens": 20,
@@ -11265,6 +11268,7 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
 
         assert!(screen.contains("12.3k/100k"));
+        assert!(!screen.contains("17.3k/100k"));
         assert!(!screen.contains("999/60k"));
         assert!(screen.contains("$0.0123"));
         Ok(())
@@ -14534,8 +14538,9 @@ wire_api = "responses"
 
         let screen = render_dump(&mut app)?;
         let composer_row = row_containing(&screen, "Ask a follow-up");
-        let status_row = row_containing(&screen, "/60k");
+        let status_row = row_containing(&screen, "$0.0412");
         assert!(status_row >= composer_row + 2);
+        assert!(!screen.contains("/60k"));
         assert!(!screen.contains("describe this repo"));
         assert!(!screen.contains("go say hi to aitor"));
         assert!(!screen.contains("It is a Rust browser-agent workbench."));
