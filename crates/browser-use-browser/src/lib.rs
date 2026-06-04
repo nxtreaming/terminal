@@ -3395,10 +3395,11 @@ fn classify_browser_error(message: &str) -> &'static str {
         "session-gone"
     } else if lower.contains("browser connect timed out") {
         "browser-connect-timeout"
-    } else if (lower.contains("resource temporarily unavailable")
+    } else if ((lower.contains("resource temporarily unavailable")
         || lower.contains("would block")
         || lower.contains("timed out"))
-        && lower.contains("read cdp")
+        && lower.contains("read cdp"))
+        || (lower.contains("cdp ") && lower.contains(" timed out"))
     {
         "cdp-read-timeout"
     } else if lower.contains("connection refused")
@@ -3424,6 +3425,7 @@ fn classify_browser_script_failure(message: &str) -> &'static str {
         "browser-script-no-result"
     } else if lower.contains("read cdp")
         || lower.contains("send cdp")
+        || (lower.contains("cdp ") && lower.contains(" timed out"))
         || lower.contains("cdp websocket")
         || lower.contains("browser is not connected")
         || lower.contains("connection refused")
@@ -7500,6 +7502,12 @@ mod tests {
         assert!(!should_drop_browser_connection(classify_browser_error(
             message
         )));
+
+        let plain_timeout = "CDP Runtime.evaluate timed out";
+        assert_eq!(classify_browser_error(plain_timeout), "cdp-read-timeout");
+        assert!(!should_drop_browser_connection(classify_browser_error(
+            plain_timeout
+        )));
     }
 
     #[test]
@@ -7578,6 +7586,15 @@ mod tests {
             classify_browser_script_failure(message),
             "browser-script-error"
         );
+    }
+
+    #[test]
+    fn runtime_evaluate_script_timeouts_keep_browser_connection() {
+        let message = "RuntimeError: CDP Runtime.evaluate timed out";
+        assert_eq!(classify_browser_script_failure(message), "cdp-read-timeout");
+        assert!(!should_drop_browser_connection(
+            classify_browser_script_failure(message)
+        ));
     }
 
     #[test]
