@@ -68,8 +68,8 @@ use browser_use_providers::{
 use browser_use_python_worker::PythonWorker;
 use browser_use_runtime::{
     send_local_runtime_request, AgentId, BrowserConfig, BrowserId, BrowserUseRuntime,
-    CompleteAgentRequest, CreateRootAgentRequest, FailAgentRequest, LiveThreadPersistence,
-    LocalRuntimeRequest, LocalRuntimeWaitTarget,
+    CompleteAgentRequest, CreateRootAgentRequest, Durability as RuntimeDurability,
+    FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
     RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState, SessionId, SpawnChildRequest,
     SqliteJournal, StateIndex, SubmitInputRequest,
@@ -3961,10 +3961,11 @@ fn sdk_agent_create(context: &SdkServerContext, params: &Value) -> Result<Value>
         task: task.clone(),
         max_concurrent_threads_per_session,
     })?;
-    context.store.append_event(
-        agent.session_id().as_str(),
+    context.runtime.append_observed_session_event(
+        agent.session_id().clone(),
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&task, &cwd)?,
+        RuntimeDurability::Barrier,
     )?;
     maybe_append_message_history(
         agent.session_id().as_str(),
@@ -4030,24 +4031,27 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
             input_items: payload.get("items").cloned(),
             payload: serde_json::json!({ "source": "sdk" }),
         })?;
-        let record = context.store.append_event(
-            session_id.as_str(),
+        let append = context.runtime.append_observed_session_event(
+            session_id.clone(),
             "session.followup.runtime_queued",
             serde_json::json!({
                 "source": "sdk",
                 "runtime_mailbox_id": submitted.mailbox_item.id,
                 "runtime_mailbox_seq": submitted.mailbox_item.seq,
             }),
+            RuntimeDurability::Barrier,
         )?;
-        capture_user_message(
-            &context.store,
-            "sdk",
-            session_id.as_str(),
-            session.parent_id.is_some(),
-            MESSAGE_KIND_FOLLOWUP,
-            record.seq,
-            followup,
-        );
+        if let Some(seq) = append.seq {
+            capture_user_message(
+                &context.store,
+                "sdk",
+                session_id.as_str(),
+                session.parent_id.is_some(),
+                MESSAGE_KIND_FOLLOWUP,
+                seq,
+                followup,
+            );
+        }
         maybe_append_message_history(
             session_id.as_str(),
             followup,
