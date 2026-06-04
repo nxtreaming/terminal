@@ -332,6 +332,26 @@ async def _test_agent_run_fails_loudly_when_server_does_not_support_run() -> Non
         await agent.run()
 
 
+def test_agent_run_fails_loudly_when_memory_sdk_rejects_real_run() -> None:
+    asyncio.run(_test_agent_run_fails_loudly_when_memory_sdk_rejects_real_run())
+
+
+async def _test_agent_run_fails_loudly_when_memory_sdk_rejects_real_run() -> None:
+    class MemoryOnlyRuntime(FakeRuntime):
+        async def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            if method == "agent.run":
+                raise JsonRpcError(
+                    -32000,
+                    "agent.run is memory-only in sdk-server, but real model execution still depends on the store-backed turn driver",
+                )
+            return await super().call(method, params)
+
+    agent = Agent("task", browser=Browser(_runtime=MemoryOnlyRuntime()))  # type: ignore[arg-type]
+
+    with pytest.raises(NotImplementedError, match="agent.run is not supported"):
+        await agent.run()
+
+
 def test_history_validates_structured_output_with_pydantic_v2_style() -> None:
     class Product:
         @classmethod
@@ -390,5 +410,6 @@ async def _test_runtime_client_round_trips_against_sdk_server_binary(tmp_path: P
         while not projected_queue.empty():
             projected.append(projected_queue.get_nowait())
         assert any(event.get("kind") == "thread_status_changed" for event in projected)
+        assert not (tmp_path / "state.db").exists()
     finally:
         await runtime.close()

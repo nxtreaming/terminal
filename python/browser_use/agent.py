@@ -68,7 +68,11 @@ class Agent:
                 self._active_run_id = self.session_id
                 result = await self.browser.runtime.call("agent.run", params)
             except JsonRpcError as error:
-                if error.code == -32601:
+                if (
+                    error.code == -32601
+                    or "memory-only in sdk-server" in error.message
+                    or "store-backed turn driver" in error.message
+                ):
                     raise NotImplementedError(
                         "agent.run is not supported by this Rust SDK server yet"
                     ) from error

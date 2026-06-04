@@ -68,9 +68,10 @@ use browser_use_providers::{
 use browser_use_python_worker::PythonWorker;
 use browser_use_runtime::{
     send_local_runtime_request, AgentId, BrowserConfig, BrowserId, BrowserUseRuntime,
-    CompleteAgentRequest, CreateRootAgentRequest, Durability as RuntimeDurability,
-    FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest, LocalRuntimeWaitTarget,
-    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
+    CompleteAgentRequest, CreateRootAgentRequest, DrainAgentMailboxRequest,
+    Durability as RuntimeDurability, FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest,
+    LocalRuntimeWaitTarget, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
+    MailboxItemKind as RuntimeMailboxItemKind, MemoryJournal, RunAgentRequest,
     RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState, SessionId, SpawnChildRequest,
     SqliteJournal, StateIndex, SubmitInputRequest,
 };
@@ -683,6 +684,9 @@ fn main() -> Result<()> {
     let _unified_exec_cleanup = UnifiedExecShutdownCleanup::new();
     load_dotenv()?;
     let mut args = Args::parse();
+    if let Command::SdkServer { transport } = args.command {
+        return sdk_server(transport);
+    }
     args.state_dir = resolve_state_dir(&args.state_dir);
     let store = Store::open(&args.state_dir)?;
     capture_async(
@@ -833,7 +837,7 @@ fn main() -> Result<()> {
         ),
         Command::Auth { command } => auth(&store, command),
         Command::Diagnostics => diagnostics(&store),
-        Command::SdkServer { transport } => sdk_server(&store, transport),
+        Command::SdkServer { .. } => unreachable!("sdk-server is handled before Store bootstrap"),
         Command::Trace { task_id, output } => trace(&store, &task_id, output),
         Command::SpawnAgent {
             parent_id,
@@ -3804,38 +3808,35 @@ struct JsonRpcRequest {
 }
 
 struct SdkServerContext {
-    store: Store,
+    journal: Arc<MemoryJournal>,
     runtime: RuntimeHandle,
 }
 
 impl SdkServerContext {
-    fn new(store: &Store) -> Result<Self> {
-        let state_dir = store.state_dir().to_path_buf();
-        let journal = std::sync::Arc::new(SqliteJournal::from_store(Store::open(&state_dir)?));
-        let persistence: std::sync::Arc<dyn LiveThreadPersistence> = journal.clone();
-        let state_index: std::sync::Arc<dyn StateIndex> = journal;
-        Ok(Self {
-            store: Store::open(&state_dir)?,
-            runtime: BrowserUseRuntime::new(persistence, state_index).handle(),
-        })
+    fn memory() -> Self {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        Self {
+            journal,
+            runtime: runtime.handle(),
+        }
     }
 
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
-            store: Store::open(self.store.state_dir())?,
+            journal: Arc::clone(&self.journal),
             runtime: self.runtime.clone(),
         })
     }
 }
 
-fn sdk_server(_store: &Store, transport: SdkTransportArg) -> Result<()> {
+fn sdk_server(transport: SdkTransportArg) -> Result<()> {
     match transport {
-        SdkTransportArg::Stdio => sdk_server_stdio(_store),
+        SdkTransportArg::Stdio => sdk_server_stdio(),
     }
 }
 
-fn sdk_server_stdio(store: &Store) -> Result<()> {
-    let context = SdkServerContext::new(store)?;
+fn sdk_server_stdio() -> Result<()> {
+    let context = SdkServerContext::memory();
     let (response_tx, response_rx) = mpsc::channel::<Value>();
     let event_thread_stop = Arc::new(AtomicBool::new(false));
     let writer = thread::Builder::new()
@@ -4058,12 +4059,6 @@ fn sdk_agent_create(context: &SdkServerContext, params: &Value) -> Result<Value>
         typed_user_input_payload_from_text_for_cwd(&task, &cwd)?,
         RuntimeDurability::Barrier,
     )?;
-    maybe_append_message_history(
-        agent.session_id().as_str(),
-        &task,
-        &cwd,
-        &AgentRunOptions::default(),
-    );
     Ok(serde_json::json!({
         "agent_id": agent.agent_id().as_str(),
         "session_id": agent.session_id().as_str(),
@@ -4100,8 +4095,8 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     let thread = context.runtime.agents().thread(&agent_id)?;
     let session_id = thread.session_id().clone();
     let session = context
-        .store
-        .load_session(session_id.as_str())?
+        .runtime
+        .load_session(&session_id)?
         .with_context(|| format!("unknown session id: {session_id}"))?;
 
     for followup in params
@@ -4132,23 +4127,7 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
             }),
             RuntimeDurability::Barrier,
         )?;
-        if let Some(seq) = append.seq {
-            capture_user_message(
-                &context.store,
-                "sdk",
-                session_id.as_str(),
-                session.parent_id.is_some(),
-                MESSAGE_KIND_FOLLOWUP,
-                seq,
-                followup,
-            );
-        }
-        maybe_append_message_history(
-            session_id.as_str(),
-            followup,
-            Path::new(&session.cwd),
-            &AgentRunOptions::default(),
-        );
+        let _ = append;
     }
 
     let browser_id = params
@@ -4157,17 +4136,17 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
         .map(|browser_id| BrowserId::from_string(browser_id.to_string()))
         .transpose()?;
 
-    let config = sdk_provider_run_config(params, &context.store, session_id.as_str())?;
-    run_session_via_engine_with_runtime_and_cancel(
-        &context.store,
-        session_id.as_str(),
-        config,
-        context.runtime.clone(),
-        tokio_util::sync::CancellationToken::new(),
-        browser_id,
-    )?;
+    let events_before_run = context.runtime.events_for_session(&session_id)?;
+    let task = task_from_events(&events_before_run).unwrap_or_else(|| "task".to_string());
+    let config = sdk_provider_run_config(params, Some(&task))?;
+    if config.backend != ProviderBackend::Fake {
+        bail!(
+            "agent.run is memory-only in sdk-server, but real model execution still depends on the store-backed turn driver; use the CLI/TUI runtime until RuntimeTurnDriver is store-free"
+        );
+    }
+    sdk_run_fake_agent_with_runtime(context, &agent_id, &session_id, browser_id, &config)?;
 
-    let events = context.store.events_for_session(session_id.as_str())?;
+    let events = context.runtime.events_for_session(&session_id)?;
     let output = session_result_from_events(&events);
     let error = failure_from_events(&events);
     let final_projected_event = sdk_final_projected_event(
@@ -4199,6 +4178,69 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
         },
         "final_projected_event": final_projected_event,
     }))
+}
+
+fn sdk_run_fake_agent_with_runtime(
+    context: &SdkServerContext,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+    browser_id: Option<BrowserId>,
+    config: &ProviderRunConfig,
+) -> Result<()> {
+    let output = config
+        .fake_result
+        .clone()
+        .unwrap_or_else(|| fake_agent_result_text("task", None));
+    let runtime = context.runtime.clone();
+    let runtime_for_turn = runtime.clone();
+    let run_session_id = session_id.clone();
+    let mut request = RunAgentRequest::new(session_id.clone())
+        .with_agent_id(agent_id.clone())
+        .with_provider_config(serde_json::json!({
+            "backend": "fake",
+            "model": config.model.as_str(),
+            "source": "sdk-memory",
+        }))
+        .with_input_source("sdk-memory");
+    if let Some(browser_id) = browser_id {
+        request = request.with_browser_id(browser_id);
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .context("build sdk fake run runtime")?;
+    rt.block_on(async move {
+        runtime
+            .run_agent(request, async move {
+                let _ = runtime_for_turn.drain_agent_mailbox(DrainAgentMailboxRequest {
+                    session_id: run_session_id.clone(),
+                    delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+                })?;
+                runtime_for_turn.append_observed_session_event(
+                    run_session_id.clone(),
+                    "model.stream_delta",
+                    serde_json::json!({
+                        "text": output,
+                        "source": "sdk-memory-fake",
+                    }),
+                    RuntimeDurability::BestEffort,
+                )?;
+                runtime_for_turn.append_observed_session_event(
+                    run_session_id.clone(),
+                    "session.done",
+                    serde_json::json!({
+                        "result": output,
+                        "runtime_owned": true,
+                        "source": "sdk-memory-fake",
+                    }),
+                    RuntimeDurability::Barrier,
+                )?;
+                Ok(run_session_id.as_str().to_string())
+            })
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    })
 }
 
 fn sdk_final_projected_event(
@@ -4346,11 +4388,7 @@ fn sdk_agent_close(context: &SdkServerContext, params: &Value) -> Result<Value> 
     Ok(serde_json::json!({ "ok": true }))
 }
 
-fn sdk_provider_run_config(
-    params: &Value,
-    store: &Store,
-    session_id: &str,
-) -> Result<ProviderRunConfig> {
+fn sdk_provider_run_config(params: &Value, task: Option<&str>) -> Result<ProviderRunConfig> {
     let llm = params.get("llm").unwrap_or(&Value::Null);
     let provider = llm
         .get("provider")
@@ -4394,9 +4432,7 @@ fn sdk_provider_run_config(
 
     let mut config = ProviderRunConfig::new(backend, model).with_options(options);
     if backend == ProviderBackend::Fake {
-        let events = store.events_for_session(session_id)?;
-        let task = task_from_events(&events).unwrap_or_else(|| "task".to_string());
-        config = config.with_fake_result(fake_agent_result_text(&task, None));
+        config = config.with_fake_result(fake_agent_result_text(task.unwrap_or("task"), None));
     }
     Ok(config)
 }
@@ -6823,8 +6859,7 @@ command = "test-mcp"
     #[test]
     fn sdk_json_rpc_ping_and_create_methods_use_runtime() -> Result<()> {
         let temp = unique_cli_test_dir("sdk-json-rpc")?;
-        let store = Store::open(&temp)?;
-        let context = SdkServerContext::new(&store)?;
+        let context = SdkServerContext::memory();
 
         let ping = handle_sdk_json_rpc_line(
             &context,
@@ -6894,10 +6929,16 @@ command = "test-mcp"
             .to_string(),
         );
         assert_eq!(session_snapshot["result"]["session_id"], session_id);
-        let events = context.store.events_for_session(session_id)?;
+        let events = context
+            .runtime
+            .events_for_session(&SessionId::from_string(session_id.to_string())?)?;
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.input"));
+        assert!(
+            !temp.join("state.db").exists(),
+            "SDK memory context must not create a SQLite database"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -6906,8 +6947,7 @@ command = "test-mcp"
     #[test]
     fn sdk_json_rpc_reports_protocol_errors() -> Result<()> {
         let temp = unique_cli_test_dir("sdk-json-rpc-errors")?;
-        let store = Store::open(&temp)?;
-        let context = SdkServerContext::new(&store)?;
+        let context = SdkServerContext::memory();
 
         let parse = handle_sdk_json_rpc_line(&context, "{not-json");
         assert_eq!(parse["error"]["code"], -32700);
@@ -6917,6 +6957,10 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":4,"method":"missing.method","params":{}}"#,
         );
         assert_eq!(missing["error"]["code"], -32601);
+        assert!(
+            !temp.join("state.db").exists(),
+            "SDK memory context must not create a SQLite database"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -6925,8 +6969,7 @@ command = "test-mcp"
     #[test]
     fn sdk_json_rpc_agent_run_executes_fake_backend() -> Result<()> {
         let temp = unique_cli_test_dir("sdk-json-rpc-run-fake")?;
-        let store = Store::open(&temp)?;
-        let context = SdkServerContext::new(&store)?;
+        let context = SdkServerContext::memory();
         let agent = handle_sdk_json_rpc_line(
             &context,
             r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
@@ -6972,7 +7015,9 @@ command = "test-mcp"
                 ["final_result"],
             serde_json::Value::String("Fake result for: inspect".to_string())
         );
-        let events = context.store.events_for_session(session_id)?;
+        let events = context
+            .runtime
+            .events_for_session(&SessionId::from_string(session_id.to_string())?)?;
         assert!(events
             .iter()
             .any(|event| event.event_type == "mailbox.enqueued"));
@@ -6985,12 +7030,9 @@ command = "test-mcp"
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.followup.runtime_queued"));
-        assert!(events
-            .iter()
-            .any(|event| event.event_type == "session.followup"));
         assert!(
-            context.store.messages_for_agent(session_id)?.is_empty(),
-            "SDK followups must not enqueue Store-backed agent_messages rows"
+            !temp.join("state.db").exists(),
+            "SDK memory runs must not create Store-backed agent_messages or SQLite state"
         );
         let browser_snapshot = context
             .runtime
@@ -7000,6 +7042,42 @@ command = "test-mcp"
         assert_eq!(
             browser_snapshot.status,
             browser_use_runtime::BrowserStatus::Released
+        );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_agent_run_rejects_store_backed_real_backend() -> Result<()> {
+        let temp = unique_cli_test_dir("sdk-json-rpc-run-real-rejected")?;
+        let context = SdkServerContext::memory();
+        let agent = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
+        );
+        let agent_id = agent["result"]["agent_id"].as_str().context("agent id")?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "agent.run",
+            "params": {
+                "agent_id": agent_id,
+                "max_steps": 2,
+                "llm": {"provider": "openai", "model": "gpt-5.5"}
+            }
+        });
+
+        let result = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        assert_eq!(result["error"]["code"], -32000);
+        assert!(result["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("store-backed turn driver"));
+        assert!(
+            !temp.join("state.db").exists(),
+            "Rejected SDK real runs must not create SQLite state"
         );
 
         std::fs::remove_dir_all(temp)?;
