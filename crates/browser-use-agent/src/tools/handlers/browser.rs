@@ -713,10 +713,11 @@ fn dispatch_browser_profile_preference(
                 .get(2)
                 .map(String::as_str)
                 .ok_or_else(|| anyhow!("browser profile use requires <profile-id>"))?;
-            store.set_setting(BROWSER_PREF_PROFILE, profile_id)?;
             Ok(json!({
                 "status": "ok",
                 "profile_id": profile_id,
+                "persisted": false,
+                "scope": "chat_history_only",
                 "next_step": browser_profile_connect_next_step("local", Some(profile_id)),
             }))
         }
@@ -744,26 +745,15 @@ fn dispatch_browser_profile_preference(
                 "mode": mode,
                 "profile_id": profile_id,
             });
-            store.set_setting(
-                &browser_domain_profile_key(&domain),
-                &serde_json::to_string(&value)?,
-            )?;
-            store.set_setting(BROWSER_PREF_MODE, value["mode"].as_str().unwrap_or("local"))?;
-            store.set_setting(
-                BROWSER_PREF_PROFILE,
-                value["profile_id"].as_str().unwrap_or(""),
-            )?;
-            store.set_setting(
-                "browser",
-                browser_display_name(value["mode"].as_str().unwrap_or("local")),
-            )?;
             let next_step = browser_profile_connect_next_step(
                 value["mode"].as_str().unwrap_or("local"),
                 value["profile_id"].as_str(),
             );
             Ok(json!({
                 "status": "ok",
-                "remembered": value,
+                "selection": value,
+                "persisted": false,
+                "scope": "chat_history_only",
                 "next_step": next_step,
             }))
         }
@@ -772,6 +762,7 @@ fn dispatch_browser_profile_preference(
                 .or_else(|| args.get(2).cloned())
                 .ok_or_else(|| anyhow!("browser profile forget requires --domain <domain>"))?;
             store.delete_setting(&browser_domain_profile_key(&domain))?;
+            store.delete_setting(BROWSER_PREF_PROFILE)?;
             Ok(json!({ "status": "ok", "forgot_domain": normalize_domain(&domain) }))
         }
         Some("suggest") => {
@@ -779,7 +770,6 @@ fn dispatch_browser_profile_preference(
             let domain = option_value_core(args, "--domain")
                 .or_else(|| args.get(2).cloned())
                 .ok_or_else(|| anyhow!("browser profile suggest requires --domain <domain>"))?;
-            let remembered = remembered_domain_profile(store, &domain)?;
             let profiles = backend
                 .command(
                     session_id,
@@ -795,31 +785,13 @@ fn dispatch_browser_profile_preference(
                         "profiles": [],
                     })
                 });
-            let next_step = remembered.as_ref().map_or_else(
-                || "Ask the user which profile to use, then run browser profile remember --domain <domain> --profile <profile-id>".to_string(),
-                |remembered| {
-                    let remembered_profile = remembered["profile_id"].as_str().unwrap_or("");
-                    if remembered["mode"].as_str().unwrap_or("local") == "local"
-                        && !remembered_profile.is_empty()
-                    {
-                        format!(
-                            "Ask the user to confirm the remembered profile {} or choose another profile, then run browser profile remember --domain <domain> --profile <profile-id> before browser connect local.",
-                            shell_quote_browser_arg(remembered_profile)
-                        )
-                    } else {
-                        browser_profile_connect_next_step(
-                            remembered["mode"].as_str().unwrap_or("local"),
-                            remembered["profile_id"].as_str(),
-                        )
-                    }
-                },
-            );
             Ok(json!({
                 "status": "ok",
                 "domain": normalize_domain(&domain),
-                "remembered": remembered,
+                "remembered": null,
+                "persistence": "disabled",
                 "local_profiles": profiles.get("profiles").cloned().unwrap_or_else(|| json!([])),
-                "next_step": next_step,
+                "next_step": "Ask the user which profile to use. Keep the answer in chat history only, then open/target that profile window if needed before browser connect local.",
             }))
         }
         Some(other) => bail!("unknown browser profile command: {other}"),
@@ -989,25 +961,12 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
                 .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
         })
         .unwrap_or_else(|| "local".to_string());
-    let profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
-    let domain_profiles = store
-        .list_settings()?
-        .into_iter()
-        .filter_map(|(key, value)| {
-            key.strip_prefix(BROWSER_DOMAIN_PROFILE_PREFIX)
-                .and_then(|domain| {
-                    serde_json::from_str::<Value>(&value)
-                        .ok()
-                        .map(|value| (domain.to_string(), value))
-                })
-        })
-        .map(|(domain, value)| json!({ "domain": domain, "preference": value }))
-        .collect::<Vec<_>>();
     Ok(json!({
         "mode": normalize_browser_preference_mode(&mode)?,
         "display": browser_display_name(normalize_browser_preference_mode(&mode)?),
-        "profile_id": profile_id,
-        "domain_profiles": domain_profiles,
+        "profile_id": null,
+        "domain_profiles": [],
+        "profile_persistence": "disabled",
         "connect_command": match normalize_browser_preference_mode(&mode)? {
             "cloud" => "browser remote start",
             "managed-headless" => "browser connect managed --headless",
@@ -1015,13 +974,6 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
             _ => "browser connect local",
         },
     }))
-}
-
-fn remembered_domain_profile(store: &Store, domain: &str) -> anyhow::Result<Option<Value>> {
-    store
-        .get_setting(&browser_domain_profile_key(domain))?
-        .map(|raw| serde_json::from_str::<Value>(&raw).map_err(Into::into))
-        .transpose()
 }
 
 fn browser_command_words(cmd: &str) -> anyhow::Result<Vec<String>> {
