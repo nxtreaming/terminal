@@ -777,6 +777,10 @@ pub mod definitions {
                     },
                     "cwd": { "type": "string", "description": "Working directory (defaults to the session cwd)." },
                     "timeout_ms": { "type": "integer", "description": "Per-command timeout in milliseconds." },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Maximum number of tokens to return. Excess output will be truncated."
+                    },
                     "env": {
                         "type": "object",
                         "additionalProperties": { "type": "string" },

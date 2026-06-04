@@ -834,6 +834,27 @@ impl MemoryJournal {
     }
 }
 
+fn status_for_session_event(event_type: &str, payload: &Value) -> Option<SessionStatus> {
+    match event_type {
+        "session.input" | "session.followup" | "agent.mailbox_input" | "agent.run.started" => {
+            Some(SessionStatus::Running)
+        }
+        "session.done" => Some(SessionStatus::Done),
+        "session.failed" => Some(SessionStatus::Failed),
+        "session.cancelled" => Some(SessionStatus::Cancelled),
+        "agent.closed"
+            if payload.get("cancelled_active_run").and_then(Value::as_bool) == Some(true) =>
+        {
+            Some(SessionStatus::Cancelled)
+        }
+        "session.status" => payload
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(|status| status.parse().ok()),
+        _ => None,
+    }
+}
+
 impl JournalSink for MemoryJournal {
     fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<JournalAppend> {
         let session_id = event
@@ -862,6 +883,7 @@ impl JournalSink for MemoryJournal {
         if !inner.sessions.contains_key(session_id.as_str()) {
             bail!("unknown session id: {session_id}");
         }
+        let status_update = status_for_session_event(event_type, &payload);
         inner.next_seq = inner.next_seq.saturating_add(1);
         let record = EventRecord {
             seq: inner.next_seq,
@@ -876,6 +898,12 @@ impl JournalSink for MemoryJournal {
             .entry(session_id.as_str().to_string())
             .or_default()
             .push(record);
+        if let Some(status) = status_update {
+            if let Some(session) = inner.sessions.get_mut(session_id.as_str()) {
+                session.status = status;
+                session.updated_ms = now_ms();
+            }
+        }
         Ok(JournalAppend {
             seq: Some(inner.next_seq),
             durability,
@@ -2795,6 +2823,34 @@ impl RuntimeHandle {
                         self.release_browser(lease)?;
                     }
                     return Err(abort_error);
+                }
+                let terminal_event_type = if request.cancellation_token.is_cancelled() {
+                    "session.cancelled"
+                } else {
+                    "session.failed"
+                };
+                let terminal_payload = if request.cancellation_token.is_cancelled() {
+                    json!({
+                        "reason": format!("{error:#}"),
+                        "runtime_owned": true,
+                    })
+                } else {
+                    json!({
+                        "error": format!("{error:#}"),
+                        "runtime_owned": true,
+                    })
+                };
+                if let Err(terminal_error) = self.inner.persistence.append_session_event(
+                    &request.session_id,
+                    terminal_event_type,
+                    terminal_payload,
+                    Durability::Barrier,
+                ) {
+                    thread.live_state.finish_run();
+                    if let Some(lease) = browser_lease.as_ref() {
+                        self.release_browser(lease)?;
+                    }
+                    return Err(terminal_error);
                 }
                 thread.set_status(final_status);
                 thread.live_state.finish_run();
@@ -5015,7 +5071,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_run_agent_releases_browser_after_run_error() -> Result<()> {
-        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let (runtime, journal) = BrowserUseRuntime::memory();
         let handle = runtime.handle();
         let root = handle.create_root_agent(CreateRootAgentRequest {
             cwd: PathBuf::from("/tmp"),
@@ -5041,6 +5097,24 @@ mod tests {
         let snapshot = handle.browsers().snapshot(&browser_id)?;
         assert_eq!(snapshot.active_agent_id, None);
         assert_eq!(snapshot.status, BrowserStatus::Released);
+        assert_eq!(
+            handle.snapshot_agent(root.agent_id())?.status,
+            AgentThreadStatus::Failed
+        );
+        assert_eq!(
+            journal
+                .load_session(root.session_id())?
+                .expect("root session")
+                .status,
+            SessionStatus::Failed
+        );
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"agent.turn.aborted".to_string()));
+        assert!(event_types.contains(&"session.failed".to_string()));
         Ok(())
     }
 
