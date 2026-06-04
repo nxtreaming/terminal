@@ -31,6 +31,7 @@ const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
 const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
+const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 const BROWSER_CONNECT_ATTACH_DEADLINE: Duration = Duration::from_secs(8);
 const BROWSER_CONNECT_CDP_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -2511,10 +2512,8 @@ impl BrowserSession {
         attach_deadline: Instant,
     ) -> Result<()> {
         let ws_url = endpoint.ws_url.clone();
-        let connection = CdpDispatcher::connect_with_timeout(
-            &ws_url,
-            connect_attach_call_timeout(attach_deadline)?,
-        )?;
+        let connection =
+            CdpDispatcher::connect_with_timeout(&ws_url, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?;
         self.endpoint = Some(endpoint);
         self.connection = Some(connection);
         self.mode = mode;
@@ -3381,6 +3380,10 @@ fn local_ws_socket_addr(ws_url: &str) -> Result<Option<SocketAddr>> {
 fn classify_browser_error(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("403 forbidden") || lower.contains("http error: 403") {
+        "permission-blocked"
+    } else if lower.contains("interrupted handshake")
+        && (lower.contains("wouldblock") || lower.contains("would block"))
+    {
         "permission-blocked"
     } else if lower.contains("target")
         && (lower.contains("not found")
@@ -7506,6 +7509,16 @@ mod tests {
         assert_eq!(
             local_connect_next_step("browser-connect-timeout"),
             "browser recover reconnect-websocket"
+        );
+    }
+
+    #[test]
+    fn local_permission_handshake_wait_is_not_websocket_drop() {
+        let message = "connect CDP websocket ws://127.0.0.1:9222/devtools/browser/abc: Interrupted handshake (WouldBlock)";
+        assert_eq!(classify_browser_error(message), "permission-blocked");
+        assert_eq!(
+            local_connect_next_step("permission-blocked"),
+            "browser local setup"
         );
     }
 
