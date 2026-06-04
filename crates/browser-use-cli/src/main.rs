@@ -4619,24 +4619,7 @@ fn send_agent_message(
         println!("{message_id}");
         return Ok(());
     }
-    let msg = store.send_agent_message(author_id, &target.session_id, message, trigger_turn)?;
-    let author_path = display_agent_path_for_session(store, author_id)?;
-    store.append_event(
-        author_id,
-        "agent.message",
-        serde_json::json!({
-            "id": msg.id,
-            "author_session_id": msg.author_session_id,
-            "target_session_id": msg.target_session_id,
-            "author_path": author_path,
-            "recipient_path": target.agent_path,
-            "child_session_id": target.session_id,
-            "content": msg.content,
-            "trigger_turn": msg.trigger_turn,
-        }),
-    )?;
-    println!("{}", msg.id);
-    Ok(())
+    bail!("send_agent_message requires a live runtime mailbox; Store-backed send is replay-only")
 }
 
 fn send_agent_message_via_live_runtime(
@@ -6978,19 +6961,20 @@ command = "test-mcp"
         assert!(err
             .to_string()
             .contains("Empty message can't be sent to an agent"));
-        send_agent_message(&store, &parent.id, "cli_child", "inspect this", false)?;
-
+        let err = send_agent_message(&store, &parent.id, "cli_child", "inspect this", false)
+            .expect_err("Store-backed CLI send should fail without live runtime");
+        assert!(err
+            .to_string()
+            .contains("send_agent_message requires a live runtime mailbox"));
         let mail = store.messages_for_agent(&child.id)?;
-        assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].content, "inspect this");
+        assert!(
+            mail.is_empty(),
+            "offline CLI send must not enqueue Store-backed agent_messages rows"
+        );
         let parent_events = store.events_for_session(&parent.id)?;
-        let message_event = parent_events
+        assert!(parent_events
             .iter()
-            .find(|event| event.event_type == "agent.message")
-            .context("agent.message")?;
-        assert_eq!(message_event.payload["author_path"], "/root");
-        assert_eq!(message_event.payload["recipient_path"], "/root/cli_child");
-        assert_eq!(message_event.payload["child_session_id"], child.id);
+            .all(|event| event.event_type != "agent.message"));
 
         let err = send_agent_message(&store, &child.id, "root", "new task", true)
             .expect_err("root trigger turns should fail");
