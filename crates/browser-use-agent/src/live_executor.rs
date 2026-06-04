@@ -6,7 +6,8 @@ use std::thread;
 
 use anyhow::{anyhow, Context, Result};
 use browser_use_runtime::{
-    AgentId, AttachChildAgentRequest, AttachRootAgentRequest, RunAgentRequest, RuntimeHandle,
+    AgentId, AttachChildAgentRequest, AttachRootAgentRequest,
+    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RunAgentRequest, RuntimeHandle,
     SessionId as RuntimeSessionId,
 };
 use browser_use_store::{Store, StoreNotifier};
@@ -159,7 +160,7 @@ impl RuntimeAgentExecutor {
             .with_context(|| format!("unknown session id: {}", request.session_id))?;
         let run_cwd = PathBuf::from(&session_meta.cwd);
         let shared_store: SharedStore = Arc::new(Mutex::new(store));
-        let cancel = request
+        let initial_cancel = request
             .cancellation_token
             .unwrap_or_else(CancellationToken::new);
         let provider_config = json!({
@@ -167,32 +168,55 @@ impl RuntimeAgentExecutor {
             "model": request.config.model,
             "runtime_agent_executor": true,
         });
-        let runtime_request = RunAgentRequest::new(runtime_session_id)
-            .with_agent_id(AgentId::from_string(request.session_id.clone())?)
-            .with_provider_config(provider_config)
-            .with_cwd(run_cwd)
-            .with_input_source("runtime_agent_executor")
-            .with_cancellation_token(cancel.clone());
+        let agent_id = AgentId::from_string(request.session_id.clone())?;
         let runtime = self.inner.runtime.clone();
-        let runner_runtime = self.inner.runtime.clone();
         let request_session_id = request.session_id.clone();
-        let request_session_id_for_run = request_session_id.clone();
-        let shared_store_for_run = Arc::clone(&shared_store);
         let config = request.config;
+        let shared_store_for_loop = Arc::clone(&shared_store);
+        let request_session_id_for_loop = request_session_id.clone();
         let result = self.inner.tokio.block_on(async move {
-            runtime
-                .run_agent(runtime_request, async move {
-                    RuntimeTurnDriver::new(
-                        shared_store_for_run,
-                        request_session_id_for_run,
-                        config,
-                        cancel,
-                    )
-                    .with_runtime_handle(Some(runner_runtime))
-                    .run()
-                    .await
-                })
-                .await
+            let mut cancel = initial_cancel;
+            let mut restart_count = 0usize;
+            loop {
+                let runtime_request = RunAgentRequest::new(runtime_session_id.clone())
+                    .with_agent_id(agent_id.clone())
+                    .with_provider_config(provider_config.clone())
+                    .with_cwd(run_cwd.clone())
+                    .with_input_source("runtime_agent_executor")
+                    .with_cancellation_token(cancel.clone());
+                let runner_runtime = runtime.clone();
+                let shared_store_for_run = Arc::clone(&shared_store_for_loop);
+                let request_session_id_for_run = request_session_id_for_loop.clone();
+                let config_for_run = config.clone();
+                let cancel_for_run = cancel.clone();
+                let run_result = runtime
+                    .run_agent(runtime_request, async move {
+                        RuntimeTurnDriver::new(
+                            shared_store_for_run,
+                            request_session_id_for_run,
+                            config_for_run,
+                            cancel_for_run,
+                        )
+                        .with_runtime_handle(Some(runner_runtime))
+                        .run()
+                        .await
+                    })
+                    .await;
+
+                match run_result {
+                    Ok(response) => break Ok(response),
+                    Err(_)
+                        if cancel.is_cancelled()
+                            && restart_count < 16
+                            && runtime_has_trigger_turn_mail(&runtime, &runtime_session_id) =>
+                    {
+                        restart_count = restart_count.saturating_add(1);
+                        cancel = CancellationToken::new();
+                        continue;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
         });
         match result {
             Ok(response) => Ok(RuntimeAgentRunResult {
@@ -240,6 +264,21 @@ impl RuntimeAgentExecutor {
             .context("spawn live agent executor thread")?;
         Ok(())
     }
+}
+
+fn runtime_has_trigger_turn_mail(runtime: &RuntimeHandle, session_id: &RuntimeSessionId) -> bool {
+    runtime
+        .has_pending_trigger_turn_agent_mail_for_session(
+            session_id,
+            RuntimeMailboxDeliveryPhase::CurrentTurn,
+        )
+        .unwrap_or(false)
+        || runtime
+            .has_pending_trigger_turn_agent_mail_for_session(
+                session_id,
+                RuntimeMailboxDeliveryPhase::NextTurn,
+            )
+            .unwrap_or(false)
 }
 
 #[deprecated(note = "use RuntimeAgentExecutor; LiveAgentExecutor is a compatibility alias")]

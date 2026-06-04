@@ -24,10 +24,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use browser_use_runtime::{
     AgentId as RuntimeAgentId, AgentTarget as RuntimeAgentTarget,
-    CloseAgentRequest as RuntimeCloseAgentRequest, Durability as RuntimeDurability,
-    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    RuntimeError, RuntimeHandle, SendAgentMessageRequest as RuntimeSendAgentMessageRequest,
-    SessionId as RuntimeSessionId, WaitAgentOutcome as RuntimeWaitAgentOutcome,
+    AgentThreadStatus as RuntimeAgentThreadStatus, CloseAgentRequest as RuntimeCloseAgentRequest,
+    Durability as RuntimeDurability, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
+    MailboxItemKind as RuntimeMailboxItemKind, RuntimeError, RuntimeHandle,
+    SendAgentMessageRequest as RuntimeSendAgentMessageRequest, SessionId as RuntimeSessionId,
+    WaitAgentOutcome as RuntimeWaitAgentOutcome,
 };
 use browser_use_store::Store;
 use serde::{Deserialize, Serialize};
@@ -849,6 +850,22 @@ fn tool_err(context: &str, err: impl std::fmt::Display) -> ToolError {
     ToolError::Other(anyhow::anyhow!("{context}: {err}"))
 }
 
+fn runtime_status_is_active(status: &RuntimeAgentThreadStatus) -> bool {
+    matches!(
+        status,
+        RuntimeAgentThreadStatus::Queued
+            | RuntimeAgentThreadStatus::Running
+            | RuntimeAgentThreadStatus::Cancelling
+    )
+}
+
+fn runtime_agent_is_active(runtime: &RuntimeHandle, agent_id: &RuntimeAgentId) -> bool {
+    runtime
+        .snapshot_agent(agent_id)
+        .map(|snapshot| runtime_status_is_active(&snapshot.status))
+        .unwrap_or(false)
+}
+
 fn parent_can_receive_completion_mail(
     store: &browser_use_store::Store,
     parent_session_id: &str,
@@ -1205,30 +1222,28 @@ fn runtime_message_tool(
                 "Tasks can't be assigned to the root agent"
             )));
         }
+        let runtime_target_agent_id = RuntimeAgentId::from_string(target.session_id.clone())
+            .map_err(|err| tool_err("invalid runtime target agent id", err))?;
+        let target_is_runtime_active = runtime_agent_is_active(runtime, &runtime_target_agent_id);
         let target_status = store
             .load_session(&target.session_id)
             .map_err(|err| tool_err("load target agent failed", err))?
             .map(|session| session.status);
         if interrupt
-            && target_status
-                .as_ref()
-                .is_some_and(browser_use_protocol::SessionStatus::is_active)
+            && (target_is_runtime_active
+                || target_status
+                    .as_ref()
+                    .is_some_and(browser_use_protocol::SessionStatus::is_active))
         {
             let runtime_session_id = RuntimeSessionId::from_string(target.session_id.clone())
                 .map_err(|err| tool_err("invalid runtime target session id", err))?;
-            if !runtime.cancel_run(&runtime_session_id) {
-                store
-                    .request_cancel(&target.session_id, "interrupted by send_input")
-                    .map_err(|err| tool_err("interrupt target agent failed", err))?;
-            }
+            let _ = runtime
+                .request_cancel_run(&runtime_session_id)
+                .map_err(|err| tool_err("interrupt target agent failed", err))?;
         }
         let author_path = display_agent_path_for_session(&store, &deps.session_id)
             .map_err(|err| tool_err("resolve author path failed", err))?;
-        let target_is_running = store
-            .load_session(&target.session_id)
-            .map_err(|err| tool_err("load target agent failed", err))?
-            .is_some_and(|session| session.status == browser_use_protocol::SessionStatus::Running);
-        let wake_request = if trigger_turn && !target_is_running {
+        let wake_request = if trigger_turn && !target_is_runtime_active {
             if let Some(summary) = target.summary.as_ref() {
                 let run_id = browser_use_store::new_thread_id();
                 let run_config = latest_child_run_config(&store, &target.session_id)?;
@@ -1321,18 +1336,6 @@ fn runtime_message_tool(
         )
         .map_err(|err| tool_err("record runtime agent message failed", err))?;
     if let (Some(runner), Some(request)) = (deps.child_runner.as_ref(), wake_request) {
-        if interrupt {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            store
-                .set_status(
-                    &request.child_session_id,
-                    browser_use_protocol::SessionStatus::Created,
-                )
-                .map_err(|err| tool_err("reset interrupted target agent failed", err))?;
-        }
         runner
             .run(request)
             .map_err(|err| tool_err("trigger target agent failed", err))?;
@@ -1446,27 +1449,24 @@ fn runtime_message_tool_v1(
             .load_session(target)
             .map_err(|err| tool_err("load target agent failed", err))?
             .ok_or_else(|| ToolError::Other(anyhow::anyhow!("agent with id {target} not found")))?;
-        if interrupt && target_session.status.is_active() {
+        let runtime_target_agent_id = RuntimeAgentId::from_string(target.to_string())
+            .map_err(|err| tool_err("invalid runtime target agent id", err))?;
+        let target_is_runtime_active = runtime_agent_is_active(runtime, &runtime_target_agent_id);
+        if interrupt && (target_is_runtime_active || target_session.status.is_active()) {
             let runtime_session_id = RuntimeSessionId::from_string(target.to_string())
                 .map_err(|err| tool_err("invalid runtime target session id", err))?;
-            if !runtime.cancel_run(&runtime_session_id) {
-                store
-                    .request_cancel(target, "interrupted by send_input")
-                    .map_err(|err| tool_err("interrupt target agent failed", err))?;
-            }
+            let _ = runtime
+                .request_cancel_run(&runtime_session_id)
+                .map_err(|err| tool_err("interrupt target agent failed", err))?;
         }
         let author_path = display_agent_path_for_session(&store, &deps.session_id)
             .map_err(|err| tool_err("resolve author path failed", err))?;
         let recipient_path = display_agent_path_for_session(&store, target)
             .map_err(|err| tool_err("resolve recipient path failed", err))?;
-        let target_is_running = store
-            .load_session(target)
-            .map_err(|err| tool_err("load target agent failed", err))?
-            .is_some_and(|session| session.status == browser_use_protocol::SessionStatus::Running);
         let summary = store
             .agent_summary_for_child(target)
             .map_err(|err| tool_err("load target child edge failed", err))?;
-        let wake_request = if !target_is_running {
+        let wake_request = if !target_is_runtime_active {
             if let Some(summary) = summary.as_ref() {
                 let run_id = browser_use_store::new_thread_id();
                 let run_config = latest_child_run_config(&store, target)?;
@@ -1552,18 +1552,6 @@ fn runtime_message_tool_v1(
         )
         .map_err(|err| tool_err("record runtime send_input failed", err))?;
     if let (Some(runner), Some(request)) = (deps.child_runner.as_ref(), wake_request) {
-        if interrupt {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            store
-                .set_status(
-                    &request.child_session_id,
-                    browser_use_protocol::SessionStatus::Created,
-                )
-                .map_err(|err| tool_err("reset interrupted target agent failed", err))?;
-        }
         runner
             .run(request)
             .map_err(|err| tool_err("trigger target agent failed", err))?;
