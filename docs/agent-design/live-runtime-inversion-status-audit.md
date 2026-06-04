@@ -157,13 +157,15 @@ BrowserUseRuntime
 1. Move turn-loop ownership deeper into RuntimeHandle/AgentThread.
 2. Replace Store-shaped LiveTurnState history/compaction/token state with
    runtime-owned state plus JournalReader replay.
-3. Make RuntimeEventProjection the live TUI/SDK streaming authority.
-4. Move tool resources into AgentThread.ToolResourceBag.
-5. Promote BrowserManager from lease metadata to the owner of browser sessions
-   and browser_script runs.
-6. Complete replay/crash recovery and lost-resource journaling.
-7. Add negative barrier tests for every critical transition.
-8. Delete or hard-gate old store-first live helpers once all call sites are gone.
+3. Make RuntimeEventProjection a real state reducer and the live TUI authority.
+4. Promote BrowserManager from lease/action ownership to the owner of browser
+   sessions, script registries, artifacts, cancellation, and crash semantics.
+5. Complete replay/crash recovery for durable graph fields that are not yet
+   materialized through RuntimeHandle.
+6. Add negative barrier tests for remaining critical transitions not already
+   covered.
+7. Delete or hard-gate old store-first compatibility helpers once all call sites
+   are gone.
 ```
 
 The branch is much more robust than the initial hybrid, and the user-visible
