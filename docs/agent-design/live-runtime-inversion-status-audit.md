@@ -79,7 +79,7 @@ BrowserUseRuntime
   same-agent nested claims, and expose a runtime action-serialization helper used
   by the runtime browser backend. Same-browser conflicting owners still fail at
   the runtime boundary.
-- Runtime session resources are attached to the agent thread resource bag and
+- Runtime session resources are attached to `AgentThread.ToolResourceBag` and
   are cleaned on `close_agent`; provider tests guard the runtime path against
   falling back to global exec/MCP/browser/Python resources.
 - The TUI projection cache overlays live session status from the runtime snapshot
@@ -109,11 +109,11 @@ BrowserUseRuntime
 - `StoreNotificationWatcher` and `agent_messages` still exist for history,
   replay, and compatibility tests. The live runtime path has guards against
   using them, but the old storage surfaces are not removed.
-- `AgentThread.AgentResourceSet` is the current tool-resource bag and owns
-  unified exec, Python worker, MCP client, and runtime browser backend resources
-  for runtime-attached sessions. It is still named/typed as a generic resource
-  set, and browser script ownership is still mediated through the provider-built
-  runtime browser backend rather than a richer `BrowserHandle`.
+- `AgentThread.ToolResourceBag` owns unified exec, Python worker, MCP client,
+  and runtime browser backend resources for runtime-attached sessions. The old
+  `AgentResourceSet` name remains as a compatibility alias. Browser script
+  ownership is still mediated through the provider-built runtime browser backend
+  rather than a richer `BrowserHandle`.
 - `BrowserManager` now owns browser lease depth and action serialization. Actual
   CDP/session execution and the script registry are still held by the runtime
   browser backend resource in the agent provider, not directly by a rich

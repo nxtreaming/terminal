@@ -1645,11 +1645,13 @@ struct AgentResourceSlot {
 }
 
 #[derive(Default)]
-pub struct AgentResourceSet {
+pub struct ToolResourceBag {
     slots: Mutex<HashMap<String, AgentResourceSlot>>,
 }
 
-impl AgentResourceSet {
+pub type AgentResourceSet = ToolResourceBag;
+
+impl ToolResourceBag {
     pub fn get_or_insert_with<T, F, C>(&self, key: &str, init: F, cleanup: C) -> Result<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
@@ -1911,7 +1913,7 @@ pub struct AgentThread {
     role: Option<String>,
     status_tx: watch::Sender<AgentThreadStatus>,
     mailbox: AgentMailbox,
-    resources: AgentResourceSet,
+    resources: ToolResourceBag,
     live_state: AgentLiveState,
 }
 
@@ -1940,7 +1942,7 @@ impl AgentThread {
             role,
             status_tx,
             mailbox: AgentMailbox::new(),
-            resources: AgentResourceSet::default(),
+            resources: ToolResourceBag::default(),
             live_state: AgentLiveState::default(),
         }
     }
@@ -1957,7 +1959,7 @@ impl AgentThread {
         &self.mailbox
     }
 
-    pub fn resources(&self) -> &AgentResourceSet {
+    pub fn resources(&self) -> &ToolResourceBag {
         &self.resources
     }
 
