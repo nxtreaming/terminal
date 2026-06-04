@@ -2380,6 +2380,8 @@ pub struct ProjectedEvent {
     pub kind: ProjectedEventKind,
     pub session_id: Option<SessionId>,
     pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<RuntimeSnapshot>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -2390,19 +2392,19 @@ pub struct RuntimeSnapshot {
 }
 
 pub struct ProjectedRuntimeSubscription {
-    snapshot: RuntimeSnapshot,
+    projection: RuntimeProjectionState,
     rx: broadcast::Receiver<RuntimeEvent>,
 }
 
 impl ProjectedRuntimeSubscription {
     pub fn snapshot(&self) -> &RuntimeSnapshot {
-        &self.snapshot
+        self.projection.snapshot()
     }
 
     pub async fn recv(&mut self) -> Result<ProjectedEvent> {
         loop {
             match self.rx.recv().await {
-                Ok(event) => return Ok(RuntimeEventProjection::project(&event)),
+                Ok(event) => return Ok(self.projection.apply_event(&event)),
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => bail!("runtime event bus closed"),
             }
@@ -2413,6 +2415,7 @@ impl ProjectedRuntimeSubscription {
 pub struct ProjectedAgentSubscription {
     agent_id: AgentId,
     snapshot: AgentThreadSnapshot,
+    projection: RuntimeProjectionState,
     rx: broadcast::Receiver<RuntimeEvent>,
 }
 
@@ -2425,13 +2428,380 @@ impl ProjectedAgentSubscription {
         loop {
             match self.rx.recv().await {
                 Ok(event) if event.agent_id.as_ref() == Some(&self.agent_id) => {
-                    return Ok(RuntimeEventProjection::project(&event));
+                    let projected = self.projection.apply_event(&event);
+                    if let Some(snapshot) = self
+                        .projection
+                        .snapshot()
+                        .agents
+                        .iter()
+                        .find(|agent| agent.agent_id == self.agent_id)
+                    {
+                        self.snapshot = snapshot.clone();
+                    }
+                    return Ok(projected);
                 }
-                Ok(_) => continue,
+                Ok(event) => {
+                    self.projection.apply_event(&event);
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => bail!("runtime event bus closed"),
             }
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeProjectionState {
+    snapshot: RuntimeSnapshot,
+}
+
+impl RuntimeProjectionState {
+    pub fn new(snapshot: RuntimeSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    pub fn snapshot(&self) -> &RuntimeSnapshot {
+        &self.snapshot
+    }
+
+    pub fn apply_event(&mut self, event: &RuntimeEvent) -> ProjectedEvent {
+        self.reduce(event);
+        let mut projected = RuntimeEventProjection::project(event);
+        projected.snapshot = Some(self.snapshot.clone());
+        projected
+    }
+
+    fn reduce(&mut self, event: &RuntimeEvent) {
+        self.reduce_agent(event);
+        self.reduce_browser(event);
+    }
+
+    fn reduce_agent(&mut self, event: &RuntimeEvent) {
+        match event.kind {
+            RuntimeEventKind::AgentCreated | RuntimeEventKind::AgentResumed => {
+                self.upsert_agent_from_event(event, None);
+            }
+            RuntimeEventKind::SubagentSpawnStarted => {
+                self.upsert_spawned_child(event);
+            }
+            RuntimeEventKind::AgentInputAccepted => {
+                if let Some(agent) = self.agent_snapshot_mut(event) {
+                    agent.live.accepted_input_count =
+                        agent.live.accepted_input_count.saturating_add(1);
+                }
+            }
+            RuntimeEventKind::AgentInputConsumed => {
+                if let Some(agent) = self.agent_snapshot_mut(event) {
+                    agent.live.pending_prompt_input_count =
+                        agent.live.pending_prompt_input_count.saturating_sub(1);
+                }
+            }
+            RuntimeEventKind::AgentCancelRequested | RuntimeEventKind::AgentCloseRequested => {
+                if let Some(agent) = self.agent_snapshot_mut(event) {
+                    agent.live.cancellation_requested = true;
+                }
+            }
+            RuntimeEventKind::AgentStarted
+            | RuntimeEventKind::AgentQueued
+            | RuntimeEventKind::AgentCompleted
+            | RuntimeEventKind::AgentFailed
+            | RuntimeEventKind::AgentCancelled
+            | RuntimeEventKind::AgentClosed
+            | RuntimeEventKind::AgentContinuationStarted
+            | RuntimeEventKind::AgentTurnStarted
+            | RuntimeEventKind::AgentTurnCompleted
+            | RuntimeEventKind::AgentTurnAborted => {
+                if let Some(status) = projected_thread_status_for_event(event) {
+                    if let Some(agent) = self.agent_snapshot_mut(event) {
+                        agent.status = status;
+                        match event.kind {
+                            RuntimeEventKind::AgentStarted
+                            | RuntimeEventKind::AgentContinuationStarted
+                            | RuntimeEventKind::AgentTurnStarted => {
+                                if let Some(run_id) = event.run_id.clone() {
+                                    agent.live.current_run_id = Some(run_id);
+                                }
+                                agent.live.cancellation_requested = false;
+                            }
+                            RuntimeEventKind::AgentCompleted
+                            | RuntimeEventKind::AgentFailed
+                            | RuntimeEventKind::AgentCancelled
+                            | RuntimeEventKind::AgentClosed
+                            | RuntimeEventKind::AgentTurnCompleted
+                            | RuntimeEventKind::AgentTurnAborted => {
+                                agent.live.current_run_id = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            RuntimeEventKind::MailboxEnqueued => {
+                if let Some(agent) = self.agent_snapshot_mut(event) {
+                    if let Some(item) = mailbox_item_from_payload(&event.payload) {
+                        agent.live.pending_mailbox_count =
+                            agent.live.pending_mailbox_count.saturating_add(1);
+                        if item.trigger_turn {
+                            agent.live.pending_trigger_turn_count =
+                                agent.live.pending_trigger_turn_count.saturating_add(1);
+                        }
+                        agent.live.last_enqueued_mailbox_seq =
+                            agent.live.last_enqueued_mailbox_seq.max(item.seq);
+                    }
+                }
+            }
+            RuntimeEventKind::MailboxDelivered => {
+                if let Some(agent) = self.agent_snapshot_mut(event) {
+                    let max_seq = mailbox_items_from_payload(&event.payload)
+                        .iter()
+                        .map(|item| item.seq)
+                        .max()
+                        .or_else(|| max_mailbox_seq_from_payload(&event.payload))
+                        .unwrap_or_default();
+                    agent.live.last_delivered_mailbox_seq =
+                        agent.live.last_delivered_mailbox_seq.max(max_seq);
+                }
+            }
+            RuntimeEventKind::MailboxConsumed => {
+                if let Some(agent) = self.agent_snapshot_mut(event) {
+                    let items = mailbox_items_from_payload(&event.payload);
+                    let count = items
+                        .len()
+                        .max(event.payload["count"].as_u64().unwrap_or_default() as usize);
+                    let trigger_count = items.iter().filter(|item| item.trigger_turn).count();
+                    agent.live.pending_mailbox_count =
+                        agent.live.pending_mailbox_count.saturating_sub(count);
+                    agent.live.pending_trigger_turn_count = agent
+                        .live
+                        .pending_trigger_turn_count
+                        .saturating_sub(trigger_count);
+                    let max_seq = items
+                        .iter()
+                        .map(|item| item.seq)
+                        .max()
+                        .or_else(|| max_mailbox_seq_from_payload(&event.payload))
+                        .unwrap_or_default();
+                    agent.live.last_consumed_mailbox_seq =
+                        agent.live.last_consumed_mailbox_seq.max(max_seq);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn upsert_agent_from_event(
+        &mut self,
+        event: &RuntimeEvent,
+        parent: Option<(AgentId, SessionId, PathBuf)>,
+    ) {
+        let Some(agent_id) = event.agent_id.clone() else {
+            return;
+        };
+        let Some(session_id) = event.session_id.clone() else {
+            return;
+        };
+        let root_id = event
+            .root_id
+            .clone()
+            .or_else(|| {
+                self.snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.agent_id == agent_id || agent.session_id == session_id)
+                    .map(|agent| agent.root_id.clone())
+            })
+            .unwrap_or_else(|| RootId::from_string(session_id.as_str()).unwrap_or_default());
+        let cwd = event
+            .payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| parent.as_ref().map(|(_, _, parent_cwd)| parent_cwd.clone()))
+            .or_else(|| {
+                self.snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.agent_id == agent_id || agent.session_id == session_id)
+                    .map(|agent| agent.cwd.clone())
+            })
+            .unwrap_or_default();
+        let (parent_agent_id, parent_session_id, default_role) = match parent {
+            Some((parent_agent_id, parent_session_id, _)) => {
+                (Some(parent_agent_id), Some(parent_session_id), None)
+            }
+            None => (None, None, Some("default".to_string())),
+        };
+        let agent_path = event
+            .payload
+            .get("agent_path")
+            .and_then(Value::as_str)
+            .unwrap_or("/root")
+            .to_string();
+        let nickname = event
+            .payload
+            .get("nickname")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let role = event
+            .payload
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(default_role);
+        let status = projected_thread_status_for_event(event).unwrap_or(AgentThreadStatus::Created);
+
+        if let Some(existing) = self
+            .snapshot
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == agent_id || agent.session_id == session_id)
+        {
+            existing.session_id = session_id;
+            existing.root_id = root_id;
+            existing.cwd = cwd;
+            existing.parent_agent_id = parent_agent_id;
+            existing.parent_session_id = parent_session_id;
+            existing.agent_path = agent_path;
+            existing.nickname = nickname;
+            existing.role = role;
+            existing.status = status;
+            return;
+        }
+
+        self.snapshot.agents.push(AgentThreadSnapshot {
+            agent_id,
+            session_id,
+            root_id,
+            cwd,
+            parent_agent_id,
+            parent_session_id,
+            agent_path,
+            nickname,
+            role,
+            status,
+            live: AgentLiveStateSnapshot::default(),
+        });
+    }
+
+    fn upsert_spawned_child(&mut self, event: &RuntimeEvent) {
+        let Some(child_agent_id) = event
+            .payload
+            .get("child_agent_id")
+            .and_then(Value::as_str)
+            .and_then(|id| AgentId::from_string(id).ok())
+        else {
+            return;
+        };
+        let Some(child_session_id) = event
+            .payload
+            .get("child_session_id")
+            .and_then(Value::as_str)
+            .and_then(|id| SessionId::from_string(id).ok())
+        else {
+            return;
+        };
+        let parent = self
+            .snapshot
+            .agents
+            .iter()
+            .find(|agent| {
+                event.agent_id.as_ref() == Some(&agent.agent_id)
+                    || event.session_id.as_ref() == Some(&agent.session_id)
+            })
+            .map(|agent| {
+                (
+                    agent.agent_id.clone(),
+                    agent.session_id.clone(),
+                    agent.cwd.clone(),
+                )
+            });
+        let mut child_event = event.clone();
+        child_event.agent_id = Some(child_agent_id);
+        child_event.session_id = Some(child_session_id);
+        self.upsert_agent_from_event(&child_event, parent);
+    }
+
+    fn agent_snapshot_mut(&mut self, event: &RuntimeEvent) -> Option<&mut AgentThreadSnapshot> {
+        self.snapshot.agents.iter_mut().find(|agent| {
+            event.agent_id.as_ref() == Some(&agent.agent_id)
+                || event.session_id.as_ref() == Some(&agent.session_id)
+        })
+    }
+
+    fn reduce_browser(&mut self, event: &RuntimeEvent) {
+        let Some(browser_id) = event.browser_id.clone() else {
+            return;
+        };
+        match event.kind {
+            RuntimeEventKind::BrowserCreated => {
+                let config = event
+                    .payload
+                    .get("config")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
+                self.upsert_browser(BrowserSnapshot {
+                    id: browser_id,
+                    config,
+                    status: BrowserStatus::Created,
+                    active_agent_id: None,
+                });
+            }
+            RuntimeEventKind::BrowserStarted => {
+                if let Some(browser) = self.browser_snapshot_mut(&browser_id) {
+                    browser.status = BrowserStatus::Started;
+                }
+            }
+            RuntimeEventKind::BrowserClaimed => {
+                let active_agent_id = event.agent_id.clone().or_else(|| {
+                    event
+                        .payload
+                        .get("agent_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| AgentId::from_string(id).ok())
+                });
+                if let Some(browser) = self.browser_snapshot_mut(&browser_id) {
+                    browser.status = BrowserStatus::Claimed;
+                    browser.active_agent_id = active_agent_id;
+                }
+            }
+            RuntimeEventKind::BrowserReleased => {
+                if let Some(browser) = self.browser_snapshot_mut(&browser_id) {
+                    browser.status = BrowserStatus::Released;
+                    browser.active_agent_id = None;
+                }
+            }
+            RuntimeEventKind::BrowserClosed => {
+                if let Some(browser) = self.browser_snapshot_mut(&browser_id) {
+                    browser.status = BrowserStatus::Closed;
+                    browser.active_agent_id = None;
+                } else {
+                    self.snapshot.browsers.push(BrowserSnapshot {
+                        id: browser_id,
+                        config: BrowserConfig::default(),
+                        status: BrowserStatus::Closed,
+                        active_agent_id: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn upsert_browser(&mut self, snapshot: BrowserSnapshot) {
+        if let Some(existing) = self.browser_snapshot_mut(&snapshot.id) {
+            *existing = snapshot;
+            return;
+        }
+        self.snapshot.browsers.push(snapshot);
+    }
+
+    fn browser_snapshot_mut(&mut self, browser_id: &BrowserId) -> Option<&mut BrowserSnapshot> {
+        self.snapshot
+            .browsers
+            .iter_mut()
+            .find(|browser| browser.id == *browser_id)
     }
 }
 
@@ -2472,8 +2842,73 @@ impl RuntimeEventProjection {
             kind,
             session_id: event.session_id.clone(),
             payload: event.payload.clone(),
+            snapshot: None,
         }
     }
+}
+
+fn projected_thread_status_for_event(event: &RuntimeEvent) -> Option<AgentThreadStatus> {
+    if event
+        .payload
+        .get("child_session_id")
+        .and_then(Value::as_str)
+        .is_some_and(|child_session_id| {
+            event
+                .session_id
+                .as_ref()
+                .is_some_and(|session_id| session_id.as_str() != child_session_id)
+        })
+    {
+        return None;
+    }
+
+    match event.kind {
+        RuntimeEventKind::AgentCreated | RuntimeEventKind::AgentResumed => {
+            Some(AgentThreadStatus::Created)
+        }
+        RuntimeEventKind::AgentQueued => Some(AgentThreadStatus::Queued),
+        RuntimeEventKind::AgentStarted
+        | RuntimeEventKind::AgentContinuationStarted
+        | RuntimeEventKind::AgentTurnStarted => Some(AgentThreadStatus::Running),
+        RuntimeEventKind::AgentCancelRequested | RuntimeEventKind::AgentCloseRequested => {
+            Some(AgentThreadStatus::Cancelling)
+        }
+        RuntimeEventKind::AgentCompleted | RuntimeEventKind::AgentTurnCompleted => {
+            Some(AgentThreadStatus::Completed)
+        }
+        RuntimeEventKind::AgentFailed | RuntimeEventKind::AgentTurnAborted => {
+            Some(AgentThreadStatus::Failed)
+        }
+        RuntimeEventKind::AgentCancelled => Some(AgentThreadStatus::Cancelled),
+        RuntimeEventKind::AgentClosed => Some(AgentThreadStatus::Closed),
+        _ => None,
+    }
+}
+
+fn mailbox_item_from_payload(payload: &Value) -> Option<MailboxItem> {
+    serde_json::from_value(payload.get("mailbox_item")?.clone()).ok()
+}
+
+fn mailbox_items_from_payload(payload: &Value) -> Vec<MailboxItem> {
+    payload
+        .get("mailbox_items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn max_mailbox_seq_from_payload(payload: &Value) -> Option<u64> {
+    payload
+        .get("mailbox_seqs")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_u64)
+        .max()
 }
 
 #[derive(Clone)]
@@ -3258,7 +3693,10 @@ impl BrowserUseRuntime {
     pub fn subscribe_projected(&self) -> ProjectedRuntimeSubscription {
         let rx = self.events.subscribe();
         let snapshot = self.snapshot();
-        ProjectedRuntimeSubscription { snapshot, rx }
+        ProjectedRuntimeSubscription {
+            projection: RuntimeProjectionState::new(snapshot),
+            rx,
+        }
     }
 
     pub fn subscribe_agent_projection(
@@ -3266,9 +3704,11 @@ impl BrowserUseRuntime {
         agent_id: AgentId,
     ) -> Result<ProjectedAgentSubscription> {
         let thread = self.agents.thread(&agent_id)?;
+        let snapshot = self.snapshot();
         Ok(ProjectedAgentSubscription {
             agent_id,
             snapshot: thread.snapshot(),
+            projection: RuntimeProjectionState::new(snapshot),
             rx: self.events.subscribe(),
         })
     }
@@ -7092,6 +7532,24 @@ mod tests {
         assert_eq!(event.session_id, Some(root.session_id().clone()));
         assert_eq!(event.kind, ProjectedEventKind::ToolUpdated);
         assert_eq!(event.payload["child_agent_id"], child.agent_id().as_str());
+        let projected_snapshot = event.snapshot.as_ref().expect("projected snapshot");
+        assert_eq!(projected_snapshot.agents.len(), 2);
+        let projected_child = projected_snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == child.agent_id().clone())
+            .expect("projected child");
+        assert_eq!(projected_child.session_id, child.session_id().clone());
+        assert_eq!(
+            projected_child.parent_agent_id,
+            Some(root.agent_id().clone())
+        );
+        assert_eq!(
+            projected_child.parent_session_id,
+            Some(root.session_id().clone())
+        );
+        assert_eq!(projected_child.status, AgentThreadStatus::Created);
+        assert_eq!(subscription.snapshot().agents.len(), 2);
 
         let fresh_snapshot = handle.snapshot();
         assert_eq!(fresh_snapshot.agents.len(), 2);
@@ -7126,6 +7584,13 @@ mod tests {
         assert_eq!(completed.kind, ProjectedEventKind::ThreadStatusChanged);
         assert_eq!(completed.session_id, Some(child.session_id().clone()));
         assert_eq!(completed.payload["result"], "done");
+        let completed_snapshot = completed.snapshot.as_ref().expect("completed snapshot");
+        let completed_child = completed_snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == child.agent_id().clone())
+            .expect("completed child");
+        assert_eq!(completed_child.status, AgentThreadStatus::Completed);
 
         let parent_terminal = subscription.recv().await?;
         assert_eq!(
@@ -7138,11 +7603,93 @@ mod tests {
             parent_terminal.payload["child_session_id"],
             child.session_id().as_str()
         );
+        let parent_terminal_snapshot = parent_terminal
+            .snapshot
+            .as_ref()
+            .expect("parent terminal snapshot");
+        let parent_after_child_completion = parent_terminal_snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == root.agent_id().clone())
+            .expect("parent snapshot");
+        assert_eq!(
+            parent_after_child_completion.status,
+            AgentThreadStatus::Created
+        );
 
         let mailbox = subscription.recv().await?;
         assert_eq!(mailbox.kind, ProjectedEventKind::ToolUpdated);
         assert_eq!(mailbox.session_id, Some(root.session_id().clone()));
         assert_eq!(mailbox.payload["trigger_turn"], false);
+        let mailbox_snapshot = mailbox.snapshot.as_ref().expect("mailbox snapshot");
+        let parent_after_mail = mailbox_snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == root.agent_id().clone())
+            .expect("parent mailbox snapshot");
+        assert_eq!(parent_after_mail.live.pending_mailbox_count, 1);
+        assert_eq!(parent_after_mail.live.pending_trigger_turn_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projected_subscription_reduces_browser_state() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let mut subscription = handle.subscribe_projected();
+
+        let browser_id = handle.create_browser(BrowserConfig {
+            keep_alive: true,
+            headless: Some(true),
+            profile_id: Some("test-profile".to_string()),
+        });
+        let created = subscription.recv().await?;
+        let created_snapshot = created.snapshot.as_ref().expect("created snapshot");
+        let browser = created_snapshot
+            .browsers
+            .iter()
+            .find(|browser| browser.id == browser_id)
+            .expect("created browser");
+        assert_eq!(browser.status, BrowserStatus::Created);
+        assert_eq!(browser.config.profile_id.as_deref(), Some("test-profile"));
+
+        let lease = handle.claim_browser(&browser_id, root.agent_id().clone())?;
+        let claimed = subscription.recv().await?;
+        let claimed_snapshot = claimed.snapshot.as_ref().expect("claimed snapshot");
+        let browser = claimed_snapshot
+            .browsers
+            .iter()
+            .find(|browser| browser.id == browser_id)
+            .expect("claimed browser");
+        assert_eq!(browser.status, BrowserStatus::Claimed);
+        assert_eq!(browser.active_agent_id, Some(root.agent_id().clone()));
+
+        handle.release_browser(&lease)?;
+        let released = subscription.recv().await?;
+        let released_snapshot = released.snapshot.as_ref().expect("released snapshot");
+        let browser = released_snapshot
+            .browsers
+            .iter()
+            .find(|browser| browser.id == browser_id)
+            .expect("released browser");
+        assert_eq!(browser.status, BrowserStatus::Released);
+        assert_eq!(browser.active_agent_id, None);
+
+        handle.close_browser(&browser_id)?;
+        let closed = subscription.recv().await?;
+        let closed_snapshot = closed.snapshot.as_ref().expect("closed snapshot");
+        let browser = closed_snapshot
+            .browsers
+            .iter()
+            .find(|browser| browser.id == browser_id)
+            .expect("closed browser");
+        assert_eq!(browser.status, BrowserStatus::Closed);
+        assert_eq!(browser.active_agent_id, None);
         Ok(())
     }
 }

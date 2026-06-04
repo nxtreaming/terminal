@@ -280,16 +280,16 @@ BrowserUseRuntime
 
 ## Work Package 9: Runtime Projection
 
-- [ ] Implement a real `RuntimeEventProjection` state machine, not just event
+- [x] Implement a real `RuntimeEventProjection` state machine, not just event
       wrapping.
 - [ ] Projection includes:
-      - active agent status
-      - live model/tool activity
-      - child agent statuses
-      - mailbox continuation state
-      - browser status
-      - token usage
-      - final result/failure
+      - [x] active agent status
+      - [ ] live model/tool activity
+      - [x] child agent statuses
+      - [x] mailbox continuation state
+      - [x] browser status
+      - [ ] token usage
+      - [ ] final result/failure
 - [ ] Projection guarantees snapshot-before-live-event ordering.
 - [ ] Projection sends final status before `run_agent` resolves.
 - [ ] TUI consumes projection for active sessions.

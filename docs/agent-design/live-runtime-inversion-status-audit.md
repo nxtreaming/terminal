@@ -75,6 +75,11 @@ BrowserUseRuntime
   projected runtime events separately from raw debug events, and Python
   `Agent.stream()` consumes the projected event queue after yielding an initial
   agent snapshot.
+- Projected runtime subscriptions now carry a reducer-backed
+  `RuntimeSnapshot`. The reducer materializes child spawn events from their
+  payload, keeps parent threads open for child-terminal transcript events,
+  updates mailbox counters/cursors, and tracks browser create/claim/release/
+  close state without re-querying SQLite.
 - Python SDK tests cover `Agent.add_new_task()` follow-up delivery, asyncio
   cancellation to `agent.stop`, same-browser fail-fast behavior, and concurrent
   different-browser runs.
@@ -124,9 +129,9 @@ BrowserUseRuntime
 - TUI uses runtime for live cancellation/follow-up/mailbox counts and now
   overlays live session status from runtime snapshots, but active rendering is
   still substantially Store/history-cache based. The SDK consumes projected
-  events for `Agent.stream()`, but a true `RuntimeEventProjection` state machine
-  is not the TUI authority yet and projection is still mostly a typed event
-  mapper rather than a complete state reducer.
+  events for `Agent.stream()`, and runtime projection now has a state reducer,
+  but the reducer does not yet cover the full model/tool activity stack, token
+  usage, terminal result/failure fields, or serve as the TUI authority.
 - Replay materialization restores important mailbox/live counters and marks
   common stale tool resources lost, but full crash recovery still does not
   hydrate every durable graph field or make browser leases/script registries
@@ -157,7 +162,7 @@ BrowserUseRuntime
 1. Move turn-loop ownership deeper into RuntimeHandle/AgentThread.
 2. Replace Store-shaped LiveTurnState history/compaction/token state with
    runtime-owned state plus JournalReader replay.
-3. Make RuntimeEventProjection a real state reducer and the live TUI authority.
+3. Complete RuntimeEventProjection coverage and make it the live TUI authority.
 4. Promote BrowserManager from lease/action ownership to the owner of browser
    sessions, script registries, artifacts, cancellation, and crash semantics.
 5. Complete replay/crash recovery for durable graph fields that are not yet
