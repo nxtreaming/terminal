@@ -12543,6 +12543,79 @@ wire_api = "responses"
     }
 
     #[test]
+    fn runtime_mailbox_counts_materialize_from_sqlite_before_existing_live_attach() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = ready_app(&temp)?;
+        let cwd = std::env::current_dir()?;
+        let parent = app.store.create_session(None, cwd.clone())?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "research this repo"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "Spawned agents; waiting later."}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            cwd,
+            Some("/root/repo_explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        let parent_session_id = browser_use_runtime::SessionId::from_string(parent.id.clone())?;
+        let parent_agent_id = browser_use_runtime::AgentId::from_string(parent.id.clone())?;
+        let child_agent_id = browser_use_runtime::AgentId::from_string(child.id.clone())?;
+        let mailbox_item = browser_use_runtime::MailboxItem {
+            seq: 9,
+            id: "mail-9".to_string(),
+            kind: browser_use_runtime::MailboxItemKind::Completion,
+            author_agent_id: child_agent_id,
+            target_agent_id: parent_agent_id.clone(),
+            target_path: Some("/root/repo_explorer".to_string()),
+            content: "<subagent_notification><status>completed</status></subagent_notification>"
+                .to_string(),
+            trigger_turn: false,
+            delivery_phase: browser_use_runtime::MailboxDeliveryPhase::NextTurn,
+            payload: serde_json::json!({"source": "test"}),
+        };
+        let mailbox_event = browser_use_runtime::RuntimeEvent::new(
+            browser_use_runtime::RuntimeEventKind::MailboxEnqueued,
+            browser_use_runtime::Durability::Barrier,
+        )
+        .with_session_id(parent_session_id)
+        .with_agent_id(parent_agent_id)
+        .with_payload(serde_json::json!({
+            "mailbox_item": mailbox_item,
+            "trigger_turn": false,
+        }));
+        app.store.append_event(
+            &parent.id,
+            mailbox_event.event_type(),
+            mailbox_event.journal_payload(),
+        )?;
+
+        assert_eq!(
+            runtime::pending_runtime_agent_mailbox_count(&app.args.state_dir, &parent.id)?,
+            Some(1)
+        );
+        assert_eq!(
+            runtime::pending_runtime_trigger_turn_agent_mailbox_count(
+                &app.args.state_dir,
+                &parent.id
+            )?,
+            Some(0)
+        );
+        assert_eq!(
+            runtime::runtime_active_child_session_count(&app.args.state_dir, &parent.id)?,
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn runtime_pending_subagent_mail_keeps_done_parent_visible() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;

@@ -64,7 +64,7 @@ pub(crate) fn pending_runtime_agent_mailbox_count(
     state_dir: &Path,
     session_id: &str,
 ) -> Result<Option<usize>> {
-    let handle = existing_tui_runtime_handle(state_dir)?;
+    let handle = tui_runtime_handle_with_attached_agent(state_dir, session_id)?;
     let Some(handle) = handle else {
         return Ok(None);
     };
@@ -79,7 +79,7 @@ pub(crate) fn pending_runtime_trigger_turn_agent_mailbox_count(
     state_dir: &Path,
     session_id: &str,
 ) -> Result<Option<usize>> {
-    let handle = existing_tui_runtime_handle(state_dir)?;
+    let handle = tui_runtime_handle_with_attached_agent(state_dir, session_id)?;
     let Some(handle) = handle else {
         return Ok(None);
     };
@@ -96,7 +96,7 @@ pub(crate) fn runtime_active_child_session_count(
     state_dir: &Path,
     root_session_id: &str,
 ) -> Result<Option<usize>> {
-    let handle = existing_tui_runtime_handle(state_dir)?;
+    let handle = tui_runtime_handle_with_attached_agent(state_dir, root_session_id)?;
     let Some(handle) = handle else {
         return Ok(None);
     };
@@ -127,7 +127,7 @@ fn runtime_agent_status_is_active(status: &AgentThreadStatus) -> bool {
 }
 
 pub(crate) fn has_live_runtime_agent(state_dir: &Path, session_id: &str) -> bool {
-    let Ok(Some(handle)) = existing_tui_runtime_handle(state_dir) else {
+    let Ok(Some(handle)) = tui_runtime_handle_with_attached_agent(state_dir, session_id) else {
         return false;
     };
     let Ok(agent_id) = AgentId::from_string(session_id.to_string()) else {
@@ -141,6 +141,27 @@ fn existing_tui_runtime_handle(state_dir: &Path) -> Result<Option<RuntimeHandle>
         .lock()
         .map_err(|_| anyhow::anyhow!("TUI live runtime registry lock poisoned"))
         .map(|runtimes| runtimes.get(state_dir).cloned())
+}
+
+fn tui_runtime_handle_with_attached_agent(
+    state_dir: &Path,
+    session_id: &str,
+) -> Result<Option<RuntimeHandle>> {
+    let store = Store::open(state_dir)?;
+    if store.load_session(session_id)?.is_none() {
+        return Ok(None);
+    }
+    let handle = match existing_tui_runtime_handle(state_dir)? {
+        Some(handle) => handle,
+        None => tui_runtime_handle_with_notifier(state_dir, None)?,
+    };
+    ensure_tui_agent_attached(
+        &handle,
+        &store,
+        session_id,
+        browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+    )?;
+    Ok(Some(handle))
 }
 
 pub(crate) fn submit_runtime_user_input(
