@@ -3706,6 +3706,11 @@ impl RunAgentRequest {
         self
     }
 
+    pub fn with_run_id(mut self, run_id: RunId) -> Self {
+        self.run_id = run_id;
+        self
+    }
+
     pub fn with_provider_config(mut self, provider_config: Value) -> Self {
         self.provider_config = Some(provider_config);
         self
@@ -6700,6 +6705,39 @@ mod tests {
         assert!(event_types.contains(&"agent.started".to_string()));
         assert!(event_types.contains(&"agent.turn.started".to_string()));
         assert!(event_types.contains(&"agent.turn.completed".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_run_agent_uses_supplied_run_id() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let supplied_run_id = RunId::from_string("durable-child-run-1")?;
+
+        let response = handle
+            .run_agent(
+                RunAgentRequest::new(root.session_id().clone())
+                    .with_agent_id(root.agent_id().clone())
+                    .with_run_id(supplied_run_id.clone()),
+                async { Ok::<_, anyhow::Error>("done".to_string()) },
+            )
+            .await?;
+
+        assert_eq!(response.run_id, supplied_run_id);
+        let started = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .find(|event| event.event_type == "agent.started")
+            .expect("agent.started event");
+        assert_eq!(
+            started.payload["run_id"],
+            serde_json::Value::String("durable-child-run-1".to_string())
+        );
         Ok(())
     }
 

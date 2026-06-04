@@ -29,8 +29,8 @@ use browser_use_protocol::{failure_from_events, session_result_from_events, Sess
 use browser_use_runtime::{
     spawn_local_runtime_server, AgentId, AgentThreadStatus, BrowserUseRuntime,
     CompleteAgentRequest, FailAgentRequest, LiveThreadPersistence, MailboxDeliveryPhase,
-    MailboxItem, RuntimeHandle, RuntimeSnapshot, SessionId, SpawnChildRequest, SqliteJournal,
-    StateIndex, SubmitInputRequest,
+    MailboxItem, RunId as RuntimeRunId, RuntimeHandle, RuntimeSnapshot, SessionId,
+    SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
 use browser_use_store::{Store, StoreNotifier};
 
@@ -489,9 +489,13 @@ fn spawn_tui_child_agent(
         config_overrides,
         None,
     )?;
+    let mut run_request = RuntimeAgentRunRequest::new(child_id.clone(), child_config);
+    if let Some(run_id) = request.run_id.as_ref() {
+        run_request = run_request.with_run_id(RuntimeRunId::from_string(run_id.clone())?);
+    }
     executor.spawn_background(
         format!("browser-use-tui-child-{child_id}"),
-        RuntimeAgentRunRequest::new(child_id.clone(), child_config),
+        run_request,
         move |completion| {
             let error = completion.error_message();
             notify_tui_child_completion(

@@ -71,8 +71,8 @@ use browser_use_runtime::{
     CompleteAgentRequest, CreateRootAgentRequest, FailAgentRequest, LiveThreadPersistence,
     LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    RuntimeHandle, RuntimeProjectionState, SessionId, SpawnChildRequest, SqliteJournal, StateIndex,
-    SubmitInputRequest,
+    RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState, SessionId, SpawnChildRequest,
+    SqliteJournal, StateIndex, SubmitInputRequest,
 };
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
@@ -1502,9 +1502,13 @@ fn spawn_runtime_cli_child_agent(
     let child_id = child.id.clone();
     record_child_run_marker_from_request(&store, &child_id, &request)?;
     apply_cli_child_request_to_config(&mut base_config, &request)?;
+    let mut run_request = RuntimeAgentRunRequest::new(child_id.clone(), base_config);
+    if let Some(run_id) = request.run_id.as_ref() {
+        run_request = run_request.with_run_id(RuntimeRunId::from_string(run_id.clone())?);
+    }
     executor.spawn_background(
         format!("browser-use-child-{child_id}"),
-        RuntimeAgentRunRequest::new(child_id.clone(), base_config),
+        run_request,
         move |completion| {
             let events = Store::open(&state_dir)
                 .and_then(|store| store.events_for_session(&child_id))

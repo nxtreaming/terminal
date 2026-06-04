@@ -8,8 +8,8 @@ use anyhow::{anyhow, Context, Result};
 use browser_use_protocol::EventRecord;
 use browser_use_runtime::{
     AgentId, AttachChildAgentRequest, AttachRootAgentRequest, BrowserId as RuntimeBrowserId,
-    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RunAgentRequest, RuntimeHandle,
-    SessionId as RuntimeSessionId,
+    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RunAgentRequest, RunId as RuntimeRunId,
+    RuntimeHandle, SessionId as RuntimeSessionId,
 };
 use browser_use_store::{Store, StoreNotifier};
 use serde_json::json;
@@ -64,6 +64,7 @@ impl RuntimeAgentExecutorConfig {
 pub struct RuntimeAgentRunRequest {
     pub session_id: String,
     pub config: ProviderRunConfig,
+    pub run_id: Option<RuntimeRunId>,
     pub browser_id: Option<RuntimeBrowserId>,
     pub cancellation_token: Option<CancellationToken>,
 }
@@ -73,9 +74,15 @@ impl RuntimeAgentRunRequest {
         Self {
             session_id: session_id.into(),
             config,
+            run_id: None,
             browser_id: None,
             cancellation_token: None,
         }
+    }
+
+    pub fn with_run_id(mut self, run_id: RuntimeRunId) -> Self {
+        self.run_id = Some(run_id);
+        self
     }
 
     pub fn with_browser_id(mut self, browser_id: RuntimeBrowserId) -> Self {
@@ -206,6 +213,11 @@ impl RuntimeAgentExecutor {
                     .with_cwd(run_cwd.clone())
                     .with_input_source("runtime_agent_executor")
                     .with_cancellation_token(cancel.clone());
+                let runtime_request = if let Some(run_id) = request.run_id.clone() {
+                    runtime_request.with_run_id(run_id)
+                } else {
+                    runtime_request
+                };
                 let runtime_request = if let Some(initial_input) = initial_input.clone() {
                     runtime_request.with_initial_input(initial_input)
                 } else {
