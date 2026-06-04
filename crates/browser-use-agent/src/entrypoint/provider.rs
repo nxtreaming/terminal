@@ -434,17 +434,20 @@ fn browser_backend_for_runtime_or_config(
                 ))
             })?;
         let resource = handle
-            .get_or_insert_session_resource(
+            .try_get_or_insert_session_resource(
                 &runtime_session_id,
                 &key,
                 || {
-                    let browser_id = handle.create_browser(RuntimeBrowserConfig {
-                        keep_alive: true,
-                        headless: None,
-                        profile_id: Some(session_id.as_str().to_string()),
-                    });
+                    let browser_id = handle.create_browser_for_agent(
+                        agent_id.clone(),
+                        RuntimeBrowserConfig {
+                            keep_alive: true,
+                            headless: None,
+                            profile_id: Some(session_id.as_str().to_string()),
+                        },
+                    )?;
                     let script_registry = browser_use_browser::BrowserScriptRunRegistry::new();
-                    RuntimeBrowserBackend {
+                    Ok(RuntimeBrowserBackend {
                         session_id: session_id.as_str().to_string(),
                         runtime: handle.clone(),
                         agent_id,
@@ -455,11 +458,13 @@ fn browser_backend_for_runtime_or_config(
                                 script_registry,
                             ),
                         ),
-                    }
+                    })
                 },
                 |resource: Arc<RuntimeBrowserBackend>| {
                     let cleaned = resource.backend.cleanup_session(&resource.session_id);
-                    let _ = resource.runtime.close_browser(&resource.browser_id);
+                    let _ = resource
+                        .runtime
+                        .close_browser_for_agent(&resource.browser_id, &resource.agent_id);
                     cleaned
                 },
             )

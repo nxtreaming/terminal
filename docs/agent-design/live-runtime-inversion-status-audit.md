@@ -108,6 +108,11 @@ BrowserUseRuntime
   same-agent nested claims, and expose a runtime action-serialization helper used
   by the runtime browser backend. Same-browser conflicting owners still fail at
   the runtime boundary.
+- Runtime-attached browser backend resources now use agent-scoped
+  `browser.created` and `browser.closed` barrier events before becoming visible
+  or being removed from `BrowserManager`. The unattached SDK/global
+  `browser.create` path remains best-effort because it has no agent/session
+  journal context.
 - Browser script start/output/completion/cancellation/failure events now append
   through a browser-scoped runtime journal path. `BrowserHandle` tracks active
   script runs by `run_id`, runtime projection exposes active browser scripts,

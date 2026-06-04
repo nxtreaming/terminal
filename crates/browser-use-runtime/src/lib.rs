@@ -606,6 +606,7 @@ impl BrowserHandle {
             );
         }
         state.status = BrowserStatus::Closed;
+        state.active_scripts.clear();
         Ok(())
     }
 
@@ -661,12 +662,31 @@ impl BrowserManager {
 
     pub fn create_browser(&self, config: BrowserConfig) -> BrowserId {
         let id = BrowserId::new();
-        let handle = BrowserHandle::new(id.clone(), config);
+        self.insert_browser_unchecked(id.clone(), config);
+        id
+    }
+
+    pub fn create_browser_with_id(
+        &self,
+        id: BrowserId,
+        config: BrowserConfig,
+    ) -> Result<BrowserId> {
+        let mut browsers = self
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if browsers.contains_key(&id) {
+            bail!("browser {} already exists", id);
+        }
+        browsers.insert(id.clone(), BrowserHandle::new(id.clone(), config));
+        Ok(id)
+    }
+
+    fn insert_browser_unchecked(&self, id: BrowserId, config: BrowserConfig) {
         self.browsers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.clone(), handle);
-        id
+            .insert(id.clone(), BrowserHandle::new(id, config));
     }
 
     pub fn snapshot(&self, browser_id: &BrowserId) -> Result<BrowserSnapshot> {
@@ -705,6 +725,14 @@ impl BrowserManager {
             }
             .into()),
         }
+    }
+
+    pub fn validate_browser_close(&self, browser_id: &BrowserId) -> Result<()> {
+        let snapshot = self.snapshot(browser_id)?;
+        if let Some(active_agent_id) = snapshot.active_agent_id.as_ref() {
+            bail!("browser {browser_id} is still claimed by agent {active_agent_id}");
+        }
+        Ok(())
     }
 
     pub fn claim_browser(&self, browser_id: &BrowserId, agent_id: AgentId) -> Result<BrowserLease> {
@@ -3959,6 +3987,32 @@ impl RuntimeHandle {
         browser_id
     }
 
+    pub fn create_browser_for_agent(
+        &self,
+        agent_id: AgentId,
+        config: BrowserConfig,
+    ) -> Result<BrowserId> {
+        let thread = self.inner.agents.thread(&agent_id)?;
+        let browser_id = BrowserId::new();
+        let mut event = RuntimeEvent::new(RuntimeEventKind::BrowserCreated, Durability::Barrier)
+            .with_agent_id(agent_id.clone())
+            .with_session_id(thread.session_id.clone())
+            .with_browser_id(browser_id.clone())
+            .with_payload(json!({
+                "browser_id": browser_id.as_str(),
+                "agent_id": agent_id.as_str(),
+                "config": config.clone(),
+                "runtime_owned": true,
+            }));
+        event.root_id = Some(thread.root_id.clone());
+        self.inner.append_runtime_event(&event)?;
+        self.inner
+            .browsers
+            .create_browser_with_id(browser_id.clone(), config)?;
+        self.inner.events.publish(event);
+        Ok(browser_id)
+    }
+
     pub fn claim_browser(&self, browser_id: &BrowserId, agent_id: AgentId) -> Result<BrowserLease> {
         let thread = self.inner.agents.thread(&agent_id)?;
         self.inner
@@ -4030,6 +4084,29 @@ impl RuntimeHandle {
                     "runtime_owned": true,
                 })),
         );
+        Ok(())
+    }
+
+    pub fn close_browser_for_agent(
+        &self,
+        browser_id: &BrowserId,
+        agent_id: &AgentId,
+    ) -> Result<()> {
+        let thread = self.inner.agents.thread(agent_id)?;
+        self.inner.browsers.validate_browser_close(browser_id)?;
+        let mut event = RuntimeEvent::new(RuntimeEventKind::BrowserClosed, Durability::Barrier)
+            .with_agent_id(agent_id.clone())
+            .with_session_id(thread.session_id.clone())
+            .with_browser_id(browser_id.clone())
+            .with_payload(json!({
+                "browser_id": browser_id.as_str(),
+                "agent_id": agent_id.as_str(),
+                "runtime_owned": true,
+            }));
+        event.root_id = Some(thread.root_id.clone());
+        self.inner.append_runtime_event(&event)?;
+        self.inner.browsers.close_browser(browser_id)?;
+        self.inner.events.publish(event);
         Ok(())
     }
 
@@ -6442,6 +6519,80 @@ mod tests {
         assert_eq!(
             handle.browsers().snapshot(&browser_id)?.active_agent_id,
             None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_scoped_browser_create_and_close_are_barrier_journaled() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let browser_id =
+            handle.create_browser_for_agent(root.agent_id().clone(), BrowserConfig::default())?;
+        assert_eq!(
+            handle.browsers().snapshot(&browser_id)?.status,
+            BrowserStatus::Created
+        );
+        handle.close_browser_for_agent(&browser_id, root.agent_id())?;
+        assert!(handle.browsers().snapshot(&browser_id).is_err());
+
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"browser.created".to_string()));
+        assert!(event_types.contains(&"browser.closed".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn browser_create_barrier_failure_does_not_insert_or_publish() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let mut rx = handle.events().subscribe();
+        journal.fail_event_type("browser.created");
+
+        let err = handle
+            .create_browser_for_agent(root.agent_id().clone(), BrowserConfig::default())
+            .expect_err("browser create must fail before insertion");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        assert!(handle.browsers().snapshots().is_empty());
+        assert!(rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn browser_close_barrier_failure_keeps_browser_visible() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id =
+            handle.create_browser_for_agent(root.agent_id().clone(), BrowserConfig::default())?;
+        journal.fail_event_type("browser.closed");
+
+        let err = handle
+            .close_browser_for_agent(&browser_id, root.agent_id())
+            .expect_err("browser close must fail before live removal");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        assert_eq!(
+            handle.browsers().snapshot(&browser_id)?.status,
+            BrowserStatus::Created
         );
         Ok(())
     }
