@@ -1084,12 +1084,18 @@ fn committed_node_for_event(
         "agent.wait.started" => None,
         "agent.wait.finished" => agent_wait_finished_node(event),
         SESSION_MAILBOX_CONTINUATION_STARTED_EVENT => Some(mailbox_continuation_node(event)),
-        "agent.resumed" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "resumed",
-            NodeStyle::Normal,
-        )),
+        "agent.resumed" => {
+            if is_replay_materialization_event(event) {
+                None
+            } else {
+                Some(subagent_lifecycle_node(
+                    app,
+                    event,
+                    "resumed",
+                    NodeStyle::Normal,
+                ))
+            }
+        }
         "agent.completed" => Some(subagent_lifecycle_node(
             app,
             event,
@@ -1828,12 +1834,21 @@ fn live_stream_pending_status_allowed(
     let Some(latest_stream) = latest_nonempty_stream_event(live_events) else {
         return false;
     };
-    if live_events.iter().any(|event| {
-        event.seq > latest_stream.seq
-            && event.event_type != "model.stream_delta"
-            && event.event_type != "goal.accounted"
+    let later_events = live_events
+        .iter()
+        .filter(|event| event.seq > latest_stream.seq)
+        .filter(|event| !is_replay_materialization_event(event))
+        .collect::<Vec<_>>();
+    if later_events.iter().any(|event| {
+        event.event_type != "model.stream_delta" && event.event_type != "goal.accounted"
     }) {
         return true;
+    }
+    if later_events
+        .iter()
+        .any(|event| event.event_type == "goal.accounted")
+    {
+        return false;
     }
     allow_quiet_status
         && now_ms().saturating_sub(latest_stream.ts_ms) >= LIVE_STREAM_QUIET_STATUS_DELAY_MS
@@ -3382,7 +3397,23 @@ fn has_later_root_event(events: &[EventRecord], event: &EventRecord, event_type:
         candidate.session_id == event.session_id
             && candidate.seq > event.seq
             && candidate.event_type == event_type
+            && !is_replay_materialization_event(candidate)
     })
+}
+
+fn is_replay_materialization_event(event: &EventRecord) -> bool {
+    event
+        .payload
+        .get("materialized_from_replay")
+        .or_else(|| {
+            event
+                .payload
+                .get("payload")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|payload| payload.get("materialized_from_replay"))
+        })
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn has_agent_message_for_collab_receiver(events: &[EventRecord], event: &EventRecord) -> bool {

@@ -3175,6 +3175,7 @@ impl BrowserUseRuntime {
             session_id.clone(),
             max_concurrent_threads_per_session,
         )));
+        let materialized_from_replay = matches!(event_kind, Some(RuntimeEventKind::AgentResumed));
         let mut event = RuntimeEvent::new(
             event_kind.unwrap_or(RuntimeEventKind::AgentCreated),
             Durability::Barrier,
@@ -3185,6 +3186,7 @@ impl BrowserUseRuntime {
             "agent_path": "/root",
             "task": task,
             "role": "default",
+            "materialized_from_replay": materialized_from_replay,
         }));
         event.root_id = Some(root_id);
         self.publish_after_barrier(event)?;
