@@ -1239,6 +1239,45 @@ fn append_runtime_prompt_projection_event(
         .and_then(|append| append.seq)
 }
 
+fn append_runtime_or_store_event(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+    event_type: &str,
+    payload: Value,
+) -> anyhow::Result<Option<i64>> {
+    if let Some(runtime_handle) = runtime_handle {
+        let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+        return runtime_handle
+            .append_observed_session_event(
+                runtime_session_id,
+                event_type,
+                payload,
+                RuntimeDurability::Barrier,
+            )
+            .map(|append| append.seq);
+    }
+    let store = store.lock().expect("store mutex poisoned");
+    Ok(Some(
+        store.append_event(session_id, event_type, payload)?.seq,
+    ))
+}
+
+fn runtime_or_store_events(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+) -> Vec<EventRecord> {
+    if let Some(runtime_handle) = runtime_handle {
+        if let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.to_string()) {
+            if let Ok(events) = runtime_handle.events_for_session(&runtime_session_id) {
+                return events;
+            }
+        }
+    }
+    events_from_store(store, session_id)
+}
+
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
     let Ok(store) = store.lock() else {
         return;
@@ -1469,6 +1508,7 @@ fn insert_initial_context_before_last_real_user_or_summary(
 async fn run_compaction_with_retries(
     session_id: &SessionId,
     store: &SharedStore,
+    runtime_handle: Option<&RuntimeHandle>,
     history: &[Item],
     sampler: &dyn DynCompactionSampler,
     compact_prompt: &str,
@@ -1485,6 +1525,7 @@ async fn run_compaction_with_retries(
         match sampler.summarize(request, CancellationToken::new()).await {
             Ok(summary) => {
                 append_compaction_token_usage(
+                    runtime_handle,
                     store,
                     session_id.as_str(),
                     summary.token_usage.as_ref(),
@@ -1502,14 +1543,20 @@ async fn run_compaction_with_retries(
                     retries = 0;
                     continue;
                 }
-                append_context_window_full(store, session_id.as_str(), context_window);
-                append_model_turn_context_overflow(store, session_id.as_str());
+                append_context_window_full(
+                    runtime_handle,
+                    store,
+                    session_id.as_str(),
+                    context_window,
+                );
+                append_model_turn_context_overflow(runtime_handle, store, session_id.as_str());
                 return Err(AgentError::ContextWindowExceeded);
             }
             Err(AgentError::TurnAborted) => return Err(AgentError::TurnAborted),
             Err(error) if error.is_retryable() && retries < max_retries => {
                 retries += 1;
                 append_stream_error(
+                    runtime_handle,
                     store,
                     session_id.as_str(),
                     &format!("Reconnecting... {retries}/{max_retries}"),
@@ -1524,75 +1571,94 @@ async fn run_compaction_with_retries(
     }
 }
 
-fn append_model_turn_context_overflow(store: &SharedStore, session_id: &str) {
-    if let Ok(store) = store.lock() {
-        let _ = store.append_event(
-            session_id,
-            "model.turn.context_overflow",
-            json!({ "action": "compaction_failed" }),
-        );
-        let _ = store.append_event(
-            session_id,
-            names::MODEL_TURN_ERROR,
-            json!({
-                "error": "context window exceeded while compacting",
-                "code": "context_window_exceeded",
-                "recoverable": false,
-            }),
-        );
-    }
+fn append_model_turn_context_overflow(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+) {
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        "model.turn.context_overflow",
+        json!({ "action": "compaction_failed" }),
+    );
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        names::MODEL_TURN_ERROR,
+        json!({
+            "error": "context window exceeded while compacting",
+            "code": "context_window_exceeded",
+            "recoverable": false,
+        }),
+    );
 }
 
-fn append_stream_error(store: &SharedStore, session_id: &str, message: &str) {
-    if let Ok(store) = store.lock() {
-        let _ = store.append_event(
-            session_id,
-            names::STREAM_ERROR,
-            json!({ "message": message }),
-        );
-    }
+fn append_stream_error(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+    message: &str,
+) {
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        names::STREAM_ERROR,
+        json!({ "message": message }),
+    );
 }
 
-fn append_compaction_started(store: &SharedStore, session_id: &str, mode: CompactionMode) {
-    if let Ok(store) = store.lock() {
-        let _ = store.append_event(
-            session_id,
-            "session.compaction_started",
-            json!({
-                "reason": "token_budget",
-                "mode": compaction_mode_name(mode),
-            }),
-        );
-    }
+fn append_compaction_started(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+    mode: CompactionMode,
+) {
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        "session.compaction_started",
+        json!({
+            "reason": "token_budget",
+            "mode": compaction_mode_name(mode),
+        }),
+    );
 }
 
 fn append_compaction_failed(
+    runtime_handle: Option<&RuntimeHandle>,
     store: &SharedStore,
     session_id: &str,
     mode: CompactionMode,
     error: &AgentError,
 ) {
-    if let Ok(store) = store.lock() {
-        let _ = store.append_event(
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        "session.compaction_failed",
+        json!({
+            "reason": "token_budget",
+            "mode": compaction_mode_name(mode),
+            "error": error.to_string(),
+        }),
+    );
+    if !matches!(error, AgentError::ContextWindowExceeded) {
+        let _ = append_runtime_or_store_event(
+            runtime_handle,
+            store,
             session_id,
-            "session.compaction_failed",
+            names::MODEL_TURN_ERROR,
             json!({
-                "reason": "token_budget",
-                "mode": compaction_mode_name(mode),
                 "error": error.to_string(),
+                "code": compaction_error_code(error),
+                "recoverable": false,
             }),
         );
-        if !matches!(error, AgentError::ContextWindowExceeded) {
-            let _ = store.append_event(
-                session_id,
-                names::MODEL_TURN_ERROR,
-                json!({
-                    "error": error.to_string(),
-                    "code": compaction_error_code(error),
-                    "recoverable": false,
-                }),
-            );
-        }
     }
 }
 
@@ -1682,6 +1748,7 @@ fn token_count_payload_from_usage(
 }
 
 fn append_compaction_token_usage(
+    runtime_handle: Option<&RuntimeHandle>,
     store: &SharedStore,
     session_id: &str,
     usage: Option<&TokenUsage>,
@@ -1690,41 +1757,46 @@ fn append_compaction_token_usage(
     let Some(usage) = usage.filter(|usage| usage.total > 0) else {
         return;
     };
-    if let Ok(store) = store.lock() {
-        let events = store.events_for_session(session_id).unwrap_or_default();
-        let previous_total = latest_total_token_usage_value(&events);
-        let _ = store.append_event(
-            session_id,
-            names::TOKEN_COUNT,
-            token_count_payload_from_usage(usage, window, &previous_total),
-        );
-    }
+    let events = runtime_or_store_events(runtime_handle, store, session_id);
+    let previous_total = latest_total_token_usage_value(&events);
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        names::TOKEN_COUNT,
+        token_count_payload_from_usage(usage, window, &previous_total),
+    );
 }
 
-fn append_context_window_full(store: &SharedStore, session_id: &str, window: Option<i64>) {
+fn append_context_window_full(
+    runtime_handle: Option<&RuntimeHandle>,
+    store: &SharedStore,
+    session_id: &str,
+    window: Option<i64>,
+) {
     let Some(window) = window.filter(|window| *window > 0) else {
         return;
     };
-    if let Ok(store) = store.lock() {
-        let events = store.events_for_session(session_id).unwrap_or_default();
-        let previous_total = latest_total_token_usage_value(&events);
-        let previous_total_tokens = token_usage_total_tokens(&previous_total);
-        let delta = window.saturating_sub(previous_total_tokens).max(0);
-        let total_usage = token_usage_value_with_total(window);
-        let last_usage = token_usage_value_with_total(delta);
-        let _ = store.append_event(
-            session_id,
-            names::TOKEN_COUNT,
-            json!({
-                "info": {
-                    "total_token_usage": total_usage,
-                    "last_token_usage": last_usage,
-                    "model_context_window": window,
-                },
-                "turn_idx": 0,
-            }),
-        );
-    }
+    let events = runtime_or_store_events(runtime_handle, store, session_id);
+    let previous_total = latest_total_token_usage_value(&events);
+    let previous_total_tokens = token_usage_total_tokens(&previous_total);
+    let delta = window.saturating_sub(previous_total_tokens).max(0);
+    let total_usage = token_usage_value_with_total(window);
+    let last_usage = token_usage_value_with_total(delta);
+    let _ = append_runtime_or_store_event(
+        runtime_handle,
+        store,
+        session_id,
+        names::TOKEN_COUNT,
+        json!({
+            "info": {
+                "total_token_usage": total_usage,
+                "last_token_usage": last_usage,
+                "model_context_window": window,
+            },
+            "turn_idx": 0,
+        }),
+    );
 }
 
 fn token_usage_value_with_total(total_tokens: i64) -> Value {
@@ -1951,7 +2023,12 @@ impl LiveTurnState {
         // `clone_history`): the durable log (or the prior compacted override) plus
         // this run's recorded turns.
         let items = self.current_prompt_items_for_compaction(mode);
-        append_compaction_started(&self.store, self.session_id.as_str(), mode);
+        append_compaction_started(
+            self.runtime_handle.as_ref(),
+            &self.store,
+            self.session_id.as_str(),
+            mode,
+        );
 
         // Model-based no-tools summary pass + codex-parity compacted-history
         // assembly (preserved recent user messages capped at 20k tokens + the
@@ -1960,6 +2037,7 @@ impl LiveTurnState {
         let compacted = match run_compaction_with_retries(
             &self.session_id,
             &self.store,
+            self.runtime_handle.as_ref(),
             &items,
             sampler.as_ref(),
             &self.compact_prompt,
@@ -1971,7 +2049,13 @@ impl LiveTurnState {
         {
             Ok(compacted) => compacted,
             Err(error) => {
-                append_compaction_failed(&self.store, self.session_id.as_str(), mode, &error);
+                append_compaction_failed(
+                    self.runtime_handle.as_ref(),
+                    &self.store,
+                    self.session_id.as_str(),
+                    mode,
+                    &error,
+                );
                 return Err(error);
             }
         };
@@ -1992,21 +2076,19 @@ impl LiveTurnState {
             compacted.items
         };
 
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            store
-                .append_event(
-                    self.session_id.as_str(),
-                    "session.compacted",
-                    compacted_event_payload(
-                        &compacted.summary_text,
-                        &replacement_messages,
-                        initial_context_already_in_history,
-                        replay_from_seq,
-                    ),
-                )
-                .map_err(|error| AgentError::Store(error.into()))?;
-        }
+        append_runtime_or_store_event(
+            self.runtime_handle.as_ref(),
+            &self.store,
+            self.session_id.as_str(),
+            "session.compacted",
+            compacted_event_payload(
+                &compacted.summary_text,
+                &replacement_messages,
+                initial_context_already_in_history,
+                replay_from_seq,
+            ),
+        )
+        .map_err(AgentError::Store)?;
 
         let active_after_compact = {
             let lowered = self.durable_history_blocking();
@@ -2021,20 +2103,18 @@ impl LiveTurnState {
                 .saturating_add(crate::compact::approx_token_count(&self.base_instructions) as i64)
         };
         let previous_total = latest_total_token_usage_value(&self.durable_events_blocking());
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            store
-                .append_event(
-                    self.session_id.as_str(),
-                    names::TOKEN_COUNT,
-                    recomputed_token_count_payload(
-                        active_after_compact,
-                        self.context_window(),
-                        &previous_total,
-                    ),
-                )
-                .map_err(|error| AgentError::Store(error.into()))?;
-        }
+        append_runtime_or_store_event(
+            self.runtime_handle.as_ref(),
+            &self.store,
+            self.session_id.as_str(),
+            names::TOKEN_COUNT,
+            recomputed_token_count_payload(
+                active_after_compact,
+                self.context_window(),
+                &previous_total,
+            ),
+        )
+        .map_err(AgentError::Store)?;
         self.recorded.lock().unwrap().clear();
         let mut window = self.auto_compact_window.lock().unwrap();
         window.start_next();
@@ -4270,6 +4350,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_backed_compaction_publishes_checkpoint_through_runtime() -> anyhow::Result<()>
+    {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "please compact").await;
+        let journal = Arc::new(SqliteJournal::open(dir.path())?);
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime_handle.attach_root_agent(AttachRootAgentRequest {
+            session_id: RuntimeSessionId::from_string(session_id.clone())?,
+            cwd: std::path::PathBuf::from("/work"),
+            task: "please compact".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let mut projection = runtime_handle.subscribe_projected();
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, None, AutoCompactTokenLimitScope::Total, sampler)
+        .with_runtime_handle(Some(runtime_handle.clone()));
+
+        state.compact(CompactionMode::MidTurn).await?;
+
+        let mut saw_compacted = false;
+        for _ in 0..6 {
+            let event = projection.recv().await?;
+            if event.payload["event_type"] == "session.compacted" {
+                saw_compacted = true;
+                break;
+            }
+        }
+        assert!(
+            saw_compacted,
+            "runtime-backed compaction should publish session.compacted through the runtime event bus"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn compaction_retries_retryable_summary_failures() {
         let (_dir, store, session_id) = store_with_session();
         seed_user_input(&store, &session_id, "please compact").await;
@@ -4315,6 +4438,7 @@ mod tests {
         let compacted = run_compaction_with_retries(
             &SessionId(session_id.clone()),
             &store,
+            None,
             &[
                 serde_json::json!({"role": "user", "content": [{"type": "text", "text": "old request"}]}),
                 serde_json::json!({"role": "user", "content": [{"type": "text", "text": "new request"}]}),
@@ -4347,6 +4471,7 @@ mod tests {
         let err = run_compaction_with_retries(
             &SessionId(session_id.clone()),
             &store,
+            None,
             &[],
             sampler.as_ref(),
             crate::compact::SUMMARIZATION_PROMPT,

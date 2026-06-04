@@ -194,7 +194,7 @@ BrowserUseRuntime
 - [ ] Port pending input logic from `StoreTurnState` to `LiveTurnState`.
 - [ ] Port mailbox current-turn/next-turn logic to runtime mailbox cursors.
 - [ ] Port active follow-up drain logic to runtime follow-up queue.
-- [ ] Port compaction checkpoint writes to `JournalSink`.
+- [x] Port compaction checkpoint writes to `JournalSink`.
 - [ ] Port token status recomputation to live state plus journal replay.
 - [ ] Remove `StoreTurnState` from the normal live run path.
 - [ ] Keep any remaining Store-based turn state only under explicit test or

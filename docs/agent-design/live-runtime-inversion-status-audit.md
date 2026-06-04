@@ -65,6 +65,9 @@ BrowserUseRuntime
   `agent.mailbox_input`, `session.followup`, and `agent.turn_queue_drained`
   through `RuntimeHandle::append_observed_session_event`, so live mailbox
   delivery no longer writes those rows directly through `Store`.
+- Runtime-backed compaction progress, errors, token usage, context-window-full
+  markers, and `session.compacted` checkpoints now append through
+  `RuntimeHandle::append_observed_session_event` when a runtime handle exists.
 - Subagent lifecycle UI events use the runtime-backed event sink when a runtime
   handle exists.
 - `session.done` emitted by the turn observer is routed through the runtime
@@ -118,8 +121,9 @@ BrowserUseRuntime
   wrapped by runtime ownership, not moved into `browser-use-runtime`.
 - `LiveTurnState` still contains `SharedStore` and reconstructs durable prompt
   history from Store/SQLite. Fresh input and mailbox are runtime-backed, but
-  prompt history, compaction checkpoints, and token replay are still
-  Store-shaped.
+  prompt history and token replay are still Store-shaped. Runtime-backed
+  compaction checkpoint writes now route through runtime, but compaction state
+  itself still lives in the agent crate turn state.
 - `run_session_with_config*` remains as compatibility wrappers over
   `RuntimeHandle::run_agent`. They are not an independent live authority when
   called normally, but they have not been deleted.
@@ -171,8 +175,8 @@ BrowserUseRuntime
 
 ```text
 1. Move turn-loop ownership deeper into RuntimeHandle/AgentThread.
-2. Replace Store-shaped LiveTurnState history/compaction/token state with
-   runtime-owned state plus JournalReader replay.
+2. Replace Store-shaped LiveTurnState history/token state and local compaction
+   state with runtime-owned state plus JournalReader replay.
 3. Complete RuntimeEventProjection coverage and make it the live TUI authority.
 4. Promote BrowserManager from lease/action ownership to the owner of browser
    sessions, script registries, artifacts, cancellation, and crash semantics.
