@@ -5025,7 +5025,7 @@ mod tests {
         assert!(err.to_string().contains("forced journal failure"));
         let snapshot = root.snapshot();
         assert_eq!(snapshot.status, AgentThreadStatus::Running);
-        assert!(snapshot.live.current_run_id.is_some());
+        assert_eq!(snapshot.live.current_run_id, None);
         assert!(!handle.cancel_run(root.session_id()));
         Ok(())
     }
