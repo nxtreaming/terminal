@@ -246,6 +246,7 @@ enum Surface {
     Mode,
     Browser,
     BrowserSelect,
+    DefaultProfile,
     CookieSync,
     Context,
     Goal,
@@ -270,6 +271,7 @@ impl Surface {
                 | Self::Mode
                 | Self::Browser
                 | Self::BrowserSelect
+                | Self::DefaultProfile
                 | Self::CookieSync
                 | Self::Context
                 | Self::Goal
@@ -474,6 +476,37 @@ impl Default for CookieSyncState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DefaultProfileStatus {
+    Loading,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct DefaultProfileEvent {
+    result: Result<serde_json::Value, String>,
+}
+
+#[derive(Debug)]
+struct DefaultProfileState {
+    status: DefaultProfileStatus,
+    profiles: Vec<CookieSyncProfile>,
+    current_profile_id: Option<String>,
+    rx: Option<mpsc::Receiver<DefaultProfileEvent>>,
+}
+
+impl Default for DefaultProfileState {
+    fn default() -> Self {
+        Self {
+            status: DefaultProfileStatus::Loading,
+            profiles: Vec::new(),
+            current_profile_id: None,
+            rx: None,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Feedback questionnaire state
 
@@ -598,6 +631,7 @@ enum AppCommand {
     SignIn,
     ConfigureTelemetry,
     ChangeBrowser,
+    ChangeDefaultProfile,
     SyncCookies,
     Reload,
     Update,
@@ -607,6 +641,7 @@ enum AppCommand {
     OpenModelSearch,
     SaveCustomModel(String),
     SaveBrowser(usize),
+    SaveDefaultProfile(usize),
     SaveAuth(String),
     SaveTelemetry(String),
     OpenFeedback,
@@ -1110,6 +1145,7 @@ struct App {
     claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
     codex_login: Option<CodexLoginFlow>,
     cookie_sync: CookieSyncState,
+    default_profile: DefaultProfileState,
     pending_cookie_sync_after_auth: bool,
     browser_notice: Option<String>,
     status_notice: Option<String>,
@@ -2116,6 +2152,7 @@ impl App {
             claude_code_oauth: None,
             codex_login: None,
             cookie_sync: CookieSyncState::default(),
+            default_profile: DefaultProfileState::default(),
             pending_cookie_sync_after_auth: false,
             browser_notice: None,
             status_notice: None,
@@ -2370,6 +2407,60 @@ impl App {
             self.apply_cookie_sync_event(event);
         }
         Ok(true)
+    }
+
+    fn drain_default_profile_notifications(&mut self) -> Result<bool> {
+        let mut events = Vec::new();
+        if let Some(rx) = self.default_profile.rx.as_ref() {
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+        }
+        if events.is_empty() {
+            return Ok(false);
+        }
+        self.default_profile.rx = None;
+        for event in events {
+            self.apply_default_profile_event(event);
+        }
+        Ok(true)
+    }
+
+    fn apply_default_profile_event(&mut self, event: DefaultProfileEvent) {
+        match event.result {
+            Ok(value) => match value.get("status").and_then(serde_json::Value::as_str) {
+                Some("needs-user-action") | Some("ok") | None => {
+                    self.default_profile.profiles = cookie_sync_profiles_from_value(&value);
+                    if let Some(current) = self.default_profile.current_profile_id.as_deref() {
+                        if let Some(index) = self
+                            .default_profile
+                            .profiles
+                            .iter()
+                            .position(|profile| profile.id == current)
+                        {
+                            self.selected_row = index;
+                        }
+                    }
+                    self.default_profile.status = DefaultProfileStatus::Ready;
+                }
+                Some("failed") => {
+                    let error = value
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Profile scan failed")
+                        .to_string();
+                    self.default_profile.status = DefaultProfileStatus::Failed(error);
+                }
+                Some(_) => {
+                    self.default_profile.status = DefaultProfileStatus::Failed(
+                        "Unexpected profile scan response.".to_string(),
+                    );
+                }
+            },
+            Err(error) => {
+                self.default_profile.status = DefaultProfileStatus::Failed(error);
+            }
+        }
     }
 
     fn apply_cookie_sync_event(&mut self, event: CookieSyncEvent) {
@@ -4042,6 +4133,7 @@ impl App {
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
+            AppCommand::ChangeDefaultProfile => self.open_default_profile()?,
             AppCommand::SyncCookies => self.open_cookie_sync()?,
             AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
@@ -4051,6 +4143,7 @@ impl App {
             AppCommand::OpenModelSearch => self.open_model_search()?,
             AppCommand::SaveCustomModel(model_id) => self.save_provider_model(model_id)?,
             AppCommand::SaveBrowser(index) => self.save_browser(index)?,
+            AppCommand::SaveDefaultProfile(index) => self.save_default_profile(index)?,
             AppCommand::SaveAuth(secret) => self.save_auth(secret)?,
             AppCommand::SaveTelemetry(secret) => self.save_telemetry(secret)?,
             AppCommand::OpenFeedback => {
@@ -5344,6 +5437,9 @@ impl App {
             Surface::BrowserSelect => {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
+            Surface::DefaultProfile => {
+                self.dispatch(AppCommand::SaveDefaultProfile(self.selected_row))?;
+            }
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
             Surface::Context | Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
@@ -5604,6 +5700,7 @@ impl App {
         match action {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
+            PaletteAction::DefaultProfile => self.dispatch(AppCommand::ChangeDefaultProfile)?,
             PaletteAction::Context => self.open_surface(Surface::Context),
             PaletteAction::Goal => self.show_current_goal()?,
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
@@ -6732,6 +6829,14 @@ impl App {
         }
     }
 
+    fn default_profile_row_count(&self) -> usize {
+        match &self.default_profile.status {
+            DefaultProfileStatus::Ready => self.default_profile.profiles.len().max(1),
+            DefaultProfileStatus::Failed(_) => 1,
+            DefaultProfileStatus::Loading => 0,
+        }
+    }
+
     fn request_open_browser(&mut self) -> Result<()> {
         let Some(session_id) = self.selected_session_id.clone() else {
             self.browser_notice = Some("No current browser task yet.".to_string());
@@ -6774,6 +6879,94 @@ impl App {
         self.open_surface(Surface::CookieSync);
         self.status_notice = None;
         self.start_cookie_sync_profile_load()
+    }
+
+    fn open_default_profile(&mut self) -> Result<()> {
+        self.open_surface(Surface::DefaultProfile);
+        self.status_notice = None;
+        self.start_default_profile_load()
+    }
+
+    fn start_default_profile_load(&mut self) -> Result<()> {
+        self.default_profile.status = DefaultProfileStatus::Loading;
+        self.default_profile.profiles.clear();
+        self.default_profile.current_profile_id = self
+            .store
+            .get_setting("browser.preference.profile")?
+            .filter(|value| !value.trim().is_empty());
+        let cwd = std::env::current_dir()?;
+        let artifact_root = self.store.state_dir().join("profile-settings-artifacts");
+        fs::create_dir_all(&artifact_root)?;
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("browser-use-profile-settings".to_string())
+            .spawn(move || {
+                let result = run_standalone_browser_command_with_browser_use_api_key(
+                    "tui-profile-settings",
+                    &cwd,
+                    &artifact_root,
+                    "browser local profiles --json",
+                    None,
+                )
+                .map_err(|error| format!("{error:#}"));
+                let _ = tx.send(DefaultProfileEvent { result });
+            })
+            .context("spawn profile settings thread")?;
+        self.default_profile.rx = Some(rx);
+        Ok(())
+    }
+
+    fn save_default_profile(&mut self, index: usize) -> Result<()> {
+        match &self.default_profile.status {
+            DefaultProfileStatus::Ready => {}
+            DefaultProfileStatus::Failed(_) => {
+                self.close_surface();
+                return Ok(());
+            }
+            DefaultProfileStatus::Loading => return Ok(()),
+        }
+        let Some(profile) = self
+            .default_profile
+            .profiles
+            .get(index.min(self.default_profile.profiles.len().saturating_sub(1)))
+            .cloned()
+        else {
+            self.status_notice = Some("No local Chromium profiles found.".to_string());
+            self.close_surface();
+            return Ok(());
+        };
+        self.store
+            .set_setting("browser.preference.profile", &profile.id)?;
+        let profile_label = human_profile_label(&profile);
+        self.store
+            .set_setting("browser.preference.profile_label", &profile_label)?;
+        self.default_profile.current_profile_id = Some(profile.id.clone());
+        self.status_notice = Some(format!("Default Chrome profile: {profile_label}"));
+        self.close_surface();
+        Ok(())
+    }
+
+    pub(crate) fn browser_status_label(&self) -> String {
+        if self.browser != settings::BROWSER_LOCAL_CHROME {
+            return self.browser.clone();
+        }
+        let profile_label = self
+            .store
+            .get_setting("browser.preference.profile_label")
+            .ok()
+            .flatten()
+            .filter(|label| !label.trim().is_empty())
+            .or_else(|| {
+                self.store
+                    .get_setting("browser.preference.profile")
+                    .ok()
+                    .flatten()
+                    .filter(|profile| !profile.trim().is_empty())
+            });
+        match profile_label {
+            Some(profile) => format!("{} · {}", self.browser, concise_profile_label(&profile)),
+            None => self.browser.clone(),
+        }
     }
 
     fn start_cookie_sync_profile_load(&mut self) -> Result<()> {
@@ -6987,6 +7180,7 @@ impl App {
             Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
+            Surface::DefaultProfile => self.default_profile_row_count(),
             Surface::CookieSync => self.cookie_sync_row_count(),
             Surface::Context | Surface::Goal => 0,
             Surface::History => self.history_visible_indices()?.len(),
@@ -7419,11 +7613,32 @@ fn codex_env_auth_present() -> bool {
 fn cookie_sync_profiles_from_value(value: &serde_json::Value) -> Vec<CookieSyncProfile> {
     value
         .get("profiles")
+        .or_else(|| value.get("local_profiles"))
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(cookie_sync_profile_from_value)
         .collect()
+}
+
+fn concise_profile_label(label: &str) -> String {
+    let trimmed = label.trim();
+    let without_browser = trimmed.strip_prefix("Google Chrome - ").unwrap_or(trimmed);
+    without_browser
+        .rsplit_once(':')
+        .map(|(_, profile)| profile)
+        .unwrap_or(without_browser)
+        .trim()
+        .to_string()
+}
+
+pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
+    let profile_name = concise_profile_label(&profile.profile_name);
+    if profile_name.trim().is_empty() {
+        concise_profile_label(&profile.display_name)
+    } else {
+        profile_name
+    }
 }
 
 fn cookie_sync_profile_from_value(value: &serde_json::Value) -> Option<CookieSyncProfile> {
@@ -8169,6 +8384,7 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_codex_login_notifications()?;
             draw_needed |= app.drain_clipboard_paste_notifications()?;
             draw_needed |= app.drain_cookie_sync_notifications()?;
+            draw_needed |= app.drain_default_profile_notifications()?;
             draw_needed |= app.drain_provider_fetch()?;
             draw_needed |= app.drain_feedback_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
@@ -10548,6 +10764,7 @@ mod redesign_tests {
             Surface::ModelSearch => "Model",
             Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
+            Surface::DefaultProfile => "Profile",
             Surface::CookieSync => "Cookie Sync",
             Surface::Context => "Context",
             Surface::Goal => "Goal",
@@ -12045,11 +12262,12 @@ mod redesign_tests {
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
-        assert!(!screen.lines().any(|line| line.contains("/mode ")));
+        assert!(screen.contains("/profile"));
         assert!(!app
             .slash_palette_items()
             .iter()
             .any(|item| item.command == "/mode"));
+        assert!(!screen.lines().any(|line| line.contains("/mode ")));
         assert!(!screen.contains("/plan"));
         assert!(screen.contains("/model"));
         assert!(!screen.contains("/auth"));
@@ -13233,6 +13451,7 @@ wire_api = "responses"
     #[test]
     fn up_down_keys_navigate_every_choice_menu() -> Result<()> {
         fn assert_nav(app: &mut App, expected_count: usize) -> Result<()> {
+            assert!(expected_count > 0, "surface {:?}", app.surface);
             app.selected_row = 0;
             for _ in 0..expected_count - 1 {
                 assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
@@ -13244,6 +13463,14 @@ wire_api = "responses"
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
             assert_eq!(app.selected_row, expected_count - 1);
             Ok(())
+        }
+        fn assert_nav_current(app: &mut App) -> Result<()> {
+            let expected_count = if app.is_slash_palette_active() {
+                app.slash_palette_items().len()
+            } else {
+                app.selectable_row_count()?
+            };
+            assert_nav(app, expected_count)
         }
 
         let first_run_temp = tempfile::tempdir()?;
@@ -13260,15 +13487,34 @@ wire_api = "responses"
             Surface::Mode,
             Surface::Browser,
             Surface::BrowserSelect,
+            Surface::DefaultProfile,
             Surface::CookieSync,
         ] {
             app.open_surface(surface);
+            if surface == Surface::DefaultProfile {
+                app.default_profile.status = DefaultProfileStatus::Ready;
+                app.default_profile.profiles = vec![
+                    CookieSyncProfile {
+                        id: "google-chrome:Default".to_string(),
+                        display_name: "Google Chrome - Work".to_string(),
+                        browser_name: "Google Chrome".to_string(),
+                        profile_name: "Work".to_string(),
+                    },
+                    CookieSyncProfile {
+                        id: "google-chrome:Profile 1".to_string(),
+                        display_name: "Google Chrome - Personal".to_string(),
+                        browser_name: "Google Chrome".to_string(),
+                        profile_name: "Personal".to_string(),
+                    },
+                ];
+            }
             let count = match surface {
                 Surface::Setup => app.setup_row_count(),
                 Surface::Account => ACCOUNT_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
                 Surface::Mode => 2,
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
+                Surface::DefaultProfile => app.default_profile_row_count(),
                 Surface::CookieSync => app.cookie_sync_row_count(),
                 _ => unreachable!(),
             };
@@ -13290,13 +13536,13 @@ wire_api = "responses"
                 serde_json::json!({"text": format!("history task {idx}")}),
             )?;
         }
+        app.refresh_state_cache_from_store()?;
         app.open_surface(Surface::History);
-        assert_nav(&mut app, 3)?;
+        assert_nav_current(&mut app)?;
         app.close_surface();
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
-        let slash_palette_count = app.slash_palette_items().len();
-        assert_nav(&mut app, slash_palette_count)?;
+        assert_nav_current(&mut app)?;
         app.close_slash_palette();
 
         let failed = app.store.create_session(None, std::env::current_dir()?)?;
@@ -13311,7 +13557,8 @@ wire_api = "responses"
             serde_json::json!({"error": "OpenRouter API key is missing"}),
         )?;
         app.selected_session_id = Some(failed.id);
-        assert_nav(&mut app, 4)?;
+        app.refresh_state_cache_from_store()?;
+        assert_nav_current(&mut app)?;
 
         let cancelled = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
@@ -13321,7 +13568,8 @@ wire_api = "responses"
         )?;
         app.store.request_cancel(&cancelled.id, "test cancel")?;
         app.selected_session_id = Some(cancelled.id);
-        assert_nav(&mut app, 3)?;
+        app.refresh_state_cache_from_store()?;
+        assert_nav_current(&mut app)?;
         Ok(())
     }
 
@@ -17344,8 +17592,9 @@ wire_api = "responses"
             serde_json::json!({"text": "visible output"}),
         )?;
         app.selected_session_id = Some(session.id.clone());
-        app.drain_store_notifications()?;
+        app.refresh_state_cache_from_store()?;
 
+        assert!(app.current_task_is_active()?);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
 
         assert!(app.composer.input().is_empty());
@@ -17457,6 +17706,7 @@ wire_api = "responses"
         let screen = render_dump(&mut app)?;
         assert_eq!(app.surface, Surface::Main);
         assert!(screen.contains("stopped"));
+        assert_eq!(app.surface, Surface::Main);
         Ok(())
     }
 

@@ -196,6 +196,10 @@ struct BrowserSession {
     last_target_id: Option<String>,
     last_session_id: Option<String>,
     last_emitted_browser_payload: Option<Value>,
+    preferred_target_marker: Option<String>,
+    preferred_profile_id: Option<String>,
+    active_local_profile_id: Option<String>,
+    preferred_browser_context_id: Option<String>,
     logs: VecDeque<String>,
 }
 
@@ -220,6 +224,10 @@ impl Default for BrowserSession {
             last_target_id: None,
             last_session_id: None,
             last_emitted_browser_payload: None,
+            preferred_target_marker: None,
+            preferred_profile_id: None,
+            active_local_profile_id: None,
+            preferred_browser_context_id: None,
             logs: VecDeque::new(),
         }
     }
@@ -1831,7 +1839,10 @@ fn dispatch_browser_command(
 ) -> Result<Value> {
     match argv.first().map(String::as_str).unwrap_or("help") {
         "help" | "--help" | "-h" => Ok(Value::String(browser_help().to_string())),
-        "status" => Ok(session.status_json()),
+        "status" => {
+            session.refresh_connection_health();
+            Ok(session.status_json())
+        }
         "doctor" => {
             let doctor = session.doctor(cwd)?;
             if has_flag(argv, "--json") {
@@ -1961,12 +1972,24 @@ fn dispatch_connect(session: &mut BrowserSession, argv: &[String]) -> Result<Val
 }
 
 fn dispatch_local(
-    _session: &mut BrowserSession,
+    session: &mut BrowserSession,
     argv: &[String],
     _artifact_dir: &Path,
 ) -> Result<Value> {
     match argv.get(1).map(String::as_str) {
         Some("list") => Ok(json!({ "candidates": local_candidates() })),
+        Some("open") => {
+            let profile_ref = option_value(argv, "--profile")
+                .or_else(|| {
+                    argv.get(2)
+                        .filter(|value| !value.starts_with("--"))
+                        .cloned()
+                })
+                .ok_or_else(|| anyhow!("browser local open requires --profile <profile-id>"))?;
+            let profiles = detect_local_profiles();
+            let profile = resolve_local_profile(&profiles, &profile_ref)?;
+            open_local_profile(session, &profile)
+        }
         Some("setup") => {
             // The agent decides how to open the URL
             let profile_ref = option_value(argv, "--profile");
@@ -1981,8 +2004,83 @@ fn dispatch_local(
         }
         Some("profiles") => dispatch_local_profiles(argv),
         Some(other) => bail!("unknown browser local command: {other}"),
-        None => bail!("browser local requires list, setup, or profiles"),
+        None => bail!("browser local requires list, open, setup, or profiles"),
     }
+}
+
+fn open_local_profile(
+    session: &mut BrowserSession,
+    profile: &LocalBrowserProfile,
+) -> Result<Value> {
+    let profile_directory_arg = format!("--profile-directory={}", profile.profile_dir);
+    let needs_marker = local_candidates()
+        .iter()
+        .any(|candidate| candidate.browser_running == Some(true));
+    let marker = needs_marker.then(|| {
+        format!(
+            "browser-use-profile-target-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default()
+        )
+    });
+    let target_url = marker.as_ref().map(|marker| {
+        format!("data:text/html,<title>Browser%20Use</title><meta%20name=browser-use-profile-target%20content={marker}>")
+    });
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new(&profile.browser_path);
+        command.arg(format!(
+            "--user-data-dir={}",
+            profile.user_data_dir.display()
+        ));
+        command.arg(&profile_directory_arg);
+        if let Some(target_url) = target_url.as_deref() {
+            command.arg(target_url);
+        } else {
+            command.arg("--no-startup-window");
+        }
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut command = {
+        let mut command = Command::new(&profile.browser_path);
+        command.arg(&profile_directory_arg);
+        if let Some(target_url) = target_url.as_deref() {
+            command.arg(target_url);
+        } else {
+            command.arg("--no-startup-window");
+        }
+        command
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "open {} with profile {}",
+                profile.browser_name, profile.profile_name
+            )
+        })?;
+    session.preferred_target_marker = marker.clone();
+    session.preferred_profile_id = Some(profile.id.clone());
+    let mut response = json!({
+        "status": "ok",
+        "opened": true,
+        "profile": profile,
+        "profile_targeting": if marker.is_some() { "marker" } else { "profile-launch" },
+        "next_step": "Give Chrome a moment to start, then run browser connect local.",
+    });
+    if let Some(marker) = marker {
+        response["target_marker"] = json!(marker);
+    }
+    if let Some(target_url) = target_url {
+        response["target_url"] = json!(target_url);
+    }
+    Ok(response)
 }
 
 fn local_setup_user_action_response(profile: Option<LocalBrowserProfile>) -> Value {
@@ -2315,6 +2413,8 @@ impl BrowserSession {
             "owner": self.owner.as_str(),
             "browser": self.browser_name,
             "profile": self.profile,
+            "local_profile_id": self.active_local_profile_id,
+            "profile_context_id": self.preferred_browser_context_id,
             "endpoint": self.endpoint.as_ref().map(|endpoint| json!({
                 "kind": endpoint.kind,
                 "http_url": endpoint.http_url,
@@ -2374,7 +2474,7 @@ impl BrowserSession {
             Some("browser connect local")
         } else if matches!(
             self.last_error_kind.as_deref(),
-            Some("browser-closed" | "stale-port")
+            Some("browser-closed" | "stale-port" | "browser-not-running")
         ) && self.mode == BrowserMode::Local
         {
             Some("Open Chrome with the selected profile, then run browser connect local")
@@ -2496,6 +2596,39 @@ impl BrowserSession {
             ws_url: candidate.ws_url.clone(),
             candidate_id: Some(candidate.id.clone()),
         };
+        if self.can_reuse_local_endpoint(&endpoint) {
+            if self.preferred_target_marker.is_some() || self.preferred_profile_id.is_some() {
+                if let Err(error) = self.attach_first_page_with_deadline(
+                    Instant::now() + BROWSER_CONNECT_ATTACH_DEADLINE,
+                ) {
+                    let message = format!("{error:#}");
+                    let kind =
+                        self.normalize_local_connectivity_error(classify_browser_error(&message));
+                    self.last_error = Some(message.clone());
+                    self.last_error_kind = Some(kind.to_string());
+                    return Ok(json!({
+                        "status": "blocked",
+                        "state": kind,
+                        "reason": local_connect_error_reason(kind, &message),
+                        "candidate": candidate,
+                        "raw_error": message,
+                        "next_step": local_connect_next_step(kind),
+                    }));
+                }
+            }
+            self.endpoint = Some(endpoint);
+            self.browser_name = Some(candidate.browser_name.clone());
+            self.profile = Some(candidate.profile_path.display().to_string());
+            self.last_error = None;
+            self.last_error_kind = None;
+            self.close_remote_debugging_setup_targets();
+            return Ok(json!({
+                "status": "connected",
+                "candidate": candidate,
+                "browser": self.status_json(),
+                "reused_connection": true,
+            }));
+        }
         if let Err(error) = self.connect_endpoint_with_attach_deadline(
             endpoint,
             BrowserMode::Local,
@@ -2503,7 +2636,7 @@ impl BrowserSession {
             Instant::now() + BROWSER_CONNECT_ATTACH_DEADLINE,
         ) {
             let message = format!("{error:#}");
-            let kind = classify_browser_error(&message);
+            let kind = self.normalize_local_connectivity_error(classify_browser_error(&message));
             self.clear_failed_connection_state();
             self.last_error = Some(message.clone());
             self.last_error_kind = Some(kind.to_string());
@@ -2518,6 +2651,7 @@ impl BrowserSession {
         }
         self.browser_name = Some(candidate.browser_name.clone());
         self.profile = Some(candidate.profile_path.display().to_string());
+        self.close_remote_debugging_setup_targets();
         Ok(json!({
             "status": "connected",
             "candidate": candidate,
@@ -2771,6 +2905,22 @@ impl BrowserSession {
         let Some(endpoint) = self.endpoint.clone() else {
             bail!("no browser endpoint is configured");
         };
+        if self.mode == BrowserMode::Local {
+            let probe = probe_endpoint(&endpoint);
+            if !probe.ok && matches!(probe.state, "browser-closed" | "websocket-dropped") {
+                self.connection = None;
+                self.last_target_id = self.current_target_id.take();
+                self.last_session_id = self.current_session_id.take();
+                let kind = self.normalize_local_connectivity_error(probe.state);
+                self.last_error = Some(probe.detail);
+                self.last_error_kind = Some(kind.to_string());
+                self.connection_generation += 1;
+                bail!(
+                    "local Chrome endpoint is not reachable; state: {kind}; next_step: {}",
+                    self.next_step().unwrap_or("browser connect local")
+                );
+            }
+        }
         self.connection = Some(CdpDispatcher::connect(&endpoint.ws_url)?);
         self.connection_generation += 1;
         if self.current_target_id.is_some() {
@@ -2782,6 +2932,92 @@ impl BrowserSession {
             "status": "reconnected",
             "browser": self.status_json(),
         }))
+    }
+
+    fn refresh_connection_health(&mut self) {
+        if self.connection.is_none() || self.mode != BrowserMode::Local {
+            return;
+        }
+        let Some(endpoint) = self.endpoint.clone() else {
+            return;
+        };
+        let probe = probe_endpoint(&endpoint);
+        if probe.ok {
+            return;
+        }
+        let kind = self.normalize_local_connectivity_error(probe.state);
+        if !should_drop_browser_connection(kind) {
+            return;
+        }
+        self.connection = None;
+        self.last_target_id = self.current_target_id.take();
+        self.last_session_id = self.current_session_id.take();
+        self.last_error = Some(probe.detail);
+        self.last_error_kind = Some(kind.to_string());
+        self.connection_generation += 1;
+    }
+
+    fn can_reuse_local_endpoint(&mut self, endpoint: &Endpoint) -> bool {
+        if self.connection.is_none()
+            || self.mode != BrowserMode::Local
+            || self.owner != BrowserOwner::External
+        {
+            return false;
+        }
+        let Some(current_endpoint) = self.endpoint.as_ref() else {
+            return false;
+        };
+        if current_endpoint.ws_url != endpoint.ws_url {
+            return false;
+        }
+        let probe = probe_endpoint(endpoint);
+        if probe.ok {
+            return true;
+        }
+        let kind = self.normalize_local_connectivity_error(probe.state);
+        if should_drop_browser_connection(kind) {
+            self.connection = None;
+            self.last_target_id = self.current_target_id.take();
+            self.last_session_id = self.current_session_id.take();
+            self.last_error = Some(probe.detail);
+            self.last_error_kind = Some(kind.to_string());
+            self.connection_generation += 1;
+        }
+        false
+    }
+
+    fn normalize_local_connectivity_error(&self, kind: &'static str) -> &'static str {
+        if self.mode != BrowserMode::Local {
+            return kind;
+        }
+        if !matches!(
+            kind,
+            "permission-blocked"
+                | "cdp-disabled"
+                | "browser-closed"
+                | "websocket-dropped"
+                | "browser-not-running"
+                | "stale-port"
+        ) {
+            return kind;
+        }
+        let candidates = local_candidates();
+        if candidates.iter().any(|candidate| candidate.connectable) {
+            return kind;
+        }
+        if candidates
+            .iter()
+            .any(|candidate| candidate.state == "cdp-disabled")
+        {
+            return "cdp-disabled";
+        }
+        if candidates.iter().any(|candidate| candidate.stale) {
+            return "stale-port";
+        }
+        if candidates.is_empty() {
+            return "browser-not-running";
+        }
+        kind
     }
 
     fn reattach_same_target(&mut self) -> Result<Value> {
@@ -3097,7 +3333,8 @@ impl BrowserSession {
                         }
                     }
                 }
-                let final_error_kind = classify_browser_error(&message);
+                let final_error_kind =
+                    self.normalize_local_connectivity_error(classify_browser_error(&message));
                 self.last_error = Some(message.clone());
                 self.last_error_kind = Some(final_error_kind.to_string());
                 if should_drop_browser_connection(final_error_kind) {
@@ -3111,12 +3348,73 @@ impl BrowserSession {
     }
 
     fn attach_first_page(&mut self) -> Result<()> {
-        let targets = self.targets()?;
-        let target_id = targets
-            .iter()
-            .find(|target| is_real_page_target(target))
-            .and_then(|target| target.get("targetId").and_then(Value::as_str))
-            .map(ToOwned::to_owned);
+        let preferred_marker = self.preferred_target_marker.clone();
+        let mut attached_profile_marker = false;
+        let mut attached_launched_profile = false;
+        let mut attached_browser_context_id = None;
+        let mut attached_profile_id = None;
+        let target_id = if let Some(marker) = preferred_marker.as_deref() {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut target_info = None;
+            while Instant::now() < deadline {
+                let targets = self.targets()?;
+                target_info = targets
+                    .into_iter()
+                    .find(|target| target_url_contains_marker(target, marker));
+                if target_info.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            match target_info {
+                Some(target_info) => {
+                    self.preferred_target_marker = None;
+                    attached_profile_marker = true;
+                    attached_profile_id = self.preferred_profile_id.take();
+                    attached_browser_context_id = target_info
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    target_info
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                }
+                None => {
+                    bail!(
+                        "selected Chrome profile target did not appear; refusing to attach to an arbitrary existing profile"
+                    );
+                }
+            }
+        } else {
+            let targets = self.targets()?;
+            let launched_profile_id = self.preferred_profile_id.take();
+            let target_info = if launched_profile_id.is_some() {
+                targets
+                    .iter()
+                    .find(|target| is_page_target(target) && !is_profile_marker_target(target))
+                    .cloned()
+            } else {
+                targets
+                    .iter()
+                    .find(|target| is_real_page_target(target))
+                    .cloned()
+            };
+            if launched_profile_id.is_some() {
+                attached_profile_id = launched_profile_id;
+                attached_browser_context_id = target_info
+                    .as_ref()
+                    .and_then(|target| target.get("browserContextId"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                attached_launched_profile = attached_profile_id.is_some();
+            }
+            target_info
+                .as_ref()
+                .and_then(|target| target.get("targetId"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        };
         let target_id = match target_id {
             Some(target_id) => target_id,
             None => self
@@ -3126,21 +3424,115 @@ impl BrowserSession {
                 .ok_or_else(|| anyhow!("Target.createTarget response missing targetId"))?
                 .to_string(),
         };
+        if attached_profile_id.is_some() && attached_browser_context_id.is_none() {
+            attached_browser_context_id = self
+                .targets()
+                .ok()
+                .and_then(|targets| {
+                    targets.into_iter().find(|target| {
+                        target.get("targetId").and_then(Value::as_str) == Some(target_id.as_str())
+                    })
+                })
+                .and_then(|target| {
+                    target
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+            attached_launched_profile = true;
+        }
         let session_id = self.attach_target(&target_id)?;
         self.current_target_id = Some(target_id);
         self.current_session_id = Some(session_id);
+        if attached_profile_marker || attached_launched_profile {
+            self.preferred_browser_context_id = attached_browser_context_id.clone();
+            self.active_local_profile_id = attached_profile_id;
+        } else {
+            self.clear_local_profile_context();
+        }
         let _ = self.cdp_current("Runtime.enable", json!({}));
         let _ = self.cdp_current("Page.enable", json!({}));
+        if attached_profile_marker {
+            let current_target = self.current_target_id.clone();
+            self.close_profile_marker_targets(
+                attached_browser_context_id.as_deref(),
+                current_target.as_deref(),
+            );
+        }
         Ok(())
     }
 
     fn attach_first_page_with_deadline(&mut self, deadline: Instant) -> Result<()> {
-        let targets = self.targets_with_deadline(deadline)?;
-        let target_id = targets
-            .iter()
-            .find(|target| is_real_page_target(target))
-            .and_then(|target| target.get("targetId").and_then(Value::as_str))
-            .map(ToOwned::to_owned);
+        let preferred_marker = self.preferred_target_marker.clone();
+        let mut attached_profile_marker = false;
+        let mut attached_launched_profile = false;
+        let mut attached_browser_context_id = None;
+        let mut attached_profile_id = None;
+        let target_id = if let Some(marker) = preferred_marker.as_deref() {
+            let mut target_info = None;
+            while Instant::now() < deadline {
+                let targets = self.targets_with_deadline(deadline)?;
+                target_info = targets
+                    .into_iter()
+                    .find(|target| target_url_contains_marker(target, marker));
+                if target_info.is_some() {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                thread::sleep(remaining.min(Duration::from_millis(150)));
+            }
+            match target_info {
+                Some(target_info) => {
+                    self.preferred_target_marker = None;
+                    attached_profile_marker = true;
+                    attached_profile_id = self.preferred_profile_id.take();
+                    attached_browser_context_id = target_info
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    target_info
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                }
+                None => {
+                    bail!(
+                        "selected Chrome profile target did not appear; refusing to attach to an arbitrary existing profile"
+                    );
+                }
+            }
+        } else {
+            let targets = self.targets_with_deadline(deadline)?;
+            let launched_profile_id = self.preferred_profile_id.take();
+            let target_info = if launched_profile_id.is_some() {
+                targets
+                    .iter()
+                    .find(|target| is_page_target(target) && !is_profile_marker_target(target))
+                    .cloned()
+            } else {
+                targets
+                    .iter()
+                    .find(|target| is_real_page_target(target))
+                    .cloned()
+            };
+            if launched_profile_id.is_some() {
+                attached_profile_id = launched_profile_id;
+                attached_browser_context_id = target_info
+                    .as_ref()
+                    .and_then(|target| target.get("browserContextId"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                attached_launched_profile = attached_profile_id.is_some();
+            }
+            target_info
+                .as_ref()
+                .and_then(|target| target.get("targetId"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        };
         let target_id = match target_id {
             Some(target_id) => target_id,
             None => self
@@ -3155,12 +3547,94 @@ impl BrowserSession {
                 .ok_or_else(|| anyhow!("Target.createTarget response missing targetId"))?
                 .to_string(),
         };
+        if attached_profile_id.is_some() && attached_browser_context_id.is_none() {
+            attached_browser_context_id = self
+                .targets_with_deadline(deadline)
+                .ok()
+                .and_then(|targets| {
+                    targets.into_iter().find(|target| {
+                        target.get("targetId").and_then(Value::as_str) == Some(target_id.as_str())
+                    })
+                })
+                .and_then(|target| {
+                    target
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+            attached_launched_profile = true;
+        }
         let session_id = self.attach_target_with_deadline(&target_id, deadline)?;
         self.current_target_id = Some(target_id);
         self.current_session_id = Some(session_id);
+        if attached_profile_marker || attached_launched_profile {
+            self.preferred_browser_context_id = attached_browser_context_id.clone();
+            self.active_local_profile_id = attached_profile_id;
+        } else {
+            self.clear_local_profile_context();
+        }
         let _ = self.cdp_current_with_deadline("Runtime.enable", json!({}), deadline);
         let _ = self.cdp_current_with_deadline("Page.enable", json!({}), deadline);
+        if attached_profile_marker {
+            let current_target = self.current_target_id.clone();
+            self.close_profile_marker_targets(
+                attached_browser_context_id.as_deref(),
+                current_target.as_deref(),
+            );
+        }
         Ok(())
+    }
+
+    fn close_profile_marker_targets(
+        &mut self,
+        browser_context_id: Option<&str>,
+        keep_target_id: Option<&str>,
+    ) {
+        let Ok(targets) = self.targets() else {
+            return;
+        };
+        for target in targets {
+            if !is_profile_marker_target(&target) {
+                continue;
+            }
+            if browser_context_id.is_some()
+                && target.get("browserContextId").and_then(Value::as_str) != browser_context_id
+            {
+                continue;
+            }
+            let Some(target_id) = target.get("targetId").and_then(Value::as_str) else {
+                continue;
+            };
+            if Some(target_id) == keep_target_id {
+                continue;
+            }
+            let _ = self.cdp("Target.closeTarget", None, json!({ "targetId": target_id }));
+        }
+    }
+
+    fn close_remote_debugging_setup_targets(&mut self) {
+        let Ok(targets) = self.targets() else {
+            return;
+        };
+        let current_target_id = self.current_target_id.clone();
+        for target in targets {
+            if !is_remote_debugging_setup_target(&target) {
+                continue;
+            }
+            let Some(target_id) = target.get("targetId").and_then(Value::as_str) else {
+                continue;
+            };
+            if current_target_id.as_deref() == Some(target_id) {
+                continue;
+            }
+            let _ = self.cdp("Target.closeTarget", None, json!({ "targetId": target_id }));
+        }
+    }
+
+    fn clear_local_profile_context(&mut self) {
+        self.preferred_profile_id = None;
+        self.active_local_profile_id = None;
+        self.preferred_browser_context_id = None;
     }
 
     fn cdp_current(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -3671,6 +4145,8 @@ fn classify_browser_error(message: &str) -> &'static str {
         "cdp-command-error"
     } else if lower.contains("browser is not connected") {
         "browser-disconnected"
+    } else if lower.contains("selected chrome profile target did not appear") {
+        "profile-target-missing"
     } else if lower.contains("connection refused")
         || lower.contains("couldn't connect to server")
         || lower.contains("unable to connect")
@@ -3849,7 +4325,9 @@ fn browser_issue_diagnosis(
         "permission-blocked" => (
             "Chrome rejected browser control.",
             "The browser endpoint returned a permission or 403 error for CDP control.",
-            status_next_step.unwrap_or("Run browser local setup, then reconnect.").to_string(),
+            status_next_step
+                .unwrap_or("Ask the user to click Allow in Chrome's 'Allow remote debugging?' popup, then reconnect.")
+                .to_string(),
             false,
             false,
         ),
@@ -3906,7 +4384,10 @@ fn browser_issue_diagnosis(
 }
 
 fn should_drop_browser_connection(error_kind: &str) -> bool {
-    matches!(error_kind, "browser-closed" | "websocket-dropped")
+    matches!(
+        error_kind,
+        "browser-closed" | "websocket-dropped" | "stale-port" | "browser-not-running"
+    )
 }
 
 fn is_cdp_command_error(message: &str) -> bool {
@@ -3950,15 +4431,24 @@ fn local_connect_error_reason(kind: &str, raw_error: &str) -> String {
             "Chrome exposed a local CDP endpoint, but attaching to a page timed out before browser control was usable.".to_string()
         }
         "target-gone" => "The previous browser tab target is gone.".to_string(),
+        "profile-target-missing" => {
+            "The selected Chrome profile window did not expose the expected tab target. Chrome may have ignored the requested profile because another profile window is already running.".to_string()
+        }
         _ => format!("Local browser CDP connection failed: {raw_error}"),
     }
 }
 
 fn local_connect_next_step(kind: &str) -> &'static str {
     match kind {
-        "permission-blocked" | "cdp-disabled" => "browser local setup",
+        "permission-blocked" => {
+            "Ask the user to click Allow in Chrome's 'Allow remote debugging?' popup, then run browser connect local"
+        }
+        "cdp-disabled" => "browser local setup",
         "browser-closed" => "Open Chrome with the selected profile, then run browser connect local",
         "browser-connect-timeout" => "browser recover reconnect-websocket",
+        "profile-target-missing" => {
+            "Close other Chrome profile windows or manually open the selected Chrome profile, then run browser connect local again"
+        }
         "target-gone" => "Use browser_script list_tabs()/switch_tab(...) or open a new tab",
         _ => "browser doctor --json",
     }
@@ -5907,7 +6397,26 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                 .get("method")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("bridge cdp request missing method"))?;
-            let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+            let mut params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+            if let Some(browser_context_id) = session.preferred_browser_context_id.clone() {
+                if method == "Target.createTarget" {
+                    match params.get("browserContextId").and_then(Value::as_str) {
+                        Some(requested) if requested != browser_context_id => {
+                            bail!(
+                                "refusing to create a target in a different Chrome profile context"
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            params["browserContextId"] = Value::String(browser_context_id);
+                        }
+                    }
+                } else if method == "Target.attachToTarget" {
+                    if let Some(target_id) = params.get("targetId").and_then(Value::as_str) {
+                        ensure_target_browser_context(session, target_id, &browser_context_id)?;
+                    }
+                }
+            }
             let session_id = request.get("session_id").and_then(Value::as_str);
             let use_browser_session = session_id.is_none() && !method.starts_with("Target.");
             let current_session = session.current_session_id.clone();
@@ -5935,6 +6444,9 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                         .and_then(Value::as_str)
                         .ok_or_else(|| anyhow!("set_session requires target_id"))?
                         .to_string();
+                    if let Some(browser_context_id) = session.preferred_browser_context_id.clone() {
+                        ensure_target_browser_context(session, &target_id, &browser_context_id)?;
+                    }
                     session.current_session_id = Some(session_id.clone());
                     session.current_target_id = Some(target_id.clone());
                     session.connection_generation += 1;
@@ -7295,7 +7807,10 @@ fn attach_inline_window_stitch(run: &mut BrowserScriptRun, output: &mut BrowserS
 }
 
 fn is_real_page_target(target: &Value) -> bool {
-    if target.get("type").and_then(Value::as_str) != Some("page") {
+    if !is_page_target(target) {
+        return false;
+    }
+    if is_profile_marker_target(target) {
         return false;
     }
     let url = target.get("url").and_then(Value::as_str).unwrap_or("");
@@ -7344,6 +7859,58 @@ fn cdp_target_summary(target: &Value) -> Value {
         "title": target.get("title").and_then(Value::as_str),
         "url": target.get("url").and_then(Value::as_str),
     })
+}
+
+fn is_page_target(target: &Value) -> bool {
+    target.get("type").and_then(Value::as_str) == Some("page")
+}
+
+fn target_url_contains_marker(target: &Value, marker: &str) -> bool {
+    is_profile_marker_target(target)
+        && target
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.contains(marker))
+}
+
+fn is_profile_marker_target(target: &Value) -> bool {
+    target.get("type").and_then(Value::as_str) == Some("page")
+        && target
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.contains("browser-use-profile-target"))
+}
+
+fn is_remote_debugging_setup_target(target: &Value) -> bool {
+    target.get("type").and_then(Value::as_str) == Some("page")
+        && target
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.starts_with("chrome://inspect/#remote-debugging"))
+}
+
+fn ensure_target_browser_context(
+    session: &mut BrowserSession,
+    target_id: &str,
+    expected_browser_context_id: &str,
+) -> Result<()> {
+    let targets = session.targets()?;
+    let Some(target) = targets.iter().find(|target| {
+        target
+            .get("targetId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id == target_id)
+    }) else {
+        bail!("target {target_id} no longer exists");
+    };
+    let Some(actual_browser_context_id) = target.get("browserContextId").and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    if actual_browser_context_id != expected_browser_context_id {
+        bail!("refusing to switch to a target from a different Chrome profile context");
+    }
+    Ok(())
 }
 
 fn browser_help() -> &'static str {
@@ -7873,6 +8440,36 @@ mod tests {
     }
 
     #[test]
+    fn clearing_local_profile_context_drops_stale_profile_lock() {
+        let mut session = BrowserSession::default();
+        session.preferred_profile_id = Some("google-chrome:Default".to_string());
+        session.active_local_profile_id = Some("google-chrome:Default".to_string());
+        session.preferred_browser_context_id = Some("context-1".to_string());
+
+        session.clear_local_profile_context();
+
+        assert_eq!(session.preferred_profile_id, None);
+        assert_eq!(session.active_local_profile_id, None);
+        assert_eq!(session.preferred_browser_context_id, None);
+    }
+
+    #[test]
+    fn remote_debugging_setup_target_matches_inspect_page_only() {
+        assert!(is_remote_debugging_setup_target(&json!({
+            "type": "page",
+            "url": "chrome://inspect/#remote-debugging",
+        })));
+        assert!(!is_remote_debugging_setup_target(&json!({
+            "type": "page",
+            "url": "chrome://inspect/#devices",
+        })));
+        assert!(!is_remote_debugging_setup_target(&json!({
+            "type": "page",
+            "url": "https://example.com",
+        })));
+    }
+
+    #[test]
     fn disconnected_external_local_chrome_requires_explicit_reconnect() {
         let mut session = BrowserSession::default();
         session.mode = BrowserMode::Local;
@@ -7941,10 +8538,7 @@ mod tests {
     fn local_permission_handshake_wait_is_not_websocket_drop() {
         let message = "connect CDP websocket ws://127.0.0.1:9222/devtools/browser/abc: Interrupted handshake (WouldBlock)";
         assert_eq!(classify_browser_error(message), "permission-blocked");
-        assert_eq!(
-            local_connect_next_step("permission-blocked"),
-            "browser local setup"
-        );
+        assert!(local_connect_next_step("permission-blocked").contains("Allow remote debugging"));
     }
 
     #[test]
@@ -8490,6 +9084,136 @@ print("navigation helpers do not auto wait")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("navigation helpers do not auto wait"));
+    }
+
+    #[test]
+    fn browser_script_new_tab_preserves_current_browser_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-new-tab-browser-context",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+
+def cdp(method, session_id=None, **params):
+    calls.append((method, params))
+    if method == "Target.getTargets":
+        return {"targetInfos": [{
+            "targetId": "current-target",
+            "type": "page",
+            "url": "data:text/html,<title>marker</title>",
+            "browserContextId": "ctx-selected-profile",
+        }]}
+    if method == "Target.createTarget":
+        assert params.get("browserContextId") == "ctx-selected-profile", calls
+        return {"targetId": "new-target"}
+    if method == "Target.activateTarget":
+        return {}
+    if method == "Target.attachToTarget":
+        return {"sessionId": "session-new"}
+    raise AssertionError((method, params))
+
+def _send_meta(meta, **params):
+    if meta == "current_tab":
+        return {"targetId": "current-target", "sessionId": "session-current", "url": "data:text/html,<title>marker</title>"}
+    assert meta == "set_session", (meta, params)
+    return {"ok": True}
+
+new_tab()
+print("new_tab preserved browser context")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("new_tab preserved browser context"));
+    }
+
+    #[test]
+    fn browser_script_list_tabs_filters_to_current_browser_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-list-tabs-browser-context",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+def cdp(method, session_id=None, **params):
+    if method == "Target.getTargets":
+        return {"targetInfos": [
+            {
+                "targetId": "selected-target",
+                "type": "page",
+                "title": "Selected",
+                "url": "https://selected.example",
+                "browserContextId": "ctx-selected-profile",
+            },
+            {
+                "targetId": "other-target",
+                "type": "page",
+                "title": "Other",
+                "url": "https://other.example",
+                "browserContextId": "ctx-other-profile",
+            },
+        ]}
+    raise AssertionError((method, params))
+
+def _send_meta(meta, **params):
+    assert meta == "current_tab", (meta, params)
+    return {"targetId": "selected-target", "sessionId": "session-current", "url": "https://selected.example"}
+
+tabs = list_tabs()
+assert [tab["targetId"] for tab in tabs] == ["selected-target"], tabs
+all_tabs = list_tabs(include_other_contexts=True)
+assert {tab["targetId"] for tab in all_tabs} == {"selected-target", "other-target"}, all_tabs
+print("list_tabs filters to current browser context")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("list_tabs filters to current browser context"));
+    }
+
+    #[test]
+    fn browser_script_current_tab_tolerates_target_list_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-current-tab-target-list-error",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+def cdp(method, session_id=None, **params):
+    if method == "Target.getTargets":
+        raise RuntimeError("target list unavailable")
+    raise AssertionError((method, params))
+
+def _send_meta(meta, **params):
+    assert meta == "current_tab", (meta, params)
+    return {
+        "targetId": "target-1",
+        "sessionId": "session-1",
+        "url": "https://example.test",
+        "title": "Example",
+    }
+
+tab = current_tab()
+assert tab["targetId"] == "target-1", tab
+assert "browserContextId" not in tab, tab
+print("current_tab tolerates target list errors")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("current_tab tolerates target list errors"));
     }
 
     #[test]

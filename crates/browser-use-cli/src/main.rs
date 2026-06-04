@@ -525,6 +525,13 @@ enum ConfigCommand {
     Init,
     Show,
     Set { key: String, value: String },
+    Reset { target: ConfigResetTarget },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ConfigResetTarget {
+    Onboarding,
+    Profile,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3086,6 +3093,20 @@ fn config(
         ConfigCommand::Set { key, value } => {
             store.set_setting(&key, &value)?;
             println!("{key}={value}");
+            Ok(())
+        }
+        ConfigCommand::Reset { target } => {
+            match target {
+                ConfigResetTarget::Onboarding => {
+                    store.set_setting("setup.complete", "0")?;
+                    println!("reset onboarding");
+                }
+                ConfigResetTarget::Profile => {
+                    store.delete_setting("browser.preference.profile")?;
+                    store.delete_setting("browser.preference.profile_label")?;
+                    println!("reset profile");
+                }
+            }
             Ok(())
         }
     }

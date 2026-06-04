@@ -31,8 +31,8 @@ use super::{
     collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
     format_goal_tokens_compact, goal_command_hint, goal_status_label,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
-    CookieSyncStatus, FeedbackCategory, FeedbackStep, MessageActionKind, ModelSearchEntry,
-    ProductState, SetupResultKind, Surface,
+    CookieSyncStatus, DefaultProfileStatus, FeedbackCategory, FeedbackStep, MessageActionKind,
+    ModelSearchEntry, ProductState, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -523,7 +523,7 @@ fn main_bottom_height_for(
         Surface::Model | Surface::History | Surface::Messages => {
             area.height.saturating_sub(2).max(6)
         }
-        Surface::BrowserSelect | Surface::CookieSync => 22,
+        Surface::BrowserSelect | Surface::DefaultProfile | Surface::CookieSync => 22,
         _ => 18,
     };
     // Add room for the surface header, footer, borders, and content margins.
@@ -1378,6 +1378,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
+        Surface::DefaultProfile => ("Profile", "Choose the default local Chrome profile"),
         Surface::CookieSync => (
             "Cookie Sync",
             "Import local browser cookies to Browser Use Cloud",
@@ -1400,7 +1401,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
 /// one-line description — the shared chrome for every dropdown/settings view.
 fn surface_header_lines(surface: Surface, width: u16) -> Vec<Line<'static>> {
     let (title, description) = surface_heading(surface);
-    let indent = if surface == Surface::CookieSync {
+    let indent = if matches!(surface, Surface::CookieSync | Surface::DefaultProfile) {
         String::new()
     } else {
         " ".repeat(CONTENT_HORIZONTAL_MARGIN as usize)
@@ -1488,6 +1489,7 @@ fn surface_lines(
         Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
+        Surface::DefaultProfile => default_profile_lines(app, width),
         Surface::CookieSync => cookie_sync_lines(app, width),
         Surface::Context => context_lines(app, state, width),
         Surface::Goal => goal_lines(app),
@@ -1652,7 +1654,8 @@ fn composer_bottom_border(width: u16, app: &App) -> Line<'static> {
     }
     let inner_w = width.saturating_sub(2) as usize;
     let mut spans: Vec<Span<'static>> = vec![Span::styled("╰", border())];
-    let browser = app.browser.trim();
+    let browser = app.browser_status_label();
+    let browser = browser.trim();
     if !browser.is_empty() {
         // ` browser ` with one cell of dash padding on each side, so the
         // background dashes hug right up to the spaces around the tag.
@@ -3387,6 +3390,61 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             lines.push(selected("Close", 0, app.selected_row));
         }
         CookieSyncStatus::Failed(error) => {
+            lines.push(Line::from(Span::styled("Failed", bold())));
+            lines.push(Line::from(""));
+            push_wrapped_cookie_sync_message(&mut lines, error, body_width);
+            lines.push(Line::from(""));
+            lines.push(selected("Close", 0, app.selected_row));
+        }
+    }
+    lines
+}
+
+pub(crate) fn default_profile_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let body_width = cookie_sync_body_width(width);
+    let mut lines = vec![
+        Line::from(Span::styled("LOCAL CHROME", muted())),
+        Line::from(""),
+    ];
+    match &app.default_profile.status {
+        DefaultProfileStatus::Loading => {
+            lines.push(Line::from("  Scanning local Chromium profiles..."));
+        }
+        DefaultProfileStatus::Ready => {
+            let current = app
+                .default_profile
+                .current_profile_id
+                .as_deref()
+                .and_then(|current| {
+                    app.default_profile
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.id == current)
+                        .map(crate::human_profile_label)
+                })
+                .unwrap_or_else(|| "not set".to_string());
+            lines.push(kv_line("default", &current));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("LOCAL PROFILES", muted())));
+            lines.push(Line::from(""));
+            if app.default_profile.profiles.is_empty() {
+                lines.push(Line::from("  No local Chromium profiles found."));
+            } else {
+                for (idx, profile) in app.default_profile.profiles.iter().enumerate() {
+                    let mut label = truncate(&crate::human_profile_label(profile), body_width);
+                    if app
+                        .default_profile
+                        .current_profile_id
+                        .as_deref()
+                        .is_some_and(|current| current == profile.id)
+                    {
+                        label.push_str("  current");
+                    }
+                    lines.push(selected(&label, idx, app.selected_row));
+                }
+            }
+        }
+        DefaultProfileStatus::Failed(error) => {
             lines.push(Line::from(Span::styled("Failed", bold())));
             lines.push(Line::from(""));
             push_wrapped_cookie_sync_message(&mut lines, error, body_width);
