@@ -380,7 +380,6 @@ def goto_url(url):
         if skills:
             __last_domain_skills = [{"url": url, **skill} for skill in skills]
             result = {**result, "domain_skills": __last_domain_skills}
-    wait_for_load(timeout=15)
     return result
 
 
@@ -520,7 +519,7 @@ def _timeout_seconds(timeout):
     return min(timeout, 60.0)
 
 
-def wait_for_load(timeout=15.0):
+def wait_for_load(timeout=3.0):
     timeout = _timeout_seconds(timeout)
     deadline = _time.time() + timeout
     while _time.time() < deadline:
@@ -533,7 +532,7 @@ def wait_for_load(timeout=15.0):
     return False
 
 
-def wait_for_element(selector, timeout=10.0, visible=False):
+def wait_for_element(selector, timeout=3.0, visible=False):
     timeout = _timeout_seconds(timeout)
     if visible:
         check = (
@@ -554,7 +553,7 @@ def wait_for_element(selector, timeout=10.0, visible=False):
     return False
 
 
-def wait_for_network_idle(timeout=10.0, idle_ms=500):
+def wait_for_network_idle(timeout=3.0, idle_ms=500):
     timeout = _timeout_seconds(timeout)
     deadline = _time.time() + timeout
     last_activity = _time.time()

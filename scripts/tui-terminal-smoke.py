@@ -154,6 +154,13 @@ def assert_no_stripped_line(text: str, expected: str, context: str) -> None:
         raise AssertionError(f"{context}: unexpected stripped line {expected!r}\n\n{text}")
 
 
+def assert_no_command_row(text: str, command: str, context: str) -> None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == command or stripped.startswith(f"{command} "):
+            raise AssertionError(f"{context}: unexpected command row {command!r}\n\n{text}")
+
+
 def assert_count(text: str, needle: str, expected: int, context: str) -> None:
     count = text.count(needle)
     if count != expected:
@@ -539,12 +546,20 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_contains(palette, "/task", "slash palette should show the first product action")
         assert_contains(palette, "/profile", "slash palette should expose the default profile setting")
         assert_contains(palette, "/model", "slash palette should show the model command in the visible window")
+        assert_not_contains(palette, "choose collaboration mode", "slash palette should not expose collaboration mode")
+        assert_not_contains(palette, "/plan", "slash palette should not expose Plan mode")
         assert_contains(palette, "↑↓ navigate", "slash palette footer should be visible")
-        assert_not_contains(palette, "/mode ", "slash palette should not expose collaboration mode")
+        assert_no_command_row(palette, "/mode", "slash palette should not expose collaboration mode")
         assert_not_contains(palette, "/plan", "slash palette should not expose Plan mode")
         assert_not_contains(palette, "/auth", "slash palette overflows extra actions into filtering")
         assert_not_contains(palette, "filter actions", "slash palette should not show a redundant filter prompt")
         assert_first_content_near_top(palette, 2, "slash palette should not be pushed down by previous viewport state")
+        tmux_send_literal(session, "goal")
+        goal_actions = wait_for(session, "> goal", "slash-palette-goal-filtered")
+        assert_contains(goal_actions, "/goal", "slash palette should find goal management through filtering")
+        assert_not_contains(goal_actions, "/model", "slash palette should hide non-matching model command")
+        tmux_send(session, "C-u")
+        wait_for(session, "/model", "slash-palette-filter-cleared-after-goal")
         tmux_send_literal(session, "auth")
         auth_actions = wait_for(session, "> auth", "slash-palette-auth-filtered")
         assert_contains(auth_actions, "/auth", "slash palette should find auth through filtering")
@@ -566,13 +581,14 @@ def smoke_interactive_terminal(binary: Path) -> None:
         model = wait_for(session, "Pick a recommended model or choose a provider", "model-panel")
         assert_contains(model, "recommended", "model surface should show recommended models")
         assert_contains(model, "providers", "model surface should show provider rows")
-        assert_contains(model, "OpenRouter", "model surface should show provider choices")
+        assert_contains(model, "OpenRouter · API key", "model surface should show provider auth rows")
+        assert_contains(model, "DeepSeek · API key", "model surface should show all visible provider rows")
         assert_contains(model, "Enter:select", "model surface footer should be visible")
         assert_first_content_near_top(model, 2, "model surface should not be rendered in the compact dock")
         tmux_send(session, "Escape")
         after_model = capture_after_idle(session, "main-after-model-surface", visible_only=True)
         assert_contains(after_model, "Type to steer the agent", "model escape should restore main composer")
-        assert_not_contains(after_model, "Pick a recommended model", "model escape should close the overlay")
+        assert_not_contains(after_model, "Pick a recommended model or choose a provider", "model escape should close the overlay")
         tmux_send(session, "F2")
         browser = wait_for(session, "Current browser", "browser-panel")
         assert_count(browser, "Current browser", 1, "browser panel should be live, not appended repeatedly")
@@ -917,17 +933,33 @@ def smoke_tall_terminal_keeps_running_controls_attached_to_content(binary: Path)
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
-def smoke_double_escape_opens_message_selector(binary: Path) -> None:
-    session = f"but-smoke-esc-stop-{os.getpid()}"
-    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-stop-"))
+def smoke_escape_pauses_running_session(binary: Path) -> None:
+    session = f"but-smoke-esc-pause-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-pause-"))
     try:
         start_session(session, binary, state_dir)
         wait_for(session, "Type to steer the agent", "double-escape-running")
         tmux_send(session, "Escape")
-        stopped = wait_for(session, "stopped", "escape-stopped-running-task")
-        assert_contains(stopped, "Progress is saved in history", "single escape should stop the active task")
-        assert_no_legacy_dashboard_chrome(stopped, "escape stop should not restore old dashboard chrome")
-        assert_not_contains(stopped, "^[[", "escape stop should not leak escape sequences")
+        paused = wait_for(
+            session,
+            "What should the model do differently? If something went wrong, please use /feedback :)",
+            "escape-paused",
+        )
+        assert_contains(paused, "Ask a follow-up", "paused session should restore follow-up composer")
+        assert_contains(paused, "• Conversation paused", "single escape should commit a paused transcript row")
+        assert_not_contains(paused, "Conversation paused -", "paused session should not duplicate the title in detail copy")
+        assert_not_contains(paused, "Session paused", "paused session should use conversation copy")
+        assert_not_contains(paused, "Previous work", "paused session should not show redundant history action")
+        assert_not_contains(paused, "Start a new task", "paused session should not show redundant next actions")
+        assert_not_contains(paused, "esc again to edit messages", "single escape should not arm message selector")
+        assert_not_contains(paused, "^[[", "escape pause should not leak escape sequences")
+        with sqlite3.connect(state_dir / "state.db") as conn:
+            paused_count = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE type = 'session.cancelled' "
+                "AND payload_json LIKE '%\"reason\":\"session paused\"%'"
+            ).fetchone()[0]
+        if paused_count != 1:
+            raise AssertionError(f"expected one paused cancellation event, saw {paused_count}")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -1962,7 +1994,7 @@ def main() -> int:
     smoke_ready_resize_does_not_leave_stale_frames(binary)
     smoke_history_selection_emits_native_transcript(binary)
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
-    smoke_double_escape_opens_message_selector(binary)
+    smoke_escape_pauses_running_session(binary)
     smoke_escape_reclaims_prompt_before_output(binary)
     smoke_tab_queues_followup_after_current_turn(binary)
     smoke_enter_previews_followup_after_next_tool(binary)

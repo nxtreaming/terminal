@@ -39,9 +39,9 @@ type_text(text)
 press_key(key, modifiers=0)  # accepts chords like "Meta+A"; modifiers: Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8
 scroll(x=0, y=600)
 
-wait_for_load(timeout=10)
-wait_for_element(selector, timeout=10)
-wait_for_network_idle(timeout=10)
+wait_for_load(timeout=3)
+wait_for_element(selector, timeout=3, visible=False)
+wait_for_network_idle(timeout=3)
 
 current_tab()
 list_tabs()
@@ -67,11 +67,12 @@ last_domain_skills(include_content=False)
 
 Usage guidance:
 
-- First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url(url)` mutates the current controlled tab.
+- First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url(url)` mutates the current controlled tab. `new_tab(url)` and `goto_url(url)` have zero implicit wait: they send the CDP navigation command and then return without waiting for readyState, network idle, selectors, paint, or sleeps. If you chain more work in the same script after navigation, explicitly wait or poll before reading/clicking. If navigation is the last action before yielding to the model, the LLM call itself may provide enough elapsed time; the next call must still inspect state before assuming the page loaded.
 - Keep keyboard semantics browser-harness/Rod aligned: `press_key(...)` simulates physical keys or shortcuts, while `type_text(...)` inserts/pastes text into the focused element with `Input.insertText`.
 - For React/Vue/Svelte/controlled inputs, prefer `fill_input(selector, text)` over direct DOM value assignment. It focuses the element, clears with Cmd/Ctrl+A plus Backspace, types through physical key events, then fires final `input`/`change` events.
 - Do not combine `Input.dispatchKeyEvent` carrying printable `text` with a manual `char` event for the same character; that double-inserts text in Chrome.
 - If the task is site-specific, call `domain_skills_for_url(url, include_content=True)` before inventing selectors, private API routes, or flows. `goto_url(url)` also returns matching `domain_skills` metadata when a skill root is available.
+- Be patient with loading pages by making several cheap observations, not one long blind wait. Prefer short waits such as `wait_for_load(1)`, `wait_for_element(selector, timeout=2)`, or `wait_for_network_idle(2)`, then inspect again. If a wait returns false, that is not a task failure; inspect the current page and continue from the best available state or decide whether it is stuck.
 - Use screenshots as labeled temporal checkpoints: initial load, before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and final verification.
 - The common screenshot call is `screenshot(label)`, for example `screenshot("before_submit")`.
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.
@@ -109,8 +110,12 @@ emit_output(rows, label="employee_rows")
 - Use `js(function_source, *args)` when passing JSON-serializable Python values into JavaScript; use `target_id=` as a keyword for iframe targets.
 - For real user forms, act like a browser user: screenshot, click the visible field/control, type with `type_text(...)`, `press_key(...)`, or `fill_input(...)`, then screenshot or otherwise verify. Use coordinate clicks for checkboxes, radios, buttons, dropdowns, and custom controls. Do not assign `element.value`, `element.checked`, `selectedIndex`, React private state, or MutationObserver restore loops on live forms. Do not synthesize `input`, `change`, `click`, or keyboard events in page JavaScript to make a form look filled. Those anti-patterns can desynchronize framework state from the visible DOM.
 - Use `http_get(...)` for static pages and APIs after the browser reveals stable endpoints. It returns the response body as a string by default, or bytes with `binary=True`; the returned body also exposes `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. If direct HTTP hits bot or login protection, retry with site-specific headers/cookies, `js(fetch(...))` in the browser, or the configured Browser Use fetch proxy.
+- Extract only fields needed for the task. Do not emit full profile text, full DOM text, cookies, localStorage, or entire app caches unless you are debugging and the smaller field-level extraction failed.
 - Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
 - For large structured results, write the full JSON/CSV/text to a file. If the task asks for an exact inline final format, return that content with `done(result=...)` and optionally include `result_file=path`; otherwise finish with `done(result_file=path)`.
-- For long extraction or verification loops, prefer bounded chunks with checkpoints written to files. If a chunk fails with a usable-page diagnosis, shrink the next chunk and resume from the last checkpoint.
+- For loops over multiple pages/items, emit short progress every item or every 2 seconds, whichever comes first. Progress can be a short `print(...)` line or compact `emit_output(..., label="progress")`.
+- For list/profile extraction, filter the candidate list before navigating when the list page already contains enough information, such as employee versus contractor. Do not visit rows that cannot affect the final answer.
+- Poll for record readiness, not for nullable answer fields. If the app cache or DOM record for a person exists but `birthday`, phone, address, or another optional field is missing/null, record that value as missing and continue instead of waiting for the optional field to appear.
+- For long extraction or verification loops, prefer bounded chunks with checkpoints written to files. Use one global deadline plus per-item micro timeouts; check the global deadline before every navigation, wait, and sleep. If a chunk fails with a usable-page diagnosis, shrink the next chunk and resume from the last checkpoint.
 
 Do not call runtime-management helpers here. There is no `browser_connect`, `browser_status`, `browser_doctor`, or `browser_recover` helper in this tool. Those are intentionally only in the `browser` tool so the model can reason about browser lifecycle explicitly.
