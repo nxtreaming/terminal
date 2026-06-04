@@ -157,6 +157,9 @@ const TYPEWRITER_TICK_INTERVAL: Duration = Duration::from_millis(8);
 const NO_KEY_NUDGE_TEXT: &str = "It looks like you don't have an API key set up yet. \
 You can get one free at cloud.browser-use.com and run this on DeepSeek V4 for \
 free — or add your own key with /auth.";
+pub(crate) const LOCAL_CHROME_CLOUD_PROMO_EVENT: &str = "session.cloud_promo";
+pub(crate) const LOCAL_CHROME_CLOUD_PROMO_TEXT: &str =
+    "Cloud browser: no local Chrome prompts, auto-solves captchas. [cloud.browser-use.com]";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
@@ -11316,6 +11319,39 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn cloud_promo_event_renders_as_committed_tip() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "run local task"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "local task result"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            LOCAL_CHROME_CLOUD_PROMO_EVENT,
+            serde_json::json!({"text": LOCAL_CHROME_CLOUD_PROMO_TEXT}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.args.width = 180;
+        app.args.height = 36;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("local task result"));
+        assert!(screen.contains("tip"));
+        assert!(screen.contains("Cloud browser: no local Chrome prompts"));
+        assert!(screen.contains("auto-solves captchas"));
+        assert!(screen.contains("[cloud.browser-use.com]"));
+        Ok(())
     }
 
     #[test]

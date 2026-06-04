@@ -19,8 +19,9 @@ use crate::theme::{
 use super::{
     active_followup_is_after_next_tool_call, active_followup_is_cancelled_in_events,
     active_followup_is_pending_in_events, user_input_display_text_from_payload, App,
-    PENDING_FOLLOWUP_INTERRUPT_REASON, SESSION_MAILBOX_CONTINUATION_STARTED_EVENT,
-    SESSION_PAUSED_REASON, SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
+    LOCAL_CHROME_CLOUD_PROMO_EVENT, PENDING_FOLLOWUP_INTERRUPT_REASON,
+    SESSION_MAILBOX_CONTINUATION_STARTED_EVENT, SESSION_PAUSED_REASON,
+    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
 };
 
 const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
@@ -914,6 +915,13 @@ fn committed_node_for_event(
                     source: source_for_state(state),
                 },
             })
+        }
+        LOCAL_CHROME_CLOUD_PROMO_EVENT => {
+            let text = payload_string(event, "text")?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(timeline_node(event, "tip", vec![text], NodeStyle::Muted))
         }
         "session.done" => {
             if let Some(result_file) = session_done_result_file(event, state) {

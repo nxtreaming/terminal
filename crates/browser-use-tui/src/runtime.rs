@@ -35,13 +35,16 @@ use browser_use_runtime::{
 use browser_use_store::{Store, StoreNotifier};
 
 use crate::settings::{
-    browser_use_cloud_env_key_present, AgentBackend, BROWSER_USE_CLOUD,
+    browser_use_cloud_env_key_present, AgentBackend, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
     BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
+use crate::{LOCAL_CHROME_CLOUD_PROMO_EVENT, LOCAL_CHROME_CLOUD_PROMO_TEXT};
 
 static TUI_LIVE_RUNTIMES: OnceLock<Mutex<HashMap<PathBuf, RuntimeHandle>>> = OnceLock::new();
 static TUI_RUNTIME_AGENT_EXECUTORS: OnceLock<Mutex<HashMap<PathBuf, RuntimeAgentExecutor>>> =
     OnceLock::new();
+const LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING: &str =
+    "session.cloud_promo.local_chrome_qualified_task_count";
 
 fn tui_live_runtimes() -> &'static Mutex<HashMap<PathBuf, RuntimeHandle>> {
     TUI_LIVE_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -286,8 +289,9 @@ pub(crate) fn spawn_tui_agent_run(
     config_overrides: ConfigOverrides,
     notifier: Option<StoreNotifier>,
 ) -> Result<()> {
+    let selected_browser = browser.clone();
     let (executor, config) = prepare_tui_agent_run(
-        state_dir,
+        state_dir.clone(),
         &session_id,
         backend,
         model,
@@ -304,6 +308,12 @@ pub(crate) fn spawn_tui_agent_run(
         move |completion| {
             if let Some(error) = completion.error_message() {
                 eprintln!("tui agent failed: {error}");
+                return;
+            }
+            if let Err(error) = Store::open(&state_dir).and_then(|store| {
+                maybe_append_local_chrome_cloud_promo(&store, &session_id, &selected_browser)
+            }) {
+                eprintln!("tui local Chrome cloud promo append failed: {error:#}");
             }
         },
     )?;
@@ -380,6 +390,73 @@ fn prepare_tui_agent_run(
         &mut config,
     );
     Ok((executor, config))
+}
+
+fn maybe_append_local_chrome_cloud_promo(
+    store: &Store,
+    session_id: &str,
+    browser: &str,
+) -> Result<()> {
+    if browser != BROWSER_LOCAL_CHROME || browser_use_cloud_api_key(store)?.is_some() {
+        return Ok(());
+    }
+    let events = store.events_for_session(session_id)?;
+    if !should_append_local_chrome_cloud_promo(&events) {
+        return Ok(());
+    }
+    let qualified_count = increment_local_chrome_cloud_promo_qualified_task_count(store)?;
+    if qualified_count % 5 != 1 {
+        return Ok(());
+    }
+    store.append_event(
+        session_id,
+        LOCAL_CHROME_CLOUD_PROMO_EVENT,
+        serde_json::json!({ "text": LOCAL_CHROME_CLOUD_PROMO_TEXT }),
+    )?;
+    Ok(())
+}
+
+fn increment_local_chrome_cloud_promo_qualified_task_count(store: &Store) -> Result<u64> {
+    let current = store
+        .get_setting(LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING)?
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let next = current.saturating_add(1);
+    store.set_setting(
+        LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING,
+        &next.to_string(),
+    )?;
+    Ok(next)
+}
+
+fn should_append_local_chrome_cloud_promo(events: &[browser_use_protocol::EventRecord]) -> bool {
+    let has_initial_input = events
+        .iter()
+        .any(|event| event.event_type == "session.input");
+    let has_followup = events
+        .iter()
+        .any(|event| event.event_type.starts_with("session.followup"));
+    let has_browser_connection = events
+        .iter()
+        .any(|event| event.event_type == "browser.connected");
+    let has_success = events
+        .iter()
+        .any(|event| event.event_type == "session.done");
+    let has_terminal_failure = events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "session.failed" | "session.cancelled"
+        )
+    });
+    let already_prompted = events
+        .iter()
+        .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT);
+    has_initial_input
+        && !has_followup
+        && has_browser_connection
+        && has_success
+        && !has_terminal_failure
+        && !already_prompted
 }
 
 fn browser_use_cloud_api_key(store: &Store) -> Result<Option<String>> {
@@ -907,6 +984,10 @@ fn tui_agent_options(
 mod tests {
     use super::*;
     use browser_use_agent::tools::AskForApproval;
+    use browser_use_protocol::EventRecord;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn env_value<'a>(options: &'a AgentRunOptions, key: &str) -> Option<&'a str> {
         options
@@ -914,6 +995,17 @@ mod tests {
             .iter()
             .find(|(candidate, _)| candidate == key)
             .map(|(_, value)| value.as_str())
+    }
+
+    fn event(seq: i64, event_type: &str) -> EventRecord {
+        EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "session-1".to_string(),
+            ts_ms: seq,
+            event_type: event_type.to_string(),
+            payload: serde_json::json!({}),
+        }
     }
 
     #[test]
@@ -1012,6 +1104,101 @@ mod tests {
             env_value(&options, BROWSER_USE_CLOUD_API_KEY_ENV),
             Some("bu-test")
         );
+    }
+
+    #[test]
+    fn local_chrome_cloud_promo_requires_browser_connection() {
+        let no_browser_events = vec![event(1, "session.input"), event(2, "session.done")];
+        assert!(!should_append_local_chrome_cloud_promo(&no_browser_events));
+
+        let events = vec![
+            event(1, "session.input"),
+            event(2, "browser.connected"),
+            event(3, "session.done"),
+        ];
+        assert!(should_append_local_chrome_cloud_promo(&events));
+    }
+
+    #[test]
+    fn local_chrome_cloud_promo_skips_followups_and_existing_promos() {
+        let followup_events = vec![
+            event(1, "session.input"),
+            event(2, "browser.connected"),
+            event(3, "session.done"),
+            event(4, "session.done"),
+            event(5, "session.followup"),
+        ];
+        assert!(!should_append_local_chrome_cloud_promo(&followup_events));
+
+        let already_prompted = vec![
+            event(1, "session.input"),
+            event(2, "browser.connected"),
+            event(3, "session.done"),
+            event(4, LOCAL_CHROME_CLOUD_PROMO_EVENT),
+        ];
+        assert!(!should_append_local_chrome_cloud_promo(&already_prompted));
+    }
+
+    #[test]
+    fn local_chrome_cloud_promo_appends_on_first_and_every_fifth_browser_connected_initial_success(
+    ) -> Result<()> {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned");
+        let saved = std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).ok();
+        unsafe {
+            std::env::remove_var(BROWSER_USE_CLOUD_API_KEY_ENV);
+        }
+
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let store = Store::open(temp.path())?;
+            for idx in 1..=6 {
+                let session = store.create_session(None, std::env::current_dir()?)?;
+                store.append_event(
+                    &session.id,
+                    "session.input",
+                    serde_json::json!({"text": format!("task {idx}")}),
+                )?;
+                store.append_event(
+                    &session.id,
+                    "browser.connected",
+                    serde_json::json!({"url": "https://example.com"}),
+                )?;
+                store.append_event(
+                    &session.id,
+                    "session.done",
+                    serde_json::json!({"result": "done"}),
+                )?;
+
+                maybe_append_local_chrome_cloud_promo(&store, &session.id, BROWSER_LOCAL_CHROME)?;
+                let events = store.events_for_session(&session.id)?;
+                let prompted = events
+                    .iter()
+                    .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT);
+                assert_eq!(
+                    prompted,
+                    idx == 1 || idx == 6,
+                    "unexpected prompt state at task {idx}"
+                );
+            }
+
+            assert_eq!(
+                store
+                    .get_setting(LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING)?
+                    .as_deref(),
+                Some("6")
+            );
+            Ok(())
+        })();
+
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, value);
+            }
+        }
+        result
     }
 
     #[test]
