@@ -2836,6 +2836,11 @@ impl BrowserSession {
                                 json!({ "targetId": marker_target }),
                             );
                         }
+                        let current_target = self.current_target_id.clone();
+                        self.close_profile_marker_targets(
+                            Some(&browser_context_id),
+                            current_target.as_deref(),
+                        );
                         let _ = self.cdp_current("Runtime.enable", json!({}));
                         let _ = self.cdp_current("Page.enable", json!({}));
                     } else {
@@ -2854,6 +2859,33 @@ impl BrowserSession {
             }
         }
         Ok(())
+    }
+
+    fn close_profile_marker_targets(
+        &mut self,
+        browser_context_id: Option<&str>,
+        keep_target_id: Option<&str>,
+    ) {
+        let Ok(targets) = self.targets() else {
+            return;
+        };
+        for target in targets {
+            if !is_profile_marker_target(&target) {
+                continue;
+            }
+            if browser_context_id.is_some()
+                && target.get("browserContextId").and_then(Value::as_str) != browser_context_id
+            {
+                continue;
+            }
+            let Some(target_id) = target.get("targetId").and_then(Value::as_str) else {
+                continue;
+            };
+            if Some(target_id) == keep_target_id {
+                continue;
+            }
+            let _ = self.cdp("Target.closeTarget", None, json!({ "targetId": target_id }));
+        }
     }
 
     fn clear_local_profile_context(&mut self) {
@@ -6866,11 +6898,19 @@ fn is_real_page_target(target: &Value) -> bool {
 }
 
 fn target_url_contains_marker(target: &Value, marker: &str) -> bool {
-    target.get("type").and_then(Value::as_str) == Some("page")
+    is_profile_marker_target(target)
         && target
             .get("url")
             .and_then(Value::as_str)
             .is_some_and(|url| url.contains(marker))
+}
+
+fn is_profile_marker_target(target: &Value) -> bool {
+    target.get("type").and_then(Value::as_str) == Some("page")
+        && target
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.contains("browser-use-profile-target"))
 }
 
 fn ensure_target_browser_context(
