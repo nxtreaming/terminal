@@ -3963,7 +3963,7 @@ fn sdk_browser_create(runtime: &RuntimeHandle, params: &Value) -> Result<Value> 
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
     };
-    let browser_id = runtime.browsers().create_browser(config);
+    let browser_id = runtime.create_browser(config);
     Ok(serde_json::json!({ "browser_id": browser_id.as_str() }))
 }
 
@@ -3975,7 +3975,7 @@ fn sdk_browser_close(runtime: &RuntimeHandle, params: &Value) -> Result<Value> {
             .context("browser.close requires string param `browser_id`")?
             .to_string(),
     )?;
-    runtime.browsers().close_browser(&browser_id)?;
+    runtime.close_browser(&browser_id)?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -4082,7 +4082,7 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
         .get("browser_id")
         .and_then(Value::as_str)
         .map(|browser_id| {
-            context.runtime.browsers().claim_browser(
+            context.runtime.claim_browser(
                 &BrowserId::from_string(browser_id.to_string())?,
                 agent_id.clone(),
             )
@@ -4100,7 +4100,7 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
         )
     })();
     if let Some(lease) = browser_lease.as_ref() {
-        context.runtime.browsers().release_browser(lease)?;
+        context.runtime.release_browser(lease)?;
     }
     run_result?;
 

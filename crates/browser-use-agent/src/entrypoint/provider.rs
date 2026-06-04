@@ -143,12 +143,11 @@ struct RuntimeBrowserBackend {
 impl RuntimeBrowserBackend {
     fn claim_browser(&self) -> anyhow::Result<RuntimeBrowserLease> {
         self.runtime
-            .browsers()
             .claim_browser(&self.browser_id, self.agent_id.clone())
     }
 
     fn release_browser(&self, lease: RuntimeBrowserLease) -> anyhow::Result<()> {
-        self.runtime.browsers().release_browser(&lease)
+        self.runtime.release_browser(&lease)
     }
 
     fn with_browser_lease<T>(
@@ -350,7 +349,7 @@ fn browser_backend_for_runtime_or_config(
                 &runtime_session_id,
                 &key,
                 || {
-                    let browser_id = handle.browsers().create_browser(RuntimeBrowserConfig {
+                    let browser_id = handle.create_browser(RuntimeBrowserConfig {
                         keep_alive: true,
                         headless: None,
                         profile_id: Some(session_id.as_str().to_string()),
@@ -369,10 +368,7 @@ fn browser_backend_for_runtime_or_config(
                 },
                 |resource: Arc<RuntimeBrowserBackend>| {
                     let cleaned = browser_use_browser::cleanup_session(&resource.session_id);
-                    let _ = resource
-                        .runtime
-                        .browsers()
-                        .close_browser(&resource.browser_id);
+                    let _ = resource.runtime.close_browser(&resource.browser_id);
                     cleaned
                 },
             ) {

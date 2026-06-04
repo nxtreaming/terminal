@@ -301,6 +301,11 @@ impl RuntimeEvent {
         self
     }
 
+    pub fn with_browser_id(mut self, browser_id: BrowserId) -> Self {
+        self.browser_id = Some(browser_id);
+        self
+    }
+
     pub fn with_payload(mut self, payload: Value) -> Self {
         self.payload = payload;
         self
@@ -580,6 +585,33 @@ impl BrowserManager {
             .get(browser_id)
             .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
         Ok(handle.snapshot())
+    }
+
+    pub fn validate_browser_claim(&self, browser_id: &BrowserId, agent_id: &AgentId) -> Result<()> {
+        let snapshot = self.snapshot(browser_id)?;
+        if let Some(active_agent_id) = snapshot.active_agent_id.as_ref() {
+            if active_agent_id != agent_id {
+                return Err(RuntimeError::BrowserAlreadyInUse {
+                    browser_id: browser_id.as_str().to_string(),
+                    active_agent_id: active_agent_id.as_str().to_string(),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_browser_release(&self, lease: &BrowserLease) -> Result<()> {
+        let snapshot = self.snapshot(&lease.browser_id)?;
+        match snapshot.active_agent_id.as_ref() {
+            Some(active_agent_id) if active_agent_id == &lease.agent_id => Ok(()),
+            other => Err(RuntimeError::BrowserLeaseMismatch {
+                browser_id: lease.browser_id.as_str().to_string(),
+                owner_agent_id: other.map(|id| id.as_str().to_string()),
+                caller_agent_id: lease.agent_id.as_str().to_string(),
+            }
+            .into()),
+        }
     }
 
     pub fn claim_browser(&self, browser_id: &BrowserId, agent_id: AgentId) -> Result<BrowserLease> {
@@ -2373,6 +2405,76 @@ impl RuntimeHandle {
         &self.inner.browsers
     }
 
+    pub fn create_browser(&self, config: BrowserConfig) -> BrowserId {
+        let browser_id = self.inner.browsers.create_browser(config.clone());
+        self.inner.events.publish(
+            RuntimeEvent::new(RuntimeEventKind::BrowserCreated, Durability::BestEffort)
+                .with_browser_id(browser_id.clone())
+                .with_payload(json!({
+                    "browser_id": browser_id.as_str(),
+                    "config": config,
+                    "runtime_owned": true,
+                })),
+        );
+        browser_id
+    }
+
+    pub fn claim_browser(&self, browser_id: &BrowserId, agent_id: AgentId) -> Result<BrowserLease> {
+        let thread = self.inner.agents.thread(&agent_id)?;
+        self.inner
+            .browsers
+            .validate_browser_claim(browser_id, &agent_id)?;
+        let mut event = RuntimeEvent::new(RuntimeEventKind::BrowserClaimed, Durability::Barrier)
+            .with_agent_id(agent_id.clone())
+            .with_session_id(thread.session_id.clone())
+            .with_browser_id(browser_id.clone())
+            .with_payload(json!({
+                "browser_id": browser_id.as_str(),
+                "agent_id": agent_id.as_str(),
+                "runtime_owned": true,
+            }));
+        event.root_id = Some(thread.root_id.clone());
+        self.inner.append_runtime_event(&event)?;
+        let lease = self
+            .inner
+            .browsers
+            .claim_browser(browser_id, agent_id.clone())?;
+        self.inner.events.publish(event);
+        Ok(lease)
+    }
+
+    pub fn release_browser(&self, lease: &BrowserLease) -> Result<()> {
+        let thread = self.inner.agents.thread(&lease.agent_id)?;
+        self.inner.browsers.validate_browser_release(lease)?;
+        let mut event = RuntimeEvent::new(RuntimeEventKind::BrowserReleased, Durability::Barrier)
+            .with_agent_id(lease.agent_id.clone())
+            .with_session_id(thread.session_id.clone())
+            .with_browser_id(lease.browser_id.clone())
+            .with_payload(json!({
+                "browser_id": lease.browser_id.as_str(),
+                "agent_id": lease.agent_id.as_str(),
+                "runtime_owned": true,
+            }));
+        event.root_id = Some(thread.root_id.clone());
+        self.inner.append_runtime_event(&event)?;
+        self.inner.browsers.release_browser(lease)?;
+        self.inner.events.publish(event);
+        Ok(())
+    }
+
+    pub fn close_browser(&self, browser_id: &BrowserId) -> Result<()> {
+        self.inner.browsers.close_browser(browser_id)?;
+        self.inner.events.publish(
+            RuntimeEvent::new(RuntimeEventKind::BrowserClosed, Durability::BestEffort)
+                .with_browser_id(browser_id.clone())
+                .with_payload(json!({
+                    "browser_id": browser_id.as_str(),
+                    "runtime_owned": true,
+                })),
+        );
+        Ok(())
+    }
+
     pub fn register_run(&self, session_id: SessionId) -> CancellationToken {
         self.inner.active_runs.register(session_id)
     }
@@ -4132,6 +4234,65 @@ mod tests {
             .release_browser(&wrong_lease)
             .expect_err("wrong agent must not release another agent's browser");
         assert!(err.to_string().contains("browser lease mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_browser_claim_and_release_are_barrier_journaled() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id = handle.create_browser(BrowserConfig {
+            keep_alive: true,
+            headless: Some(true),
+            profile_id: Some("sdk".to_string()),
+        });
+
+        let lease = handle.claim_browser(&browser_id, root.agent_id().clone())?;
+        assert_eq!(
+            handle.browsers().snapshot(&browser_id)?.active_agent_id,
+            Some(root.agent_id().clone())
+        );
+        handle.release_browser(&lease)?;
+        assert_eq!(
+            handle.browsers().snapshot(&browser_id)?.active_agent_id,
+            None
+        );
+
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"browser.claimed".to_string()));
+        assert!(event_types.contains(&"browser.released".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn browser_claim_barrier_failure_does_not_claim_browser() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id = handle.create_browser(BrowserConfig::default());
+        journal.fail_event_type("browser.claimed");
+
+        let err = handle
+            .claim_browser(&browser_id, root.agent_id().clone())
+            .expect_err("browser claim must fail before live ownership changes");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        assert_eq!(
+            handle.browsers().snapshot(&browser_id)?.active_agent_id,
+            None
+        );
         Ok(())
     }
 
