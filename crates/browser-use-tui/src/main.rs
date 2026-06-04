@@ -158,6 +158,8 @@ pub(crate) const SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT: &str = "session.followup
 const SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT: &str = "session.followup.interrupt_sent";
 pub(crate) const SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT: &str = "session.followup.cancelled";
 const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
+const SESSION_STOPPED_REASON: &str = "stopped from terminal";
+pub(crate) const SESSION_PAUSED_REASON: &str = "session paused";
 pub(crate) const FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL: &str = "after_next_tool_call";
 const FOLLOWUP_DELIVERY_AFTER_CURRENT_TURN: &str = "after_current_turn";
 pub(crate) const PENDING_FOLLOWUP_INTERRUPT_REASON: &str = "pending follow-up interrupt";
@@ -2322,6 +2324,23 @@ impl App {
         self.state_cache.events_for_session(session_id)
     }
 
+    pub(crate) fn selected_session_is_paused(&self) -> bool {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return false;
+        };
+        self.cached_events_for_session(session_id)
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "session.cancelled")
+            .is_some_and(|event| {
+                event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SESSION_PAUSED_REASON)
+            })
+    }
+
     fn goal_response_for_session(&self, session_id: &str) -> serde_json::Value {
         goal_response_from_event_records(session_id, self.cached_events_for_session(session_id))
     }
@@ -4072,6 +4091,14 @@ impl App {
     }
 
     fn cancel_current_task(&mut self) -> Result<bool> {
+        self.cancel_current_task_with_reason(SESSION_STOPPED_REASON)
+    }
+
+    fn pause_current_task(&mut self) -> Result<bool> {
+        self.cancel_current_task_with_reason(SESSION_PAUSED_REASON)
+    }
+
+    fn cancel_current_task_with_reason(&mut self, reason: &'static str) -> Result<bool> {
         let Some(id) = self.selected_session_id.clone() else {
             return Ok(false);
         };
@@ -4080,13 +4107,16 @@ impl App {
         }
         let cancelled_live_run = cancel_agent_run(&id);
         self.pause_active_goal_for_interrupt(&id)?;
-        self.store.request_cancel(&id, "stopped from terminal")?;
+        self.store.request_cancel(&id, reason)?;
         cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |session_id| {
             usize::from(cancel_agent_run(session_id))
         })?;
         if !cancelled_live_run {
-            self.status_notice =
-                Some("Marked task stopped; no live runtime handle was found.".to_string());
+            self.status_notice = if reason == SESSION_PAUSED_REASON {
+                Some("Marked conversation paused; no live runtime handle was found.".to_string())
+            } else {
+                Some("Marked task stopped; no live runtime handle was found.".to_string())
+            };
         }
         Ok(true)
     }
@@ -4325,7 +4355,10 @@ impl App {
         if self.reclaim_latest_queued_followup()? {
             return Ok(());
         }
-        if self.cancel_current_task()? {
+        if self.reclaim_latest_submitted_message_before_output()? {
+            return Ok(());
+        }
+        if self.pause_current_task()? {
             self.escape_stop_until = None;
             self.quit_hint_until = None;
             self.close_surface();
@@ -4334,9 +4367,6 @@ impl App {
         if self.escape_stop_is_pending() {
             self.open_message_actions()?;
             self.quit_hint_until = None;
-            return Ok(());
-        }
-        if self.reclaim_latest_submitted_message_before_output()? {
             return Ok(());
         }
         self.escape_stop_until =
@@ -5289,7 +5319,12 @@ impl App {
     }
 
     fn execute_cancelled_selection(&mut self) -> Result<()> {
-        match self.selected_row.min(2) {
+        let max_row = if self.selected_session_is_paused() {
+            1
+        } else {
+            2
+        };
+        match self.selected_row.min(max_row) {
             0 => {}
             1 => self.dispatch(AppCommand::NewTask)?,
             _ => self.dispatch(AppCommand::OpenHistory)?,
@@ -6767,6 +6802,7 @@ impl App {
         let state = self.workbench_state()?;
         Ok(match self.product_state(&state) {
             ProductState::Failed => 4,
+            ProductState::Cancelled if self.selected_session_is_paused() => 0,
             ProductState::Cancelled => 3,
             _ => 0,
         })
@@ -9692,7 +9728,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn single_escape_stops_active_task_without_double_escape() -> Result<()> {
+    fn single_escape_pauses_active_task_without_double_escape() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, temp.path())?;
@@ -9716,6 +9752,14 @@ mod redesign_tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.cancel_requested"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.cancelled"
+                && event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SESSION_PAUSED_REASON)
+        }));
         assert_eq!(
             app.store
                 .load_session(&session.id)?
@@ -9724,6 +9768,50 @@ mod redesign_tests {
         );
         assert!(app.escape_stop_until.is_none());
         assert_ne!(app.surface, Surface::Messages);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Conversation paused"));
+        assert!(screen.contains(
+            "What should the model do differently? If something went wrong, please use /feedback :)"
+        ));
+        assert!(!screen.contains("Conversation paused -"));
+        assert!(!screen.contains("Session paused"));
+        assert!(!screen.contains("Previous work"));
+        assert!(!screen.contains("Start a new task"));
+        Ok(())
+    }
+
+    #[test]
+    fn paused_detection_uses_latest_cancel_event() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep working"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.cancelled",
+            serde_json::json!({"reason": SESSION_PAUSED_REASON}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        assert!(app.selected_session_is_paused());
+        assert_eq!(app.main_selection_count()?, 0);
+
+        app.store.append_event(
+            &session.id,
+            "session.cancelled",
+            serde_json::json!({"reason": SESSION_STOPPED_REASON}),
+        )?;
+        app.refresh_state_cache_from_store()?;
+
+        assert!(!app.selected_session_is_paused());
+        assert_eq!(app.main_selection_count()?, 3);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Previous work"), "{screen}");
         Ok(())
     }
 
@@ -11526,7 +11614,10 @@ mod redesign_tests {
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
-        assert!(!screen.contains("/mode"));
+        assert!(!app
+            .slash_palette_items()
+            .iter()
+            .any(|item| item.command == "/mode"));
         assert!(!screen.contains("/plan"));
         assert!(screen.contains("/model"));
         assert!(!screen.contains("/auth"));
@@ -12637,7 +12728,7 @@ wire_api = "responses"
             let count = match surface {
                 Surface::Setup | Surface::Account => ACCOUNT_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
-                Surface::Mode => 1,
+                Surface::Mode => 2,
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
                 Surface::CookieSync => app.cookie_sync_row_count(),
                 _ => unreachable!(),
@@ -16348,7 +16439,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn escape_once_does_not_reclaim_after_streamed_output() -> Result<()> {
+    fn escape_once_pauses_after_streamed_output() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -16368,11 +16459,34 @@ wire_api = "responses"
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
 
         assert!(app.composer.input().is_empty());
-        assert!(app.escape_stop_is_pending());
+        assert!(!app.escape_stop_is_pending());
         let events = app.store.events_for_session(&session.id)?;
         assert!(!events
             .iter()
             .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.cancelled"
+                && event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SESSION_PAUSED_REASON)
+        }));
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Cancelled)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Conversation paused"));
+        assert!(screen.contains(
+            "What should the model do differently? If something went wrong, please use /feedback :)"
+        ));
+        assert!(!screen.contains("Conversation paused -"));
+        assert!(!screen.contains("Session paused"));
+        assert!(!screen.contains("Previous work"));
+        assert!(!screen.contains("Start a new task"));
         Ok(())
     }
 
@@ -16414,7 +16528,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn escape_twice_opens_message_selector_and_ctrl_c_stops_running_task() -> Result<()> {
+    fn ctrl_c_stops_running_task() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let running = app.store.create_session(None, std::env::current_dir()?)?;
@@ -16430,24 +16544,6 @@ wire_api = "responses"
         )?;
         app.selected_session_id = Some(running.id.clone());
 
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
-        assert!(app.escape_stop_is_pending());
-        assert_eq!(
-            app.store
-                .load_session(&running.id)?
-                .map(|session| session.status),
-            Some(SessionStatus::Running)
-        );
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("esc again to edit messages"));
-
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
-        assert!(!app.escape_stop_is_pending());
-        assert_eq!(app.surface, Surface::Messages);
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Messages"));
-        assert!(screen.contains("run"));
-
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL))?);
         assert_eq!(
             app.store
@@ -16455,6 +16551,15 @@ wire_api = "responses"
                 .map(|session| session.status),
             Some(SessionStatus::Cancelled)
         );
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.cancelled"
+                && event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SESSION_STOPPED_REASON)
+        }));
         assert_eq!(app.surface, Surface::Main);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("stopped"));

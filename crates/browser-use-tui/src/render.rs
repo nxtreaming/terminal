@@ -3542,6 +3542,7 @@ fn next_action_lines(
             let (primary, secondary) = failure_actions(error);
             vec![primary, secondary, "Retry", "New task"]
         }
+        ProductState::Cancelled if app.selected_session_is_paused() => return None,
         ProductState::Cancelled => vec![
             "Continue with a follow-up",
             "Start a new task",
