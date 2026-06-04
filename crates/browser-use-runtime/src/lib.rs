@@ -1633,7 +1633,7 @@ pub struct RuntimeModelRequestSnapshot {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentLiveStateSnapshot {
     pub accepted_input_count: usize,
     pub accepted_followup_count: usize,
@@ -1662,10 +1662,47 @@ pub struct AgentLiveStateSnapshot {
     pub total_token_usage: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_window: Option<i64>,
+    pub compaction_window_ordinal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_prefill_input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_prefill_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+}
+
+impl Default for AgentLiveStateSnapshot {
+    fn default() -> Self {
+        Self {
+            accepted_input_count: 0,
+            accepted_followup_count: 0,
+            pending_prompt_input_count: 0,
+            last_accepted_prompt_input_seq: 0,
+            last_consumed_prompt_input_seq: 0,
+            pending_mailbox_count: 0,
+            pending_trigger_turn_count: 0,
+            last_enqueued_mailbox_seq: 0,
+            last_wait_observed_mailbox_seq: 0,
+            last_delivered_mailbox_seq: 0,
+            last_consumed_mailbox_seq: 0,
+            current_run_id: None,
+            cancellation_requested: false,
+            active_items: Vec::new(),
+            last_model_delta: None,
+            last_model_thinking_delta: None,
+            active_model_request: None,
+            last_token_usage: None,
+            total_token_usage: None,
+            model_context_window: None,
+            compaction_window_ordinal: 1,
+            compaction_prefill_input_tokens: None,
+            compaction_prefill_source: None,
+            final_result: None,
+            failure: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1923,6 +1960,47 @@ impl AgentLiveState {
             .pending_trigger_turn_count
             .saturating_sub(trigger_count);
         state.last_consumed_mailbox_seq = state.last_consumed_mailbox_seq.max(max_seq);
+    }
+
+    fn compaction_prefill_input_tokens(&self) -> Option<i64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .compaction_prefill_input_tokens
+    }
+
+    fn record_estimated_compaction_prefill(&self, tokens: i64) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.compaction_prefill_source.as_deref() == Some("server_observed") {
+            return;
+        }
+        state.compaction_prefill_input_tokens = Some(tokens.max(0));
+        state.compaction_prefill_source = Some("estimated".to_string());
+    }
+
+    fn record_server_observed_compaction_prefill(&self, tokens: i64) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.compaction_prefill_source.as_deref() == Some("server_observed") {
+            return;
+        }
+        state.compaction_prefill_input_tokens = Some(tokens.max(0));
+        state.compaction_prefill_source = Some("server_observed".to_string());
+    }
+
+    fn start_next_compaction_window(&self) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.compaction_window_ordinal = state.compaction_window_ordinal.max(1).saturating_add(1);
+        state.compaction_prefill_input_tokens = None;
+        state.compaction_prefill_source = None;
     }
 
     fn materialize_from_replay(&self, replay: &MaterializedLiveState) {
@@ -3504,6 +3582,53 @@ impl RuntimeHandle {
         self.inner
             .persistence
             .events_after_seq(session_id, after_seq)
+    }
+
+    pub fn compaction_prefill_input_tokens_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<i64>> {
+        Ok(self
+            .inner
+            .agents
+            .thread_for_session(session_id)?
+            .live_state
+            .compaction_prefill_input_tokens())
+    }
+
+    pub fn record_estimated_compaction_prefill_for_session(
+        &self,
+        session_id: &SessionId,
+        tokens: i64,
+    ) -> Result<()> {
+        self.inner
+            .agents
+            .thread_for_session(session_id)?
+            .live_state
+            .record_estimated_compaction_prefill(tokens);
+        Ok(())
+    }
+
+    pub fn record_server_observed_compaction_prefill_for_session(
+        &self,
+        session_id: &SessionId,
+        tokens: i64,
+    ) -> Result<()> {
+        self.inner
+            .agents
+            .thread_for_session(session_id)?
+            .live_state
+            .record_server_observed_compaction_prefill(tokens);
+        Ok(())
+    }
+
+    pub fn start_next_compaction_window_for_session(&self, session_id: &SessionId) -> Result<()> {
+        self.inner
+            .agents
+            .thread_for_session(session_id)?
+            .live_state
+            .start_next_compaction_window();
+        Ok(())
     }
 
     pub fn append_observed_session_event(
@@ -5829,6 +5954,53 @@ mod tests {
         assert_eq!(reservation.child_agent_id, child_b);
         assert_eq!(scheduler.open_count(), 1);
         assert_eq!(scheduler.queued_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_compaction_window_state_lives_on_agent_thread() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let session_id = root.session_id().clone();
+
+        let initial = root.live_state_snapshot();
+        assert_eq!(initial.compaction_window_ordinal, 1);
+        assert_eq!(initial.compaction_prefill_input_tokens, None);
+        assert_eq!(initial.compaction_prefill_source, None);
+
+        handle.record_estimated_compaction_prefill_for_session(&session_id, 42)?;
+        let estimated = root.live_state_snapshot();
+        assert_eq!(estimated.compaction_prefill_input_tokens, Some(42));
+        assert_eq!(
+            estimated.compaction_prefill_source.as_deref(),
+            Some("estimated")
+        );
+
+        handle.record_server_observed_compaction_prefill_for_session(&session_id, 7)?;
+        let observed = root.live_state_snapshot();
+        assert_eq!(observed.compaction_prefill_input_tokens, Some(7));
+        assert_eq!(
+            observed.compaction_prefill_source.as_deref(),
+            Some("server_observed")
+        );
+
+        handle.record_estimated_compaction_prefill_for_session(&session_id, 99)?;
+        assert_eq!(
+            root.live_state_snapshot().compaction_prefill_input_tokens,
+            Some(7),
+            "estimated prefill must not replace server-observed prefill"
+        );
+
+        handle.start_next_compaction_window_for_session(&session_id)?;
+        let next = root.live_state_snapshot();
+        assert_eq!(next.compaction_window_ordinal, 2);
+        assert_eq!(next.compaction_prefill_input_tokens, None);
+        assert_eq!(next.compaction_prefill_source, None);
         Ok(())
     }
 

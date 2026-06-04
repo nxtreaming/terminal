@@ -145,7 +145,7 @@ BrowserUseRuntime
       - last delivered seq
       - last consumed seq
       - current-turn vs next-turn delivery phase
-- [ ] Add per-agent token usage and compaction window state.
+- [x] Add per-agent token usage and compaction window state.
 - [ ] Add per-agent current run state:
       - idle
       - queued

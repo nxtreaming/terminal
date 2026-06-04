@@ -254,7 +254,7 @@ struct LiveTurnState {
     context_window_tokens: i64,
     model_auto_compact_token_limit: Option<i64>,
     auto_compact_scope: AutoCompactTokenLimitScope,
-    auto_compact_window: Mutex<AutoCompactWindow>,
+    local_auto_compact_window: Mutex<AutoCompactWindow>,
     mailbox_delivery_phase: Mutex<MailboxDeliveryPhase>,
     pre_turn_replay_from_seq: Mutex<Option<i64>>,
     compact_prompt: String,
@@ -289,7 +289,7 @@ impl LiveTurnState {
             context_window_tokens: 0,
             model_auto_compact_token_limit: None,
             auto_compact_scope: AutoCompactTokenLimitScope::Total,
-            auto_compact_window: Mutex::new(AutoCompactWindow::default()),
+            local_auto_compact_window: Mutex::new(AutoCompactWindow::default()),
             mailbox_delivery_phase: Mutex::new(MailboxDeliveryPhase::CurrentTurn),
             pre_turn_replay_from_seq: Mutex::new(None),
             compact_prompt: crate::compact::SUMMARIZATION_PROMPT.to_string(),
@@ -463,24 +463,87 @@ impl LiveTurnState {
         (self.context_window_tokens > 0).then_some(self.context_window_tokens)
     }
 
+    fn auto_compact_prefill_input_tokens(&self) -> Option<i64> {
+        if let (Some(runtime_handle), Some(runtime_session_id)) =
+            (self.runtime_handle.as_ref(), self.runtime_session_id())
+        {
+            if let Ok(prefill) =
+                runtime_handle.compaction_prefill_input_tokens_for_session(&runtime_session_id)
+            {
+                return prefill;
+            }
+        }
+        self.local_auto_compact_window
+            .lock()
+            .unwrap()
+            .prefill_input_tokens()
+    }
+
+    fn ensure_auto_compact_server_observed_prefill_from_usage(&self, usage: &TokenUsage) {
+        if let (Some(runtime_handle), Some(runtime_session_id)) =
+            (self.runtime_handle.as_ref(), self.runtime_session_id())
+        {
+            if runtime_handle
+                .record_server_observed_compaction_prefill_for_session(
+                    &runtime_session_id,
+                    usage.input,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.local_auto_compact_window
+            .lock()
+            .unwrap()
+            .ensure_server_observed_prefill_from_usage(usage);
+    }
+
+    fn set_auto_compact_estimated_prefill(&self, tokens: i64) {
+        if let (Some(runtime_handle), Some(runtime_session_id)) =
+            (self.runtime_handle.as_ref(), self.runtime_session_id())
+        {
+            if runtime_handle
+                .record_estimated_compaction_prefill_for_session(&runtime_session_id, tokens)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.local_auto_compact_window
+            .lock()
+            .unwrap()
+            .set_estimated_prefill(tokens);
+    }
+
+    fn start_next_auto_compact_window(&self) {
+        if let (Some(runtime_handle), Some(runtime_session_id)) =
+            (self.runtime_handle.as_ref(), self.runtime_session_id())
+        {
+            if runtime_handle
+                .start_next_compaction_window_for_session(&runtime_session_id)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.local_auto_compact_window.lock().unwrap().start_next();
+    }
+
     fn token_status_blocking(&self) -> TokenStatus {
         if self.compaction_sampler.is_none() {
             return TokenStatus::default();
         }
         let tokens = self.active_prompt_tokens_for_status();
-        let prefill = {
-            let mut window = self.auto_compact_window.lock().unwrap();
-            if tokens.provider_usage.is_some()
-                && matches!(
-                    self.auto_compact_scope,
-                    AutoCompactTokenLimitScope::BodyAfterPrefix
-                )
-            {
-                let usage = tokens.provider_usage.unwrap();
-                window.ensure_server_observed_prefill_from_usage(&usage);
-            }
-            window.prefill_input_tokens()
-        };
+        if let Some(usage) = tokens.provider_usage.as_ref().filter(|_| {
+            matches!(
+                self.auto_compact_scope,
+                AutoCompactTokenLimitScope::BodyAfterPrefix
+            )
+        }) {
+            self.ensure_auto_compact_server_observed_prefill_from_usage(usage);
+        }
+        let prefill = self.auto_compact_prefill_input_tokens();
         TokenStatus::from_codex_usage(
             tokens.active,
             prefill,
@@ -2117,13 +2180,12 @@ impl LiveTurnState {
         )
         .map_err(AgentError::Store)?;
         self.recorded.lock().unwrap().clear();
-        let mut window = self.auto_compact_window.lock().unwrap();
-        window.start_next();
+        self.start_next_auto_compact_window();
         if matches!(
             self.auto_compact_scope,
             AutoCompactTokenLimitScope::BodyAfterPrefix
         ) {
-            window.set_estimated_prefill(active_after_compact);
+            self.set_auto_compact_estimated_prefill(active_after_compact);
         }
         Ok(())
     }
@@ -4096,6 +4158,93 @@ mod tests {
         assert!(
             second.auto_compact_scope_tokens < 50,
             "the baseline should be provider usage, not the full prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_body_after_prefix_prefill_lives_on_agent_thread() {
+        let (_dir, store, session_id) = store_with_session();
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let runtime_session_id =
+            RuntimeSessionId::from_string(session_id.clone()).expect("runtime session id");
+        journal
+            .create_thread(CreateThreadRequest {
+                session_id: Some(runtime_session_id.clone()),
+                parent_session_id: None,
+                cwd: std::path::PathBuf::from("/work"),
+                artifact_root: None,
+                agent_path: None,
+                nickname: None,
+                role: None,
+            })
+            .expect("create runtime thread");
+        let runtime = runtime.handle();
+        let root = runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: runtime_session_id.clone(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "initial request".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        runtime
+            .append_observed_session_event(
+                runtime_session_id.clone(),
+                names::SESSION_INPUT,
+                serde_json::json!({ "text": "initial request" }),
+                RuntimeDurability::Barrier,
+            )
+            .expect("append runtime input");
+        runtime
+            .append_observed_session_event(
+                runtime_session_id,
+                names::TOKEN_COUNT,
+                serde_json::json!({
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 80,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 20,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 100,
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 80,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 20,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 100,
+                        },
+                        "model_context_window": 1_000,
+                    },
+                    "turn_idx": 0,
+                }),
+                RuntimeDurability::Barrier,
+            )
+            .expect("append runtime token count");
+
+        let recorded = Arc::new(Mutex::new(vec![assistant_text_message("done")]));
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::clone(&recorded),
+        )
+        .with_runtime_handle(Some(runtime))
+        .with_compaction(
+            1_000,
+            Some(50),
+            AutoCompactTokenLimitScope::BodyAfterPrefix,
+            sampler,
+        );
+
+        let status = state.token_status().await;
+        assert_eq!(status.auto_compact_scope_tokens, 20);
+        let live = root.live_state_snapshot();
+        assert_eq!(live.compaction_prefill_input_tokens, Some(80));
+        assert_eq!(
+            live.compaction_prefill_source.as_deref(),
+            Some("server_observed")
         );
     }
 

@@ -72,6 +72,10 @@ BrowserUseRuntime
   previous-model downshift compaction setup now prefer
   `RuntimeHandle::events_for_session` before falling back to the compatibility
   `Store` read.
+- Per-agent live snapshots now include token usage plus runtime-owned
+  compaction window state: ordinal, prefill input tokens, and whether the
+  prefill came from an estimate or a server-observed usage sample. Runtime-backed
+  `LiveTurnState::token_status` updates that state through `RuntimeHandle`.
 - Subagent lifecycle UI events use the runtime-backed event sink when a runtime
   handle exists.
 - `session.done` emitted by the turn observer is routed through the runtime
@@ -125,10 +129,10 @@ BrowserUseRuntime
   wrapped by runtime ownership, not moved into `browser-use-runtime`.
 - `LiveTurnState` still contains `SharedStore` and reconstructs durable prompt
   history through the runtime journal reader when available, with Store fallback
-  for compatibility. Fresh input and mailbox are runtime-backed, but token
-  replay is still Store-shaped. Runtime-backed compaction checkpoint writes now
-  route through runtime, but compaction state itself still lives in the agent
-  crate turn state.
+  for compatibility. Fresh input, mailbox, and compaction window state are
+  runtime-backed, but token-status recomputation and token replay still live in
+  the agent crate turn state. Runtime-backed compaction checkpoint writes now
+  route through runtime.
 - `run_session_with_config*` remains as compatibility wrappers over
   `RuntimeHandle::run_agent`. They are not an independent live authority when
   called normally, but they have not been deleted.
@@ -180,8 +184,8 @@ BrowserUseRuntime
 
 ```text
 1. Move turn-loop ownership deeper into RuntimeHandle/AgentThread.
-2. Replace Store-shaped LiveTurnState history/token state and local compaction
-   state with runtime-owned state plus JournalReader replay.
+2. Replace Store-shaped LiveTurnState token recomputation/replay with
+   runtime-owned state plus JournalReader replay.
 3. Complete RuntimeEventProjection coverage and make it the live TUI authority.
 4. Promote BrowserManager from lease/action ownership to the owner of browser
    sessions, script registries, artifacts, cancellation, and crash semantics.
