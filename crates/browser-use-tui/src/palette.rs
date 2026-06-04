@@ -3,6 +3,7 @@ pub(crate) enum PaletteAction {
     NewTask,
     PreviousWork,
     ChangeBrowser,
+    Context,
     Goal,
     ChooseModel,
     Authenticate,
@@ -20,7 +21,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const VISIBLE_ITEMS: [PaletteItem; 7] = [
+const VISIBLE_ITEMS: [PaletteItem; 8] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -35,6 +36,11 @@ const VISIBLE_ITEMS: [PaletteItem; 7] = [
         command: "/browser",
         description: "change browser backend",
         action: PaletteAction::ChangeBrowser,
+    },
+    PaletteItem {
+        command: "/context",
+        description: "inspect context window attribution",
+        action: PaletteAction::Context,
     },
     PaletteItem {
         command: "/model",
@@ -124,5 +130,10 @@ mod tests {
     #[test]
     fn goal_is_available_from_palette() {
         assert_eq!(selected_action("/goal", 0), Some(PaletteAction::Goal));
+    }
+
+    #[test]
+    fn context_is_available_from_palette() {
+        assert_eq!(selected_action("/context", 0), Some(PaletteAction::Context));
     }
 }

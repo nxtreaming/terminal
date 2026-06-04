@@ -209,15 +209,42 @@ def _has_return_statement(expression):
     return False
 
 
-def js(expression, target_id=None, returnByValue=True):
-    """Run JS in the attached tab, or in an iframe target via target_id.
+def js(expression, *args, target_id=None, returnByValue=True):
+    """Run JS in the attached tab, or call a JS function with JSON args.
 
     Expressions with top-level `return` are wrapped in an IIFE, so both
     `document.title` and `const x = 1; return x` are valid.
+    If positional args are provided, `expression` must evaluate to a function;
+    args must be JSON-serializable and are passed to that function.
     """
-    session_id = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
-    if _has_return_statement(expression) and not expression.strip().startswith("("):
+    if not isinstance(expression, str):
+        raise TypeError("js(expression, ...): expression must be a string")
+    if target_id is not None and not isinstance(target_id, str):
+        raise TypeError("js(..., target_id=None): target_id must be a string when provided")
+    if not isinstance(returnByValue, bool):
+        raise TypeError("js(..., returnByValue=True): returnByValue must be a boolean")
+    if args:
+        try:
+            args_json = json.dumps(args, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "js(..., *args) arguments must be JSON-serializable. "
+                "For DOM nodes or remote objects, use raw CDP Runtime.callFunctionOn."
+            ) from exc
+        source = expression.strip().rstrip(";")
+        expression = f"""
+(async () => {{
+  const fn = ({source});
+  if (typeof fn !== "function") {{
+    throw new TypeError("js(expression, *args): expression must evaluate to a function when args are provided");
+  }}
+  const args = {args_json};
+  return await fn(...args);
+}})()
+"""
+    elif _has_return_statement(expression) and not expression.strip().startswith("("):
         expression = f"(function(){{{expression}}})()"
+    session_id = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
     return _runtime_evaluate(
         expression,
         session_id=session_id,

@@ -23,7 +23,7 @@ Preimported helpers:
 ```python
 cdp(method, session_id=None, **params)
 cdp_batch(calls)
-js(expression, returnByValue=True)
+js(expression_or_function_source, *args, target_id=None, returnByValue=True)
 
 new_tab(url="about:blank")
 goto_url(url)
@@ -106,6 +106,7 @@ emit_output(rows, label="employee_rows")
 - Keep `print(...)` for short debug/status text only. Do not print large page, DOM, network, or extraction objects when `emit_output(...)` can carry the full value.
 - Prefer coordinate clicks for visible UI: screenshot, inspect pixels, `click_at_xy(x, y)`, wait, screenshot again.
 - Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level browser actions.
+- Use `js(function_source, *args)` when passing JSON-serializable Python values into JavaScript; use `target_id=` as a keyword for iframe targets.
 - For real user forms, act like a browser user: screenshot, click the visible field/control, type with `type_text(...)`, `press_key(...)`, or `fill_input(...)`, then screenshot or otherwise verify. Use coordinate clicks for checkboxes, radios, buttons, dropdowns, and custom controls. Do not assign `element.value`, `element.checked`, `selectedIndex`, React private state, or MutationObserver restore loops on live forms. Do not synthesize `input`, `change`, `click`, or keyboard events in page JavaScript to make a form look filled. Those anti-patterns can desynchronize framework state from the visible DOM.
 - Use `http_get(...)` for static pages and APIs after the browser reveals stable endpoints. It returns the response body as a string by default, or bytes with `binary=True`; the returned body also exposes `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. If direct HTTP hits bot or login protection, retry with site-specific headers/cookies, `js(fetch(...))` in the browser, or the configured Browser Use fetch proxy.
 - Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.

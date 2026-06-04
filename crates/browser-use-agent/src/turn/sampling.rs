@@ -439,7 +439,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         }
     }
 
-    fn emit_turn_request(&self, attempt: u32) {
+    fn emit_turn_request(&self, attempt: u32, composition: &Value) {
         self.sink.emit(PendingEvent::new(
             self.ctx.session_id.clone(),
             names::MODEL_TURN_REQUEST,
@@ -448,6 +448,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                 "provider": &self.ctx.provider,
                 "turn_idx": self.ctx.turn_idx,
                 "attempt": attempt,
+                "composition": composition,
             }),
         ));
     }
@@ -858,9 +859,14 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         if let Some(dispatcher) = &self.dispatcher {
             req.tools = dispatcher.tool_specs().to_vec();
         }
+        // Measure the REAL assembled request so the /context view can attribute
+        // the window dynamically: the system prompt and per-tool schemas only
+        // exist here (they are never persisted as message events). Uses the same
+        // byte->token estimator the agent uses elsewhere, so it stays consistent.
+        let composition = request_composition(&req);
         let mut attempt: u32 = 0;
         loop {
-            self.emit_turn_request(attempt);
+            self.emit_turn_request(attempt, &composition);
             // ---- open the stream (codex: `client.stream(&prompt).await`) ----
             let mut stream = match self.transport.open_stream(&req) {
                 Ok(s) => s,
@@ -1029,4 +1035,33 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
         );
     }
     req
+}
+
+/// Token attribution for the per-turn request, computed from the REAL assembled
+/// [`LlmRequest`]. The system prompt and tool schemas are not message events, so
+/// this is the only place the `/context` view can learn their size. Counts use
+/// the agent's standard byte->token estimate so they line up with the
+/// compaction accounting.
+fn request_composition(req: &LlmRequest) -> Value {
+    use crate::context::accounting::approx_tokens_from_byte_count_i64;
+
+    let system_bytes: i64 = req.system.iter().map(|part| part.text.len() as i64).sum();
+    let system_prompt_tokens = approx_tokens_from_byte_count_i64(system_bytes);
+
+    let tools: Vec<Value> = req
+        .tools
+        .iter()
+        .map(|tool| {
+            let bytes = serde_json::to_string(tool).map(|s| s.len()).unwrap_or(0) as i64;
+            serde_json::json!({
+                "name": tool.name,
+                "tokens": approx_tokens_from_byte_count_i64(bytes),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "system_prompt_tokens": system_prompt_tokens,
+        "tools": tools,
+    })
 }

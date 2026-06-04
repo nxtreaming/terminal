@@ -165,6 +165,23 @@ pub(crate) fn border() -> Style {
     Style::default().fg(palette().border)
 }
 
+/// Stable color per /context category so the usage bar segments and their
+/// labels share a hue. Pulls from the active palette so it adapts to light/dark.
+pub(crate) fn context_category_color(label: &str) -> Color {
+    let palette = palette();
+    match label {
+        "System prompt" | "System prompts" => palette.thought,
+        "Tool definitions" | "System prompt + tools" => palette.accent,
+        "Tool outputs" => palette.running,
+        "Tool calls" => palette.activity_search,
+        "Assistant responses" => palette.activity_list,
+        "User messages" => palette.link,
+        "Reasoning" => palette.activity_task,
+        "Compaction" => palette.path_reference,
+        _ => palette.muted,
+    }
+}
+
 /// Background fill for a user prompt block in the transcript, so the message
 /// the user sent stands apart from the agent's replies.
 pub(crate) fn user_prompt_text() -> Style {
