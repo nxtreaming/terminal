@@ -1037,6 +1037,29 @@ fn subagent_v2_spawn_schema_can_hide_metadata_fields() {
 }
 
 #[test]
+fn spawn_agent_descriptions_explain_root_inclusive_capacity() {
+    let options = definitions::SpawnAgentDefinitionOptions {
+        max_concurrent_threads_per_session: Some(3),
+        ..Default::default()
+    };
+    let v2 = definitions::spawn_agent_with_options(options.clone());
+    assert!(v2
+        .description
+        .contains("the root agent counts toward that cap"));
+    assert!(v2
+        .description
+        .contains("at most 2 spawned subagent(s) may be open concurrently"));
+
+    let v1 = definitions::spawn_agent_v1_with_options(options);
+    assert!(v1
+        .description
+        .contains("the root agent counts toward that cap"));
+    assert!(v1
+        .description
+        .contains("at most 2 spawned subagent(s) may be open concurrently"));
+}
+
+#[test]
 fn legacy_subagent_items_schema_advertises_full_user_input_fields() {
     let spawn = definitions::spawn_agent_v1_with_options(Default::default());
     let item_properties = &spawn.input_schema["properties"]["items"]["items"]["properties"];

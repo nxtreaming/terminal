@@ -1231,6 +1231,17 @@ to the single frame that proves the task succeeded."
         })
     }
 
+    fn spawned_subagent_concurrency_guidance(limit: Option<usize>) -> String {
+        limit
+            .map(|limit| {
+                let spawned_limit = limit.saturating_sub(1);
+                format!(
+                    " This session is configured with `max_concurrent_threads_per_session = {limit}`; the root agent counts toward that cap, so at most {spawned_limit} spawned subagent(s) may be open concurrently. If that spawned-subagent cap is already reached, wait for an existing subagent to finish and close it before spawning another, or spawn fewer subagents."
+                )
+            })
+            .unwrap_or_default()
+    }
+
     fn spawn_agent_description_v2(options: &SpawnAgentDefinitionOptions) -> String {
         let available_models_description = if options.hide_agent_type_model_reasoning {
             ""
@@ -1240,14 +1251,8 @@ to the single frame that proves the task succeeded."
                 .as_deref()
                 .unwrap_or("")
         };
-        let concurrency_guidance = options
-            .max_concurrent_threads_per_session
-            .map(|limit| {
-                format!(
-                    " This session is configured with `max_concurrent_threads_per_session = {limit}` for concurrently open agent threads."
-                )
-            })
-            .unwrap_or_default();
+        let concurrency_guidance =
+            spawned_subagent_concurrency_guidance(options.max_concurrent_threads_per_session);
         let mut description = format!(
             r#"
         {}
@@ -1288,10 +1293,13 @@ If multiple spawned agents are expected to contribute to the answer, keep waitin
                 .as_deref()
                 .unwrap_or("")
         };
+        let concurrency_guidance =
+            spawned_subagent_concurrency_guidance(options.max_concurrent_threads_per_session);
         let mut description = format!(
             r#"
         {}
 This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
+{concurrency_guidance}
 
 Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.
 Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.

@@ -157,6 +157,8 @@ impl SubagentManager {
         spawner: Arc<dyn ChildSpawner>,
         role_registry: RoleRegistry,
         max_depth: i32,
+        // Root-inclusive session cap. Direct spawned-child capacity is computed
+        // inside the manager by subtracting the root thread exactly once.
         max_concurrent_threads_per_session: Option<usize>,
     ) -> Self {
         Self {

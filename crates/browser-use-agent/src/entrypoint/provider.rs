@@ -1806,16 +1806,15 @@ fn register_subagent_tools<S, A>(
         }),
         None => Arc::new(UnconfiguredChildSpawner),
     };
-    let subagent_thread_limit = config
+    let max_concurrent_threads_per_session = config
         .options
         .multi_agent_v2
-        .max_concurrent_threads_per_session
-        .saturating_sub(1);
+        .max_concurrent_threads_per_session;
     let manager = Arc::new(SubagentManager::with_config_and_limits(
         spawner,
         crate::subagents::role::RoleRegistry::with_user_defined(config.options.agent_roles.clone()),
         crate::subagents::depth::DEFAULT_AGENT_MAX_DEPTH,
-        Some(subagent_thread_limit),
+        Some(max_concurrent_threads_per_session),
     ));
     let spawn_gate = Arc::new(tokio::sync::Mutex::new(()));
     *parent_link
@@ -1872,7 +1871,7 @@ fn register_subagent_tools<S, A>(
             max_timeout_ms: config.options.multi_agent_v2.max_wait_timeout_ms,
         },
         hide_spawn_agent_metadata: config.options.multi_agent_v2.hide_spawn_agent_metadata,
-        max_concurrent_threads_per_session: Some(subagent_thread_limit),
+        max_concurrent_threads_per_session: Some(max_concurrent_threads_per_session),
     };
     let tool_namespace = if provider_supports_tool_namespaces(config) {
         config.options.multi_agent_v2.tool_namespace.clone()
@@ -1990,16 +1989,15 @@ fn register_legacy_subagent_tools<S, A>(
         }),
         None => Arc::new(UnconfiguredChildSpawner),
     };
-    let subagent_thread_limit = config
+    let max_concurrent_threads_per_session = config
         .options
         .multi_agent_v2
-        .max_concurrent_threads_per_session
-        .saturating_sub(1);
+        .max_concurrent_threads_per_session;
     let manager = Arc::new(SubagentManager::with_config_and_limits(
         spawner,
         crate::subagents::role::RoleRegistry::with_user_defined(config.options.agent_roles.clone()),
         crate::subagents::depth::DEFAULT_AGENT_MAX_DEPTH,
-        Some(subagent_thread_limit),
+        Some(max_concurrent_threads_per_session),
     ));
     let spawn_gate = Arc::new(tokio::sync::Mutex::new(()));
     *parent_link
@@ -2041,7 +2039,7 @@ fn register_legacy_subagent_tools<S, A>(
             max_timeout_ms: config.options.multi_agent_v2.max_wait_timeout_ms,
         },
         hide_spawn_agent_metadata: config.options.multi_agent_v2.hide_spawn_agent_metadata,
-        max_concurrent_threads_per_session: Some(subagent_thread_limit),
+        max_concurrent_threads_per_session: Some(max_concurrent_threads_per_session),
     };
 
     let spawn_options = SpawnAgentDefinitionOptions {
@@ -3528,6 +3526,77 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
         assert_eq!(body["task_name"].as_str(), Some("/root/explore"));
         assert!(body.get("nickname").is_some());
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_registration_uses_root_inclusive_thread_limit_once() {
+        use crate::config_overrides::{AgentRunOptions, ChildAgentRunner, MultiAgentV2Options};
+        use crate::tools::orchestrator::ToolOrchestrator;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::runtime::ToolCtx;
+        use crate::tools::sandbox::FileSystemSandboxPolicy;
+
+        let runner = ChildAgentRunner::new(|_req| Ok(()));
+        let options = AgentRunOptions {
+            child_agent_runner: Some(runner),
+            multi_agent_v2: MultiAgentV2Options {
+                enabled: true,
+                max_concurrent_threads_per_session: 4,
+                ..Default::default()
+            },
+            ..AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
+        register_subagent_tools(&mut reg, &config, &None, &std::env::temp_dir(), None);
+
+        let orch = ToolOrchestrator::stub();
+        let env = TurnEnv {
+            file_system_sandbox_policy: FileSystemSandboxPolicy {
+                restricted: false,
+                denied_read: false,
+            },
+            managed_network_active: false,
+            strict_auto_review: false,
+            use_guardian: false,
+        };
+        let ctx = ToolCtx {
+            call_id: "c".to_string(),
+            tool_name: "spawn_agent".to_string(),
+            cwd: std::env::temp_dir(),
+            artifact_root: std::env::temp_dir().join("artifacts"),
+        };
+
+        for task_name in ["one", "two", "three"] {
+            reg.dispatch(
+                "spawn_agent",
+                &serde_json::json!({ "task_name": task_name, "message": "go" }),
+                &ctx,
+                &env,
+                AskForApproval::Never,
+                &orch,
+            )
+            .await
+            .expect("cap 4 allows root plus three spawned agents");
+        }
+
+        let err = reg
+            .dispatch(
+                "spawn_agent",
+                &serde_json::json!({ "task_name": "four", "message": "go" }),
+                &ctx,
+                &env,
+                AskForApproval::Never,
+                &orch,
+            )
+            .await
+            .expect_err("fourth spawned agent should exceed root-inclusive cap 4");
+        let error_text = format!("{err:?}");
+        assert!(
+            error_text.contains("agent limit reached: limit 3"),
+            "unexpected error: {error_text}"
+        );
     }
 
     #[tokio::test]
