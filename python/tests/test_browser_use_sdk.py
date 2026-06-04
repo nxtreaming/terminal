@@ -151,6 +151,41 @@ def test_runtime_client_routes_agent_events_by_run_and_session_id() -> None:
     assert runtime.event_queue("session-1").get_nowait() == {"kind": "agent_started"}
 
 
+def test_runtime_client_cancelled_call_removes_pending_request() -> None:
+    asyncio.run(_test_runtime_client_cancelled_call_removes_pending_request())
+
+
+async def _test_runtime_client_cancelled_call_removes_pending_request() -> None:
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.lines: List[bytes] = []
+
+        def write(self, data: bytes) -> None:
+            self.lines.append(data)
+
+        async def drain(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+            self.returncode = None
+
+    class NoStartRuntime(RuntimeClient):
+        async def start(self) -> None:
+            self._process = FakeProcess()  # type: ignore[assignment]
+
+    runtime = NoStartRuntime(command=["unused"])
+    task = asyncio.create_task(runtime.call("runtime.never_returns"))
+    await asyncio.sleep(0)
+
+    assert list(runtime._pending) == [1]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runtime._pending == {}
+
+
 def test_two_running_agents_cannot_share_one_browser() -> None:
     asyncio.run(_test_two_running_agents_cannot_share_one_browser())
 

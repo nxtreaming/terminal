@@ -30,6 +30,7 @@ class RuntimeClient:
         self._reader_task: Optional[asyncio.Task[Any]] = None
         self._stderr_task: Optional[asyncio.Task[Any]] = None
         self._next_id = 1
+        self._write_lock = asyncio.Lock()
         self._pending: Dict[int, asyncio.Future[Any]] = {}
         self._events: Dict[str, asyncio.Queue[Dict[str, Any]]] = {}
         self.stderr_lines: List[str] = []
@@ -39,29 +40,35 @@ class RuntimeClient:
         if self._process is None or self._process.stdin is None:
             raise BrowserUseProtocolError("Rust SDK server stdin is unavailable")
 
-        request_id = self._next_id
-        self._next_id += 1
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[Any] = loop.create_future()
-        self._pending[request_id] = future
+        async with self._write_lock:
+            request_id = self._next_id
+            self._next_id += 1
+            future: asyncio.Future[Any] = loop.create_future()
+            self._pending[request_id] = future
 
-        request = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params or {},
-        }
-        self._process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
-        await self._process.stdin.drain()
-        return await future
+            request = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params or {},
+            }
+            self._process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+            await self._process.stdin.drain()
+        try:
+            return await future
+        except asyncio.CancelledError:
+            self._pending.pop(request_id, None)
+            raise
 
     async def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
         await self.start()
         if self._process is None or self._process.stdin is None:
             raise BrowserUseProtocolError("Rust SDK server stdin is unavailable")
         request = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-        self._process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
-        await self._process.stdin.drain()
+        async with self._write_lock:
+            self._process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+            await self._process.stdin.drain()
 
     async def start(self) -> None:
         if self._process is not None and self._process.returncode is None:
@@ -96,6 +103,7 @@ class RuntimeClient:
         for task in (self._reader_task, self._stderr_task):
             if task is not None:
                 task.cancel()
+        self._fail_all(BrowserUseProtocolError("Rust SDK server closed"))
         self._process = None
 
     def event_queue(self, run_id: str) -> asyncio.Queue[Dict[str, Any]]:
