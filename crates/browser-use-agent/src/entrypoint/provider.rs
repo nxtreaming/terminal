@@ -51,8 +51,8 @@ use browser_use_llm::route::ModelClient;
 use browser_use_runtime::{
     AgentId as RuntimeAgentId, BrowserConfig as RuntimeBrowserConfig,
     BrowserId as RuntimeBrowserId, BrowserLease as RuntimeBrowserLease,
-    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RuntimeHandle,
-    SessionId as RuntimeSessionId,
+    Durability as RuntimeDurability, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
+    RuntimeHandle, SessionId as RuntimeSessionId,
 };
 use browser_use_store::Store;
 use serde::Serialize;
@@ -1659,6 +1659,29 @@ impl EventSink for SubagentStoreSink {
     }
 }
 
+/// Runtime-backed lifecycle sink for live subagent events.
+///
+/// The event payloads stay byte-compatible with the Store projection, but the
+/// append and publish go through `BrowserUseRuntime`, so active TUI/SDK
+/// subscribers see the same lifecycle facts that SQLite records.
+struct SubagentRuntimeSink {
+    runtime: RuntimeHandle,
+}
+
+impl EventSink for SubagentRuntimeSink {
+    fn emit(&self, ev: PendingEvent) {
+        let Ok(session_id) = RuntimeSessionId::from_string(ev.session_id) else {
+            return;
+        };
+        let _ = self.runtime.append_observed_session_event(
+            session_id,
+            &ev.event_type,
+            ev.payload,
+            RuntimeDurability::Barrier,
+        );
+    }
+}
+
 /// A no-op [`EventSink`] for runs without a session store (tests / headless):
 /// lifecycle events are dropped, but spawn/wait/send still function.
 struct NoopSubagentSink;
@@ -1750,15 +1773,20 @@ fn register_subagent_tools<S, A>(
 
     // Durable lifecycle sink + session scope: journal projection on the live
     // run path, a no-op when no session store is wired.
-    let (sink, session_id): (Arc<dyn EventSink>, String) = match user_input {
-        Some((store, sid)) => (
-            Arc::new(SubagentStoreSink {
-                store: store.clone(),
-            }),
-            sid.as_str().to_string(),
-        ),
-        None => (Arc::new(NoopSubagentSink), String::new()),
-    };
+    let (sink, session_id): (Arc<dyn EventSink>, String) =
+        match (runtime_handle.clone(), user_input) {
+            (Some(runtime), Some((_, sid))) => (
+                Arc::new(SubagentRuntimeSink { runtime }),
+                sid.as_str().to_string(),
+            ),
+            (None, Some((store, sid))) => (
+                Arc::new(SubagentStoreSink {
+                    store: store.clone(),
+                }),
+                sid.as_str().to_string(),
+            ),
+            (Some(_), None) | (None, None) => (Arc::new(NoopSubagentSink), String::new()),
+        };
     let is_spawned_subagent = user_input
         .as_ref()
         .is_some_and(|(store, sid)| session_is_spawned_subagent_for_tools(store, sid.as_str()));
