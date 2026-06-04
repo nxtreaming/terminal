@@ -1,0 +1,145 @@
+# Live Runtime Inversion Status Audit
+
+This file is the current truth for the `codex/live-runtime-rewrite` branch after
+the latest runtime/mailbox hardening commits. The long checklist in
+`docs/agent-design/live-runtime-inversion-checklist.md` is still the target, but
+it is not all implemented yet.
+
+## Current Shape
+
+```text
+TUI / CLI / Python SDK
+        |
+        v
+RuntimeAgentExecutor / SDK JSON-RPC
+        |
+        v
+RuntimeHandle::run_agent
+        |
+        +-- barrier: agent.input.accepted
+        +-- barrier: agent.started / agent.turn.started
+        +-- claims BrowserManager metadata lease when browser_id exists
+        |
+        v
+RuntimeTurnDriver
+        |
+        v
+existing agent crate model/tool loop
+        |
+        +-- LiveTurnState
+        |     +-- runtime-backed fresh input consumption
+        |     +-- runtime-backed mailbox delivery/consume
+        |     +-- Store/Journals still used for durable prompt/history
+        |     +-- compaction/token state still local to agent crate state
+        |
+        +-- provider/tool registry
+              +-- runtime event sink when runtime is present
+              +-- some resource ownership still provider/session scoped
+
+BrowserUseRuntime
+        |
+        +-- AgentManager / AgentThread
+        |     +-- in-memory mailbox with seq wakeups
+        |     +-- AgentLiveState counters/cursors
+        |     +-- AgentResourceSet skeleton
+        |
+        +-- BrowserManager
+        |     +-- BrowserHandle metadata lease/status
+        |
+        +-- JournalSink / StateIndex
+              |
+              v
+            SQLite debug journal + replay source
+```
+
+## What Is Implemented
+
+- Root agent input is accepted inside `RuntimeHandle::run_agent` before
+  `agent.started`, with barrier journal semantics.
+- Runtime-backed runs no longer enqueue live mailbox rows into
+  `agent_messages`; live smokes show `agent_messages` stays empty.
+- Child completion mail is non-triggering and delivered through the runtime
+  mailbox. `wait_agent` observes mailbox sequence changes and records
+  `after_seq`, `mailbox_seq`, and `timed_out`.
+- Subagent lifecycle UI events use the runtime-backed event sink when a runtime
+  handle exists.
+- `session.done` emitted by the turn observer is routed through the runtime
+  journal path, and `RunAgentResponse.final_result` is derived from the runtime
+  journal.
+- CLI child spawn/send/wait paths have runtime-backed live tests and guards
+  proving they do not depend on store `agent_messages` for live delivery.
+- SDK JSON-RPC request lifecycle is hardened for serialized writes,
+  cancellation cleanup, notification writes, and pending-future failure on
+  close.
+- Browser metadata leases exist in `BrowserManager`, including barrier tests for
+  claim failure and same-browser ownership conflicts.
+
+## What Is Still Not The Final Architecture
+
+- `RuntimeAgentExecutor` still builds a `SharedStore` and supplies a closure to
+  `RuntimeHandle::run_agent`. The runtime owns the lifecycle envelope, but the
+  reusable turn loop is still implemented in `crates/browser-use-agent`.
+- `RuntimeTurnDriver` still calls the existing
+  `run_session_once_with_config_with_cancel` path. The turn loop has been
+  wrapped by runtime ownership, not moved into `browser-use-runtime`.
+- `LiveTurnState` still contains `SharedStore` and reconstructs durable prompt
+  history from Store/SQLite. Fresh input and mailbox are runtime-backed, but
+  prompt history, compaction checkpoints, and token replay are still
+  Store-shaped.
+- `run_session_with_config*` remains as compatibility wrappers over
+  `RuntimeHandle::run_agent`. They are not an independent live authority when
+  called normally, but they have not been deleted.
+- `StoreNotificationWatcher` and `agent_messages` still exist for history,
+  replay, and compatibility tests. The live runtime path has guards against
+  using them, but the old storage surfaces are not removed.
+- `AgentThread.AgentResourceSet` exists, but unified exec, Python worker, MCP,
+  and browser script resources are not fully owned by a per-agent
+  `ToolResourceBag`.
+- `BrowserManager` is still mostly a metadata/lease manager. Actual
+  `browser_script` execution is not fully routed through a stateful
+  `BrowserHandle` with script registry, artifacts, cancellation, and crash/lost
+  resource semantics.
+- TUI uses runtime for live cancellation/follow-up/mailbox counts, but active
+  rendering is still substantially Store/history-cache based. A true
+  `RuntimeEventProjection` state machine is not the TUI authority yet.
+- Replay materialization restores important mailbox/live counters, but full
+  crash recovery still does not hydrate every durable graph field or explicitly
+  journal every stale live resource as lost/orphaned.
+
+## Verification Passed
+
+- `cargo fmt --check`
+- `cargo test`
+- `uv run --with pytest python -m pytest -q`
+- `scripts/verify-terminal-ui.sh`
+- Inspected `/tmp/but-design-loop` deterministic dumps and tmux captures.
+- Live GPT-5.5 subagent smoke:
+  `spin up 2 subagents ask them whats the capital of france and compare answers`
+- Live GPT-5.5 codebase research smoke:
+  `can you spin up a few subagents that research this codebase pls`
+- Browser boundary smoke:
+  `scripts/live-browser-boundary-smoke.sh`
+- Direct CLI tool smoke:
+  `user-shell` plus `python`
+- Live GPT-5.5 model-facing exec/write smoke:
+  `exec_command` with `tty=true`, followed by `write_stdin`, producing
+  `hello` and `got:hello`.
+
+## Remaining High-Risk Work
+
+```text
+1. Move turn-loop ownership deeper into RuntimeHandle/AgentThread.
+2. Replace Store-shaped LiveTurnState history/compaction/token state with
+   runtime-owned state plus JournalReader replay.
+3. Make RuntimeEventProjection the live TUI/SDK streaming authority.
+4. Move tool resources into AgentThread.ToolResourceBag.
+5. Promote BrowserManager from lease metadata to the owner of browser sessions
+   and browser_script runs.
+6. Complete replay/crash recovery and lost-resource journaling.
+7. Add negative barrier tests for every critical transition.
+8. Delete or hard-gate old store-first live helpers once all call sites are gone.
+```
+
+The branch is much more robust than the initial hybrid, and the user-visible
+subagent bugs that triggered this work are covered by live smokes. It is not yet
+the full final design from the checklist.
