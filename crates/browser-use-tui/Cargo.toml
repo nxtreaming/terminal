@@ -15,6 +15,7 @@ browser-use-agent = { path = "../browser-use-agent" }
 browser-use-browser = { path = "../browser-use-browser" }
 browser-use-providers = { path = "../browser-use-providers" }
 browser-use-protocol = { path = "../browser-use-protocol" }
+browser-use-runtime = { path = "../browser-use-runtime" }
 browser-use-store = { path = "../browser-use-store" }
 clap.workspace = true
 crossterm.workspace = true

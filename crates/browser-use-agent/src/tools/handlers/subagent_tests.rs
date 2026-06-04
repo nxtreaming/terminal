@@ -28,6 +28,11 @@ use crate::subagents::DEFAULT_AGENT_MAX_DEPTH;
 use crate::tools::runtime::{SandboxAttempt, ToolCtx};
 use crate::tools::sandbox::{SandboxLaunch, SandboxPermissions, SandboxType};
 use browser_use_protocol::SessionStatus;
+use browser_use_runtime::{
+    AgentId as RuntimeAgentId, AttachChildAgentRequest, AttachRootAgentRequest, BrowserUseRuntime,
+    CompleteAgentRequest, LiveThreadPersistence, SessionId as RuntimeSessionId, SqliteJournal,
+    StateIndex,
+};
 use browser_use_store::Store;
 
 /// A fake child-spawner that simulates a child running to completion: it flips
@@ -127,6 +132,7 @@ fn deps_with_fake() -> (Arc<SubagentManager>, Arc<CaptureSink>, SubagentToolDeps
         store: None,
         child_runner: None,
         cleanup_session_runtime: None,
+        runtime_handle: None,
         spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
         wait_timeouts: Default::default(),
         hide_spawn_agent_metadata: false,
@@ -184,6 +190,7 @@ fn deps_with_store_tree() -> (
         store: Some(shared_store.clone()),
         child_runner: None,
         cleanup_session_runtime: None,
+        runtime_handle: None,
         spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
         wait_timeouts: Default::default(),
         hide_spawn_agent_metadata: false,
@@ -422,11 +429,11 @@ async fn store_backed_spawn_does_not_emit_duplicate_legacy_spawn_event() {
 }
 
 #[tokio::test]
-async fn store_backed_v2_wait_ignores_manager_mailbox_notifications() {
+async fn store_backed_v2_wait_requires_live_runtime_mailbox() {
     let (_dir, _store, _root_id, _child_id, _sink, mut deps) = deps_with_store_tree();
     deps.wait_timeouts = WaitAgentTimeoutOptions {
         default_timeout_ms: 1,
-        min_timeout_ms: 0,
+        min_timeout_ms: 1,
         max_timeout_ms: 10,
     };
     deps.manager.mailbox().enqueue(InterAgentCommunication::new(
@@ -438,16 +445,120 @@ async fn store_backed_v2_wait_ignores_manager_mailbox_notifications() {
     ));
     let wait = WaitAgentTool::new(deps);
 
-    let out = run_handler(
+    let err = run_handler(
         &wait,
         &WaitAgentRequest {
-            timeout_ms: Some(0),
+            timeout_ms: Some(1),
         },
     )
     .await
-    .expect("store-backed v2 wait should return from the durable store path");
+    .expect_err("Store-backed v2 wait must not be a live wakeup path");
+    assert!(
+        format!("{err:?}").contains("requires a live runtime mailbox"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn store_backed_v2_wait_does_not_consume_durable_completion_projection() {
+    let (_dir, store, root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    let handler = store_completion_handler(store.clone(), root_id.clone(), child_id, None);
+    handler
+        .notify(ChildAgentRunCompletion::success(Some(
+            "queued result".to_string(),
+        )))
+        .expect("completion should project parent terminal event");
+
+    deps.wait_timeouts = WaitAgentTimeoutOptions {
+        default_timeout_ms: 1,
+        min_timeout_ms: 1,
+        max_timeout_ms: 50,
+    };
+    let wait = WaitAgentTool::new(deps);
+
+    let err = run_handler(
+        &wait,
+        &WaitAgentRequest {
+            timeout_ms: Some(1),
+        },
+    )
+    .await
+    .expect_err("durable completion projection must not wake Store-backed wait");
+    assert!(
+        format!("{err:?}").contains("requires a live runtime mailbox"),
+        "{err:?}"
+    );
+
+    let store = store.lock().unwrap();
+    let parent_mail = store.messages_for_agent(&root_id).unwrap();
+    assert!(
+        parent_mail.is_empty(),
+        "Store-backed completion projection must not enqueue live mailbox rows"
+    );
+}
+
+#[tokio::test]
+async fn runtime_backed_v2_wait_uses_live_mailbox_without_store_mail() {
+    let (dir, store, root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    let journal = Arc::new(SqliteJournal::from_store(
+        Store::open(dir.path()).expect("runtime store"),
+    ));
+    let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+    let state_index: Arc<dyn StateIndex> = journal;
+    let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+    runtime
+        .attach_root_agent(AttachRootAgentRequest {
+            session_id: RuntimeSessionId::from_string(root_id.clone()).expect("root session id"),
+            cwd: "/tmp".into(),
+            task: "root".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })
+        .expect("attach root");
+    runtime
+        .attach_child_agent(AttachChildAgentRequest {
+            parent_agent_id: RuntimeAgentId::from_string(root_id.clone()).expect("parent id"),
+            child_agent_id: RuntimeAgentId::from_string(child_id.clone()).expect("child id"),
+            child_session_id: RuntimeSessionId::from_string(child_id.clone())
+                .expect("child session id"),
+            cwd: "/tmp".into(),
+            agent_path: "/root/worker".to_string(),
+            nickname: Some("Atlas".to_string()),
+            role: Some("explorer".to_string()),
+        })
+        .expect("attach child");
+    runtime
+        .complete_agent(CompleteAgentRequest {
+            child_agent_id: RuntimeAgentId::from_string(child_id).expect("child id"),
+            result: "runtime result".to_string(),
+        })
+        .expect("complete child");
+
+    deps.runtime_handle = Some(runtime);
+    deps.wait_timeouts = WaitAgentTimeoutOptions {
+        default_timeout_ms: 1,
+        min_timeout_ms: 1,
+        max_timeout_ms: 50,
+    };
+    let wait = WaitAgentTool::new(deps);
+
+    let out = run_handler(
+        &wait,
+        &WaitAgentRequest {
+            timeout_ms: Some(1),
+        },
+    )
+    .await
+    .expect("runtime completion mail should wake wait_agent");
     let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
+    assert_eq!(body["message"].as_str(), Some("Wait completed."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(false), "{body}");
+    assert!(body["mailbox_seq"].as_u64().is_some(), "{body}");
+    assert!(store
+        .lock()
+        .unwrap()
+        .messages_for_agent(&root_id)
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -478,8 +589,8 @@ async fn wait_returns_child_completion_via_mailbox() {
 async fn wait_uses_configured_timeout_bounds() {
     let (_manager, _sink, mut deps) = deps_with_fake();
     deps.wait_timeouts = WaitAgentTimeoutOptions {
-        default_timeout_ms: 50,
-        min_timeout_ms: 0,
+        default_timeout_ms: 1,
+        min_timeout_ms: 1,
         max_timeout_ms: 50,
     };
     let wait = WaitAgentTool::new(deps);
@@ -488,61 +599,112 @@ async fn wait_uses_configured_timeout_bounds() {
         .await
         .expect("default timeout should be accepted");
     let body: serde_json::Value = serde_json::from_str(&default_timeout.stdout).unwrap();
-    assert_eq!(body["timed_out"].as_bool(), Some(true));
+    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
+    assert!(body.get("status").is_none(), "{body}");
 
-    run_handler(
+    let min_timeout = run_handler(
         &wait,
         &WaitAgentRequest {
-            timeout_ms: Some(0),
+            timeout_ms: Some(1),
         },
     )
     .await
     .expect("configured minimum should be accepted");
+    let body: serde_json::Value = serde_json::from_str(&min_timeout.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
 
-    let too_large = run_handler(
+    let above_max = run_handler(
         &wait,
         &WaitAgentRequest {
             timeout_ms: Some(51),
         },
     )
     .await
-    .expect_err("timeout above configured maximum must fail");
+    .expect("timeout above configured maximum should clamp");
+    let body: serde_json::Value = serde_json::from_str(&above_max.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
+}
+
+#[tokio::test]
+async fn store_backed_wait_requires_live_runtime_mailbox() {
+    let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    {
+        let store = store.lock().unwrap();
+        store
+            .close_child_agent(&child_id, "test no-live wait")
+            .expect("close child");
+    }
+    deps.wait_timeouts = WaitAgentTimeoutOptions {
+        default_timeout_ms: 1,
+        min_timeout_ms: 1,
+        max_timeout_ms: 50,
+    };
+    let wait = WaitAgentTool::new(deps);
+
+    let out = run_handler(
+        &wait,
+        &WaitAgentRequest {
+            timeout_ms: Some(1),
+        },
+    )
+    .await
+    .expect_err("Store-backed live wait should be rejected");
+    let out = format!("{out:?}");
     assert!(
-        format!("{too_large:?}").contains("at most 50"),
-        "unexpected error: {too_large:?}"
+        out.contains("wait_agent requires a live runtime mailbox"),
+        "{out}"
     );
 }
 
 #[tokio::test]
-async fn wait_rejects_codex_timeout_bounds() {
+async fn wait_uses_codex_timeout_bounds() {
     let (_manager, _sink, deps) = deps_with_fake();
+    deps.manager.mailbox().enqueue(InterAgentCommunication::new(
+        "/root/worker",
+        "/root",
+        Vec::new(),
+        "pending mail",
+        true,
+    ));
     let wait = WaitAgentTool::new(deps);
 
-    let too_small = run_handler(
+    let zero = run_handler(
+        &wait,
+        &WaitAgentRequest {
+            timeout_ms: Some(0),
+        },
+    )
+    .await
+    .expect_err("zero timeout must fail");
+    assert!(
+        format!("{zero:?}").contains("greater than zero"),
+        "unexpected error: {zero:?}"
+    );
+
+    let below_min = run_handler(
         &wait,
         &WaitAgentRequest {
             timeout_ms: Some(9_999),
         },
     )
     .await
-    .expect_err("timeout below codex v2 minimum must fail");
-    assert!(
-        format!("{too_small:?}").contains("at least 10000"),
-        "unexpected error: {too_small:?}"
-    );
+    .expect("positive timeout below configured minimum should clamp");
+    let body: serde_json::Value = serde_json::from_str(&below_min.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait completed."), "{body}");
 
-    let too_large = run_handler(
+    let above_max = run_handler(
         &wait,
         &WaitAgentRequest {
             timeout_ms: Some(3_600_001),
         },
     )
     .await
-    .expect_err("timeout above codex v2 maximum must fail");
-    assert!(
-        format!("{too_large:?}").contains("at most 3600000"),
-        "unexpected error: {too_large:?}"
-    );
+    .expect("timeout above configured maximum should clamp");
+    let body: serde_json::Value = serde_json::from_str(&above_max.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait completed."), "{body}");
 }
 
 #[tokio::test]
@@ -867,15 +1029,75 @@ async fn close_agent_marks_target_closed() {
 }
 
 #[tokio::test]
-async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
+async fn store_backed_close_agent_rejects_already_closed_child() {
+    let (_dir, store, _root_id, child_id, _sink, deps) = deps_with_store_tree();
+    {
+        let store = store.lock().unwrap();
+        store
+            .close_child_agent(&child_id, "already closed")
+            .expect("close child");
+    }
+    let close = CloseAgentTool::new(deps);
+
+    let err = run_handler(
+        &close,
+        &CloseAgentRequest {
+            target: "worker".to_string(),
+        },
+    )
+    .await
+    .expect_err("closed child is no longer a live v2 close target");
+    assert!(
+        format!("{err:?}").contains("live agent path `worker` not found"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn store_thread_limit_ignores_terminal_child_edges() {
+    let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_child_agent_status(&child_id, "done")
+            .expect("mark child terminal");
+    }
+    deps.max_concurrent_threads_per_session = Some(2);
+    let spawn = SpawnAgentTool::new(deps);
+
+    let out = run_handler(&spawn, &spawn_args("next", "new task"))
+        .await
+        .expect("terminal persisted edge must not consume spawn capacity");
+    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(body["task_name"].as_str(), Some("/root/next"));
+}
+
+#[tokio::test]
+async fn store_tree_is_not_live_spawn_capacity_authority() {
+    let (_dir, _store, _root_id, _child_id, sink, mut deps) = deps_with_store_tree();
+    deps.max_concurrent_threads_per_session = Some(2);
+    let spawn = SpawnAgentTool::new(deps);
+
+    let out = run_handler(&spawn, &spawn_args("next", "new task"))
+        .await
+        .expect("historical Store children must not reject live spawn capacity");
+    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(body["task_name"].as_str(), Some("/root/next"));
+    assert!(!sink
+        .types()
+        .contains(&"subagent.spawn_rejected".to_string()));
+}
+
+#[tokio::test]
+async fn followup_task_requires_runtime_mailbox_for_store_child() {
     let (_dir, store, root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    seed_child_run_config_marker(&store, &child_id);
     {
         let store = store.lock().unwrap();
         store
             .set_status(&child_id, SessionStatus::Done)
             .expect("child idle");
     }
-    seed_child_run_config_marker(&store, &child_id);
 
     let captured: Arc<Mutex<Vec<ChildAgentRunRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_for_runner = Arc::clone(&captured);
@@ -905,7 +1127,7 @@ async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
     deps.child_runner = Some(runner);
     let followup = FollowupTaskTool::new(deps);
 
-    let out = run_handler(
+    let err = run_handler(
         &followup,
         &FollowupTaskRequest {
             target: "worker".to_string(),
@@ -913,32 +1135,74 @@ async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
         },
     )
     .await
-    .expect("followup ok");
-    assert!(out.stdout.is_empty());
+    .expect_err("Store-backed follow-up should require runtime");
+    assert!(
+        format!("{err:?}").contains("subagent messaging requires a live runtime mailbox"),
+        "{err:?}"
+    );
 
     let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].child_session_id, child_id);
-    assert_eq!(requests[0].fork_turns.as_deref(), Some("none"));
-    assert!(requests[0].run_id.is_some());
-    assert_child_run_config_replayed(&requests[0]);
+    assert!(requests.is_empty());
     drop(requests);
 
     let store = store.lock().unwrap();
     let child_mail = store.messages_for_agent(&child_id).unwrap();
-    assert_eq!(child_mail.len(), 1);
-    assert_eq!(child_mail[0].content, "next task");
-    assert!(child_mail[0].trigger_turn);
+    assert!(child_mail.is_empty());
 
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
-    assert_eq!(parent_mail.len(), 1);
-    assert!(parent_mail[0].content.contains("<subagent_notification>"));
-    assert!(!parent_mail[0].trigger_turn);
+    assert!(parent_mail.is_empty());
     assert!(store
         .events_for_session(&root_id)
         .unwrap()
         .iter()
-        .any(|event| event.event_type == "agent.completed"));
+        .all(|event| event.event_type != "agent.completed"));
+}
+
+#[tokio::test]
+async fn store_completion_handler_projects_done_parent_without_store_mail() {
+    let (_dir, store, root_id, child_id, _sink, _deps) = deps_with_store_tree();
+    let run_id = "late-run".to_string();
+    let handler = store_completion_handler(
+        store.clone(),
+        root_id.clone(),
+        child_id.clone(),
+        Some(run_id.clone()),
+    );
+
+    {
+        let store = store.lock().unwrap();
+        store
+            .append_event(
+                &child_id,
+                "agent.run.started",
+                serde_json::json!({ "run_id": run_id.as_str() }),
+            )
+            .unwrap();
+        store
+            .set_status(&root_id, SessionStatus::Done)
+            .expect("parent marked done before child completion");
+    }
+
+    handler
+        .notify(ChildAgentRunCompletion::success(Some(
+            "late result".to_string(),
+        )))
+        .expect("late completion should notify idle parent");
+
+    let store = store.lock().unwrap();
+    let parent_events = store.events_for_session(&root_id).unwrap();
+    assert_eq!(
+        parent_events
+            .iter()
+            .filter(|event| event.event_type == "agent.completed")
+            .count(),
+        1
+    );
+    let parent_mail = store.messages_for_agent(&root_id).unwrap();
+    assert!(
+        parent_mail.is_empty(),
+        "Store completion projection must not enqueue live mailbox rows"
+    );
 }
 
 #[tokio::test]
@@ -1016,8 +1280,10 @@ async fn store_completion_handler_ignores_stale_run_marker_after_restart() {
         1
     );
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
-    assert_eq!(parent_mail.len(), 1);
-    assert!(parent_mail[0].content.contains("fresh result"));
+    assert!(
+        parent_mail.is_empty(),
+        "Store completion projection must not enqueue live mailbox rows"
+    );
 }
 
 #[tokio::test]
@@ -1112,12 +1378,14 @@ async fn store_completion_handler_writes_current_run_completion_once() {
         "duplicate failure must not overwrite first completion: {parent_events:?}"
     );
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
-    assert_eq!(parent_mail.len(), 1);
-    assert!(parent_mail[0].content.contains("first result"));
+    assert!(
+        parent_mail.is_empty(),
+        "Store completion projection must not enqueue live mailbox rows"
+    );
 }
 
 #[tokio::test]
-async fn send_input_interrupt_cancels_and_restarts_store_backed_child() {
+async fn send_input_interrupt_requires_runtime_mailbox_for_store_child() {
     let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
     seed_child_run_config_marker(&store, &child_id);
     let captured: Arc<Mutex<Vec<ChildAgentRunRequest>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1128,7 +1396,7 @@ async fn send_input_interrupt_cancels_and_restarts_store_backed_child() {
     }));
     let send = SendInputTool::new(deps);
 
-    let out = run_handler(
+    let err = run_handler(
         &send,
         &SendInputRequest {
             target: child_id.clone(),
@@ -1138,36 +1406,31 @@ async fn send_input_interrupt_cancels_and_restarts_store_backed_child() {
         },
     )
     .await
-    .expect("interrupting send_input should succeed");
-    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-    assert!(body["submission_id"].is_string());
+    .expect_err("Store-backed send_input should require runtime");
+    assert!(
+        format!("{err:?}").contains("send_input requires a live runtime mailbox"),
+        "{err:?}"
+    );
 
     let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].child_session_id, child_id);
-    assert_eq!(requests[0].fork_turns.as_deref(), Some("none"));
-    assert_eq!(requests[0].message, "redirect now");
-    assert_child_run_config_replayed(&requests[0]);
+    assert!(requests.is_empty());
     drop(requests);
 
     let store = store.lock().unwrap();
-    let child = store.load_session(&child_id).unwrap().unwrap();
-    assert_eq!(child.status, SessionStatus::Created);
     let child_events = store.events_for_session(&child_id).unwrap();
     assert!(child_events
         .iter()
-        .any(|event| event.event_type == "session.cancel_requested"));
+        .all(|event| event.event_type != "session.cancel_requested"));
     let child_mail = store.messages_for_agent(&child_id).unwrap();
-    assert_eq!(child_mail.len(), 1);
-    assert!(child_mail[0].trigger_turn);
+    assert!(child_mail.is_empty());
 }
 
 #[tokio::test]
-async fn send_input_items_preserves_structured_user_input_for_store_child() {
+async fn send_input_items_require_runtime_mailbox_for_store_child() {
     let (_dir, store, _root_id, child_id, _sink, deps) = deps_with_store_tree();
     let send = SendInputTool::new(deps);
 
-    run_handler(
+    let err = run_handler(
         &send,
         &SendInputRequest {
             target: child_id.clone(),
@@ -1185,17 +1448,15 @@ async fn send_input_items_preserves_structured_user_input_for_store_child() {
         },
     )
     .await
-    .expect("structured send_input should succeed");
+    .expect_err("Store-backed structured send_input should require runtime");
+    assert!(
+        format!("{err:?}").contains("send_input requires a live runtime mailbox"),
+        "{err:?}"
+    );
 
     let store = store.lock().unwrap();
     let child_mail = store.messages_for_agent(&child_id).unwrap();
-    assert_eq!(child_mail.len(), 1);
-    assert_eq!(child_mail[0].content, "preserve me");
-    assert_eq!(child_mail[0].input_kind, "user_input");
-    assert_eq!(
-        child_mail[0].input_items,
-        Some(serde_json::json!([{ "type": "text", "text": "preserve me" }]))
-    );
+    assert!(child_mail.is_empty());
 }
 
 #[tokio::test]
@@ -1267,12 +1528,13 @@ async fn wait_closed_completed_store_child_reports_shutdown() {
         .unwrap();
     store.set_child_agent_status(&child_id, "closed").unwrap();
 
-    let statuses = final_statuses_for_v1_wait(&store, &[child_id.as_str()]).unwrap();
+    let statuses =
+        crate::subagents::final_statuses_for_v1_wait(&store, &[child_id.as_str()]).unwrap();
     assert_eq!(statuses["/root/worker"], serde_json::json!("shutdown"));
 }
 
 #[tokio::test]
-async fn send_input_wakes_resumed_store_backed_child() {
+async fn send_input_to_resumed_store_child_requires_runtime_mailbox() {
     let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
     {
         let store = store.lock().unwrap();
@@ -1299,7 +1561,7 @@ async fn send_input_wakes_resumed_store_backed_child() {
     }));
     let send = SendInputTool::new(deps);
 
-    run_handler(
+    let err = run_handler(
         &send,
         &SendInputRequest {
             target: child_id.clone(),
@@ -1309,12 +1571,14 @@ async fn send_input_wakes_resumed_store_backed_child() {
         },
     )
     .await
-    .expect("send_input after resume should wake the child runner");
+    .expect_err("send_input after resume should require runtime");
+    assert!(
+        format!("{err:?}").contains("send_input requires a live runtime mailbox"),
+        "{err:?}"
+    );
 
     let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].child_session_id, child_id);
-    assert_eq!(requests[0].message, "continue after resume");
+    assert!(requests.is_empty());
 }
 
 #[tokio::test]
@@ -1352,7 +1616,34 @@ async fn resume_completed_store_backed_child_restarts_target() {
 
 #[tokio::test]
 async fn store_backed_tools_use_durable_agent_tree() {
-    let (_dir, store, root_id, child_id, sink, mut deps) = deps_with_store_tree();
+    let (dir, store, root_id, child_id, sink, mut deps) = deps_with_store_tree();
+    let journal = Arc::new(SqliteJournal::from_store(
+        Store::open(dir.path()).expect("runtime store"),
+    ));
+    let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+    let state_index: Arc<dyn StateIndex> = journal;
+    let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+    runtime
+        .attach_root_agent(AttachRootAgentRequest {
+            session_id: RuntimeSessionId::from_string(root_id.clone()).expect("root session id"),
+            cwd: "/tmp".into(),
+            task: "root".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })
+        .expect("attach root");
+    let runtime_child = runtime
+        .attach_child_agent(AttachChildAgentRequest {
+            parent_agent_id: RuntimeAgentId::from_string(root_id.clone()).expect("parent id"),
+            child_agent_id: RuntimeAgentId::from_string(child_id.clone()).expect("child id"),
+            child_session_id: RuntimeSessionId::from_string(child_id.clone())
+                .expect("child session id"),
+            cwd: "/tmp".into(),
+            agent_path: "/root/worker".to_string(),
+            nickname: Some("Worker".to_string()),
+            role: Some("explorer".to_string()),
+        })
+        .expect("attach child");
+    deps.runtime_handle = Some(runtime.clone());
     let grandchild_id = {
         let store = store.lock().unwrap();
         store
@@ -1393,15 +1684,23 @@ async fn store_backed_tools_use_durable_agent_tree() {
     {
         let store = store.lock().unwrap();
         let mail = store.messages_for_agent(&child_id).unwrap();
-        assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].content, "durable note");
-        assert!(!mail[0].trigger_turn);
-        assert!(store
-            .events_for_session(&root_id)
-            .unwrap()
+        assert!(
+            mail.is_empty(),
+            "runtime-backed send_message should not use store agent_messages rows"
+        );
+        let root_events = store.events_for_session(&root_id).unwrap();
+        assert!(root_events
             .iter()
             .any(|event| event.event_type == "agent.message"));
+        let child_events = store.events_for_session(&child_id).unwrap();
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "mailbox.enqueued"));
     }
+    let live_mail = runtime_child.mailbox().pending_items();
+    assert_eq!(live_mail.len(), 1);
+    assert_eq!(live_mail[0].content, "durable note");
+    assert!(!live_mail[0].trigger_turn);
 
     let listed = run_handler(&list, &ListAgentsRequest::default())
         .await
@@ -1434,11 +1733,19 @@ async fn store_backed_tools_use_durable_agent_tree() {
                 .status,
             "closed"
         );
+        assert_eq!(
+            store
+                .agent_summary_for_child(&grandchild_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "closed"
+        );
     }
     let cleaned_sessions = cleaned_sessions.lock().unwrap();
-    assert_eq!(
-        cleaned_sessions.as_slice(),
-        &[child_id.clone(), grandchild_id]
+    assert!(
+        cleaned_sessions.is_empty(),
+        "runtime-backed close should use runtime resource cleanup, not the store fallback callback"
     );
     assert!(sink.types().contains(&"subagent.input".to_string()));
     assert!(sink.types().contains(&"subagent.closed".to_string()));
@@ -1463,6 +1770,7 @@ async fn spawn_failure_surfaces_as_tool_error() {
         store: None,
         child_runner: None,
         cleanup_session_runtime: None,
+        runtime_handle: None,
         spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
         wait_timeouts: Default::default(),
         hide_spawn_agent_metadata: false,

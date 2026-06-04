@@ -19,8 +19,8 @@ use crate::theme::{
 use super::{
     active_followup_is_after_next_tool_call, active_followup_is_cancelled_in_events,
     active_followup_is_pending_in_events, user_input_display_text_from_payload, App,
-    PENDING_FOLLOWUP_INTERRUPT_REASON, SESSION_PAUSED_REASON,
-    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
+    PENDING_FOLLOWUP_INTERRUPT_REASON, SESSION_MAILBOX_CONTINUATION_STARTED_EVENT,
+    SESSION_PAUSED_REASON, SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
 };
 
 const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
@@ -634,7 +634,9 @@ fn build_transcript_model_from_events(
         }
     }
 
-    let active = if session.status.is_active() {
+    let has_live_subagent_work = active_child_session_count(app, &session.id) > 0
+        || pending_agent_mailbox_count(app, &session.id) > 0;
+    let active = if session.status.is_active() || has_live_subagent_work {
         active_node_for_session(app, state, session, events)
     } else {
         None
@@ -1040,30 +1042,7 @@ fn committed_node_for_event(
                 ))
             }
         }
-        "collab_waiting_begin" => {
-            if has_later_root_event(events, event, "agent.wait.started") {
-                None
-            } else {
-                Some(subagent_lifecycle_node(
-                    app,
-                    event,
-                    "waiting",
-                    NodeStyle::Muted,
-                ))
-            }
-        }
-        "collab_waiting_end" => {
-            if has_later_root_event(events, event, "agent.wait.finished") {
-                None
-            } else {
-                Some(timeline_node(
-                    event,
-                    "subagent wait finished",
-                    Vec::new(),
-                    NodeStyle::Muted,
-                ))
-            }
-        }
+        "collab_waiting_begin" | "collab_waiting_end" => None,
         "collab_close_end" => Some(subagent_lifecycle_node(
             app,
             event,
@@ -1088,6 +1067,18 @@ fn committed_node_for_event(
             "started",
             NodeStyle::Normal,
         )),
+        "agent.spawn.queued" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "queued",
+            NodeStyle::Muted,
+        )),
+        "agent.spawn.queue_released" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "starting",
+            NodeStyle::Muted,
+        )),
         "agent.message" => Some(subagent_lifecycle_node(
             app,
             event,
@@ -1103,51 +1094,28 @@ fn committed_node_for_event(
             },
             NodeStyle::Muted,
         )),
-        "agent.wait.started" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "waiting",
-            NodeStyle::Muted,
-        )),
-        "agent.wait.finished" => Some(timeline_node(
-            event,
-            if event
-                .payload
-                .get("timed_out")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                "subagent wait timed out"
+        "agent.wait.started" => None,
+        "agent.wait.finished" => agent_wait_finished_node(event),
+        SESSION_MAILBOX_CONTINUATION_STARTED_EVENT => Some(mailbox_continuation_node(event)),
+        "agent.resumed" => {
+            if is_replay_materialization_event(event) {
+                None
             } else {
-                "subagent wait finished"
-            },
-            Vec::new(),
-            NodeStyle::Muted,
-        )),
-        "agent.resumed" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "resumed",
-            NodeStyle::Normal,
-        )),
-        "agent.completed" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "finished",
-            NodeStyle::Normal,
-        )),
-        "agent.failed" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "failed",
-            NodeStyle::Failed,
-        )),
-        "agent.cancelled" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "stopped",
-            NodeStyle::Muted,
-        )),
+                Some(subagent_lifecycle_node(
+                    app,
+                    event,
+                    "resumed",
+                    NodeStyle::Normal,
+                ))
+            }
+        }
+        "agent.completed" => {
+            subagent_terminal_lifecycle_node(app, event, "finished", NodeStyle::Normal)
+        }
+        "agent.failed" => subagent_terminal_lifecycle_node(app, event, "failed", NodeStyle::Failed),
+        "agent.cancelled" => {
+            subagent_terminal_lifecycle_node(app, event, "stopped", NodeStyle::Muted)
+        }
         "model.tool_call" | "tool.started" | "tool.finished" => None,
         "tool.batch_started" | "tool.batch_result" | "tool.batch_finished" => None,
         "tool.output" => tool_output_node(event),
@@ -1562,6 +1530,7 @@ fn active_node_for_session(
     }
 
     let active_child_count = active_child_session_count(app, &root.id);
+    let pending_mailbox_count = pending_agent_mailbox_count(app, &root.id);
     let live_thinking_text = state
         .transcript
         .last()
@@ -1616,9 +1585,18 @@ fn active_node_for_session(
             }
         }
     }
-    if live_streaming_text.is_none()
-        || (live_status == "Thinking..."
-            && live_stream_pending_status_allowed(live_events, !live_turn_is_followup))
+    if pending_mailbox_count > 0 && live_streaming_text.is_none() {
+        active_nodes.push(pending_status_node(
+            root,
+            events,
+            "subagent results ready",
+            pending_mailbox_summary(pending_mailbox_count).as_deref(),
+        ));
+    }
+    if pending_mailbox_count == 0
+        && (live_streaming_text.is_none()
+            || (live_status == "Thinking..."
+                && live_stream_pending_status_allowed(live_events, !live_turn_is_followup)))
     {
         active_nodes.push(pending_status_node(
             root,
@@ -1675,13 +1653,27 @@ fn live_status_for_session(
 }
 
 fn active_child_session_count(app: &App, root_id: &str) -> usize {
-    app.state_cache
+    let store_count = app
+        .state_cache
         .sessions
         .iter()
         .filter(|session| {
             session.parent_id.as_deref() == Some(root_id) && session.status.is_active()
         })
-        .count()
+        .count();
+    let runtime_count =
+        crate::runtime::runtime_active_child_session_count(&app.args.state_dir, root_id)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+    store_count.max(runtime_count)
+}
+
+fn pending_agent_mailbox_count(app: &App, session_id: &str) -> usize {
+    crate::runtime::pending_runtime_agent_mailbox_count(&app.args.state_dir, session_id)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
 }
 
 fn active_subagent_summary(active_child_count: usize) -> Option<String> {
@@ -1694,6 +1686,18 @@ fn active_subagent_summary(active_child_count: usize) -> Option<String> {
         "subagents"
     };
     Some(format!("({active_child_count} {noun} running)"))
+}
+
+fn pending_mailbox_summary(pending_mailbox_count: usize) -> Option<String> {
+    if pending_mailbox_count == 0 {
+        return None;
+    }
+    let noun = if pending_mailbox_count == 1 {
+        "result"
+    } else {
+        "results"
+    };
+    Some(format!("({pending_mailbox_count} subagent {noun} queued)"))
 }
 
 fn active_timeline_tail_node(
@@ -1832,12 +1836,21 @@ fn live_stream_pending_status_allowed(
     let Some(latest_stream) = latest_nonempty_stream_event(live_events) else {
         return false;
     };
-    if live_events.iter().any(|event| {
-        event.seq > latest_stream.seq
-            && event.event_type != "model.stream_delta"
-            && event.event_type != "goal.accounted"
+    let later_events = live_events
+        .iter()
+        .filter(|event| event.seq > latest_stream.seq)
+        .filter(|event| !is_replay_materialization_event(event))
+        .collect::<Vec<_>>();
+    if later_events.iter().any(|event| {
+        event.event_type != "model.stream_delta" && event.event_type != "goal.accounted"
     }) {
         return true;
+    }
+    if later_events
+        .iter()
+        .any(|event| event.event_type == "goal.accounted")
+    {
+        return false;
     }
     allow_quiet_status
         && now_ms().saturating_sub(latest_stream.ts_ms) >= LIVE_STREAM_QUIET_STATUS_DELAY_MS
@@ -1923,6 +1936,20 @@ fn active_node_for_event(
             events,
             "subagent",
             vec!["spawning".to_string()],
+            NodeStyle::Muted,
+        )),
+        "agent.spawn.queued" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["queued for capacity".to_string()],
+            NodeStyle::Muted,
+        )),
+        "agent.spawn.queue_released" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["starting queued task".to_string()],
             NodeStyle::Muted,
         )),
         "collab_agent_interaction_begin" => Some(active_status_node(
@@ -3396,7 +3423,23 @@ fn has_later_root_event(events: &[EventRecord], event: &EventRecord, event_type:
         candidate.session_id == event.session_id
             && candidate.seq > event.seq
             && candidate.event_type == event_type
+            && !is_replay_materialization_event(candidate)
     })
+}
+
+fn is_replay_materialization_event(event: &EventRecord) -> bool {
+    event
+        .payload
+        .get("materialized_from_replay")
+        .or_else(|| {
+            event
+                .payload
+                .get("payload")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|payload| payload.get("materialized_from_replay"))
+        })
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn has_agent_message_for_collab_receiver(events: &[EventRecord], event: &EventRecord) -> bool {
@@ -3435,11 +3478,34 @@ fn subagent_lifecycle_node(
     timeline_node(event, &group, Vec::new(), style)
 }
 
-fn subagent_label_for_event(app: &App, event: &EventRecord) -> Option<String> {
-    if let Some(child_id) = event
+fn subagent_terminal_lifecycle_node(
+    app: &App,
+    event: &EventRecord,
+    status: &str,
+    style: NodeStyle,
+) -> Option<TranscriptNode> {
+    if event_child_session_id(event).is_none() {
+        return None;
+    }
+    Some(subagent_lifecycle_node(app, event, status, style))
+}
+
+fn event_child_session_id(event: &EventRecord) -> Option<&str> {
+    event
         .payload
         .get("child_session_id")
         .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("child_session_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
+fn subagent_label_for_event(app: &App, event: &EventRecord) -> Option<String> {
+    if let Some(child_id) = event_child_session_id(event)
         .or_else(|| {
             event
                 .payload
@@ -3450,13 +3516,6 @@ fn subagent_label_for_event(app: &App, event: &EventRecord) -> Option<String> {
             event
                 .payload
                 .get("receiver_thread_id")
-                .and_then(serde_json::Value::as_str)
-        })
-        .or_else(|| {
-            event
-                .payload
-                .get("payload")
-                .and_then(|payload| payload.get("child_session_id"))
                 .and_then(serde_json::Value::as_str)
         })
     {
@@ -3547,6 +3606,37 @@ fn browser_event_label(event: &EventRecord) -> String {
     .to_string()
 }
 
+fn agent_wait_finished_node(event: &EventRecord) -> Option<TranscriptNode> {
+    if !event
+        .payload
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(timeline_node(
+        event,
+        "subagent wait timed out",
+        Vec::new(),
+        NodeStyle::Muted,
+    ))
+}
+
+fn mailbox_continuation_node(event: &EventRecord) -> TranscriptNode {
+    let count = event
+        .payload
+        .get("mailbox_messages")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let lines = if count == 0 {
+        Vec::new()
+    } else {
+        vec![format!("{count} mailbox update{} queued", plural(count))]
+    };
+    timeline_node(event, "subagent results ready", lines, NodeStyle::Normal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3565,6 +3655,41 @@ mod tests {
 
     fn filtered_seqs(events: &[EventRecord]) -> Vec<i64> {
         events.iter().map(|event| event.seq).collect()
+    }
+
+    #[test]
+    fn successful_agent_wait_finished_is_hidden_from_transcript() {
+        let event = EventRecord {
+            seq: 1,
+            id: "wait-finished".to_string(),
+            session_id: "s".to_string(),
+            ts_ms: 0,
+            event_type: "agent.wait.finished".to_string(),
+            payload: serde_json::json!({ "timed_out": false }),
+        };
+
+        assert!(agent_wait_finished_node(&event).is_none());
+    }
+
+    #[test]
+    fn timed_out_agent_wait_finished_stays_visible() {
+        let event = EventRecord {
+            seq: 1,
+            id: "wait-timeout".to_string(),
+            session_id: "s".to_string(),
+            ts_ms: 0,
+            event_type: "agent.wait.finished".to_string(),
+            payload: serde_json::json!({ "timed_out": true }),
+        };
+
+        let node = agent_wait_finished_node(&event).expect("timeout should render");
+        let text = node
+            .display_lines(120, DisplayMode::Scrollback)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("subagent wait timed out"), "{text}");
     }
 
     // The cache's extend path must produce exactly what a full rebuild would,

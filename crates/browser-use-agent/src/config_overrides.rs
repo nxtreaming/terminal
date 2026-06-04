@@ -45,10 +45,10 @@ pub const DEFAULT_MAX_CONTEXT_CHARS: usize = 240_000;
 /// Codex MultiAgentV2 defaults. These mirror Codex's `MultiAgentV2Config`
 /// values, with v2 enabled by default for this terminal's model-visible toolset.
 pub const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
-pub const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
+pub const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 1;
 pub const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
-pub const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
-pub const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 0;
+pub const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 300_000;
+pub const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 1;
 pub const HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;
 
 /// Parsed CLI/TUI `--config key=value` overrides: an ordered list of dotted TOML
@@ -2075,8 +2075,12 @@ nickname_candidates = ["Hypatia", "Noether"]
 
     #[test]
     fn rejects_invalid_multi_agent_v2_config() {
+        let _guard = crate::test_env::lock();
         let overrides = parse_config_overrides(&ov(&[
             "features.multi_agent_v2.max_concurrent_threads_per_session=0",
+            "features.multi_agent_v2.min_wait_timeout_ms=1",
+            "features.multi_agent_v2.default_wait_timeout_ms=1",
+            "features.multi_agent_v2.max_wait_timeout_ms=1000",
         ]))
         .unwrap();
         let err = resolve_multi_agent_v2_for_profile(None, &overrides).unwrap_err();
@@ -2084,9 +2088,24 @@ nickname_candidates = ["Hypatia", "Noether"]
             .to_string()
             .contains("max_concurrent_threads_per_session must be at least 1"));
 
-        let overrides =
-            parse_config_overrides(&ov(&["features.multi_agent_v2.tool_namespace=functions"]))
-                .unwrap();
+        let overrides = parse_config_overrides(&ov(&[
+            "features.multi_agent_v2.min_wait_timeout_ms=0",
+            "features.multi_agent_v2.default_wait_timeout_ms=1",
+            "features.multi_agent_v2.max_wait_timeout_ms=1000",
+        ]))
+        .unwrap();
+        let err = resolve_multi_agent_v2_for_profile(None, &overrides).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("min_wait_timeout_ms must be at least 1"));
+
+        let overrides = parse_config_overrides(&ov(&[
+            "features.multi_agent_v2.tool_namespace=functions",
+            "features.multi_agent_v2.min_wait_timeout_ms=1",
+            "features.multi_agent_v2.default_wait_timeout_ms=1",
+            "features.multi_agent_v2.max_wait_timeout_ms=1000",
+        ]))
+        .unwrap();
         let err = resolve_multi_agent_v2_for_profile(None, &overrides).unwrap_err();
         assert!(err.to_string().contains("reserved namespace"));
     }

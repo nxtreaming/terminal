@@ -19,6 +19,7 @@ use crate::tools::runtime::{
 use crate::tools::sandbox::{
     FileSystemSandboxPolicy, NoneSandboxProvider, SandboxLaunch, SandboxPermissions, SandboxType,
 };
+use crate::tools::unified_exec::DEFAULT_MAX_OUTPUT_TOKENS;
 use crate::tools::UnifiedExecManager;
 
 /// A `SandboxType::None` launch + attempt for direct `run` calls.
@@ -496,6 +497,7 @@ async fn shell_cancellation_kills_running_child() {
         cwd: None,
         timeout_ms: Some(10_000),
         env: HashMap::new(),
+        max_output_tokens: None,
     };
 
     let run_cancel = cancel.clone();
@@ -583,7 +585,8 @@ async fn oversized_output_is_truncated() {
     let want = MAX_STREAM_OUTPUT_BYTES + 4096;
     // Deterministic, bounded payload: N bytes of 'a'.
     let script = format!("head -c {want} /dev/zero | tr '\\0' 'a'");
-    let req = ShellRequest::from_argv(["sh", "-c", &script]);
+    let mut req = ShellRequest::from_argv(["sh", "-c", &script]);
+    req.max_output_tokens = Some(MAX_STREAM_OUTPUT_BYTES);
 
     let out = run_direct(&req, &ctx).await.expect("command should run");
     assert_eq!(out.exit_code, 0);
@@ -598,6 +601,28 @@ async fn oversized_output_is_truncated() {
     assert_eq!(
         a_count, MAX_STREAM_OUTPUT_BYTES,
         "retained payload should be exactly the byte cap (cap honored, no overflow)"
+    );
+}
+
+#[tokio::test]
+async fn shell_default_model_output_tokens_truncates_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_in(dir.path());
+    let want = DEFAULT_MAX_OUTPUT_TOKENS * 4 + 4096;
+    let script = format!("head -c {want} /dev/zero | tr '\\0' 'a'");
+    let req = ShellRequest::from_argv(["sh", "-c", &script]);
+
+    let out = run_direct(&req, &ctx).await.expect("command should run");
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.contains("\n…\n"),
+        "expected model-output truncation marker, stdout len = {}",
+        out.stdout.len()
+    );
+    assert_eq!(
+        out.stdout.matches('a').count(),
+        DEFAULT_MAX_OUTPUT_TOKENS * 4,
+        "default shell output should be capped before it is re-fed to the model"
     );
 }
 
@@ -677,6 +702,7 @@ async fn empty_command_errors() {
         cwd: None,
         timeout_ms: None,
         env: HashMap::new(),
+        max_output_tokens: None,
     };
     match run_direct(&req, &ctx).await {
         Err(ToolError::Other(_)) => {}

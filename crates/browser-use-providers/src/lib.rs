@@ -12232,14 +12232,23 @@ mod tests {
     fn read_request_headers(stream: &mut TcpStream) {
         let mut request = Vec::new();
         let mut buf = [0_u8; 1024];
+        let start = Instant::now();
         loop {
-            let read = stream.read(&mut buf).expect("read request");
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buf[..read]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() > Duration::from_secs(2) {
+                        panic!("read request timed out");
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("read request: {error}"),
             }
         }
         let request_text = String::from_utf8_lossy(&request);

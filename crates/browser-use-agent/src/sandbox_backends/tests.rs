@@ -6,15 +6,18 @@
 //! trivial child (`/bin/true`) under the Linux sandbox. NO escape attempts and
 //! NO network access are performed.
 
+#[cfg(not(target_os = "macos"))]
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::derive_sandbox_policy;
 use super::linux;
 use super::policy::{policy_summary, FsIntent, FsPolicy, SandboxPolicy};
+#[cfg(target_os = "linux")]
+use super::provider::spawn_under_sandbox;
 use super::provider::{
-    get_platform_sandbox, real_backend_available, spawn_under_sandbox, unavailable_denial,
-    PlatformSandbox, PlatformSandboxProvider, SpawnUnderSandboxError,
+    get_platform_sandbox, real_backend_available, unavailable_denial, PlatformSandbox,
+    PlatformSandboxProvider, SpawnUnderSandboxError,
 };
 use super::seatbelt;
 use crate::tools::sandbox::{

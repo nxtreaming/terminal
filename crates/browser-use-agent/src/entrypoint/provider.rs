@@ -40,14 +40,22 @@
 //! matching the legacy `stored_or_env` precedence. A missing credential surfaces
 //! as [`ProviderResolveError::MissingCredentials`] (honest, never a panic).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use browser_use_llm::auth::{load_codex_auth, CodexAuth};
 use browser_use_llm::route::ModelClient;
+use browser_use_runtime::{
+    AgentId as RuntimeAgentId, BrowserConfig as RuntimeBrowserConfig,
+    BrowserId as RuntimeBrowserId, Durability as RuntimeDurability,
+    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RuntimeHandle,
+    SessionId as RuntimeSessionId,
+};
 use browser_use_store::Store;
+use serde::Serialize;
 
 use crate::config_overrides::ProviderBackend;
 use crate::config_overrides::ProviderRunConfig;
@@ -72,6 +80,7 @@ use crate::subagents::parent_link::{update_parent_from_child_run, ChildRunOutcom
 use crate::subagents::registry::AgentRegistry;
 use crate::subagents::role::AgentConfigLayer;
 use crate::tools::approval::AskForApproval;
+use crate::tools::handlers::browser::BrowserBackend;
 use crate::tools::handlers::mcp::{McpClient, McpTool};
 use crate::tools::handlers::python::PythonBackend;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
@@ -118,8 +127,188 @@ pub type RealToolDispatcher = ToolDispatcher<RegistryRunner<NoneSandboxProvider,
 static UNIFIED_EXEC_MANAGERS: OnceLock<Mutex<HashMap<String, UnifiedExecManager>>> =
     OnceLock::new();
 
+const UNIFIED_EXEC_RESOURCE_KEY: &str = "tools.unified_exec_manager";
+const BROWSER_BACKEND_RESOURCE_PREFIX: &str = "tools.browser_backend";
+const PYTHON_BACKEND_RESOURCE_PREFIX: &str = "tools.python_backend";
+const MCP_CLIENT_RESOURCE_PREFIX: &str = "tools.mcp_client";
+
+struct RuntimeBrowserBackend {
+    session_id: String,
+    runtime: RuntimeHandle,
+    agent_id: RuntimeAgentId,
+    browser_id: RuntimeBrowserId,
+    backend: Arc<dyn BrowserBackend>,
+}
+
+impl RuntimeBrowserBackend {
+    fn with_browser_lease<T>(
+        &self,
+        action: impl FnOnce(&dyn BrowserBackend) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.runtime
+            .with_browser_action(&self.browser_id, self.agent_id.clone(), || {
+                action(self.backend.as_ref())
+            })
+    }
+
+    fn record_browser_script_response(
+        &self,
+        session_id: &str,
+        response: &browser_use_browser::BrowserScriptOutput,
+        synthesize_start: bool,
+    ) -> anyhow::Result<()> {
+        let Some(run_id) = response
+            .run_id
+            .as_deref()
+            .filter(|run_id| !run_id.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+        let base_payload = serde_json::json!({
+            "run_id": run_id,
+            "ok": response.ok,
+            "status": response.status.clone(),
+            "next_observe_ms": response.next_observe_ms,
+            "text": response.text.clone(),
+            "error": response.error.clone(),
+        });
+
+        if synthesize_start {
+            self.runtime.append_observed_browser_session_event(
+                runtime_session_id.clone(),
+                self.browser_id.clone(),
+                "browser_script.started",
+                base_payload.clone(),
+                RuntimeDurability::Barrier,
+            )?;
+        }
+
+        if response.status.as_deref() == Some("running") {
+            if !response.text.trim().is_empty() {
+                self.runtime.append_observed_browser_session_event(
+                    runtime_session_id,
+                    self.browser_id.clone(),
+                    "browser_script.output_delta",
+                    base_payload,
+                    RuntimeDurability::BestEffort,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let event_type = match response.status.as_deref() {
+            Some("cancelled") => "browser_script.cancelled",
+            Some("failed") => "browser_script.failed",
+            Some("finished") => "browser_script.completed",
+            _ if response.ok => "browser_script.completed",
+            _ => "browser_script.failed",
+        };
+        self.runtime.append_observed_browser_session_event(
+            runtime_session_id,
+            self.browser_id.clone(),
+            event_type,
+            base_payload,
+            RuntimeDurability::Barrier,
+        )?;
+        Ok(())
+    }
+}
+
+impl BrowserBackend for RuntimeBrowserBackend {
+    fn set_browser_mode(&self, browser_mode: Option<String>) {
+        self.backend.set_browser_mode(browser_mode);
+    }
+
+    fn command(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        command: &str,
+    ) -> anyhow::Result<browser_use_browser::BrowserCommandOutput> {
+        self.with_browser_lease(|backend| backend.command(session_id, cwd, artifact_dir, command))
+    }
+
+    fn run_script(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+        self.with_browser_lease(|backend| {
+            let output = backend.run_script(session_id, cwd, artifact_dir, code, timeout_secs)?;
+            self.record_browser_script_response(session_id, &output, true)?;
+            Ok(output)
+        })
+    }
+
+    fn start_script(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+        self.with_browser_lease(|backend| {
+            let output = backend.start_script(session_id, cwd, artifact_dir, code, timeout_secs)?;
+            self.record_browser_script_response(session_id, &output, true)?;
+            Ok(output)
+        })
+    }
+
+    fn observe_script(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        observe_timeout_ms: u64,
+    ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+        self.with_browser_lease(|backend| {
+            let output = backend.observe_script(session_id, run_id, observe_timeout_ms)?;
+            self.record_browser_script_response(session_id, &output, false)?;
+            Ok(output)
+        })
+    }
+
+    fn cancel_script(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+        self.with_browser_lease(|backend| {
+            let output = backend.cancel_script(session_id, run_id)?;
+            self.record_browser_script_response(session_id, &output, false)?;
+            Ok(output)
+        })
+    }
+}
+
+struct RuntimePythonBackend {
+    backend: Arc<dyn PythonBackend>,
+}
+
+struct RuntimeMcpClient {
+    client: Arc<dyn McpClient>,
+    startup_errors: Vec<(String, String)>,
+}
+
 fn unified_exec_managers() -> &'static Mutex<HashMap<String, UnifiedExecManager>> {
     UNIFIED_EXEC_MANAGERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn runtime_resource_key<T: Serialize>(prefix: &str, value: &T) -> String {
+    let serialized =
+        serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string());
+    let mut hasher = DefaultHasher::new();
+    serialized.hash(&mut hasher);
+    format!("{prefix}:{:016x}", hasher.finish())
+}
+
+fn runtime_session_id_for_agent_session(session_id: &SessionId) -> Option<RuntimeSessionId> {
+    RuntimeSessionId::from_string(session_id.as_str()).ok()
 }
 
 fn unified_exec_manager_for_session(session_id: Option<&SessionId>) -> UnifiedExecManager {
@@ -131,6 +320,45 @@ fn unified_exec_manager_for_session(session_id: Option<&SessionId>) -> UnifiedEx
         return UnifiedExecManager::default();
     };
     managers.entry(key).or_default().clone()
+}
+
+fn unified_exec_manager_for_runtime_or_session(
+    runtime_handle: Option<&RuntimeHandle>,
+    session_id: Option<&SessionId>,
+) -> Result<UnifiedExecManager, ProviderResolveError> {
+    let Some(session_id) = session_id else {
+        return if runtime_handle.is_some() {
+            Err(ProviderResolveError::RuntimeResource(
+                "runtime-backed exec manager requires an attached session".to_string(),
+            ))
+        } else {
+            Ok(UnifiedExecManager::default())
+        };
+    };
+    if let Some(runtime_handle) = runtime_handle {
+        let runtime_session_id =
+            RuntimeSessionId::from_string(session_id.as_str()).map_err(|e| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "invalid runtime session id for exec manager {}: {e}",
+                    session_id.as_str()
+                ))
+            })?;
+        let manager = runtime_handle
+            .get_or_insert_session_resource(
+                &runtime_session_id,
+                UNIFIED_EXEC_RESOURCE_KEY,
+                UnifiedExecManager::default,
+                |manager: Arc<UnifiedExecManager>| manager.terminate_all_best_effort(),
+            )
+            .map_err(|e| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "failed to attach runtime exec manager for {}: {e}",
+                    session_id.as_str()
+                ))
+            })?;
+        return Ok((*manager).clone());
+    }
+    Ok(unified_exec_manager_for_session(Some(session_id)))
 }
 
 pub fn cleanup_unified_exec_manager_for_session_id(session_id: &str) -> usize {
@@ -160,22 +388,229 @@ pub fn cleanup_all_unified_exec_managers() -> usize {
         .sum()
 }
 
+fn cleanup_session_runtime(
+    runtime_handle: Option<RuntimeHandle>,
+) -> Arc<dyn Fn(&str) -> usize + Send + Sync> {
+    Arc::new(move |session_id| {
+        runtime_handle
+            .as_ref()
+            .and_then(|runtime_handle| {
+                RuntimeSessionId::from_string(session_id)
+                    .ok()
+                    .and_then(|runtime_session_id| {
+                        runtime_handle
+                            .cleanup_session_resources(&runtime_session_id)
+                            .ok()
+                    })
+            })
+            .unwrap_or_else(|| cleanup_unified_exec_manager_for_session_id(session_id))
+    })
+}
+
+fn browser_backend_for_runtime_or_config(
+    config: &ProviderRunConfig,
+    runtime_handle: Option<&RuntimeHandle>,
+    session_id: Option<&SessionId>,
+) -> Result<Arc<dyn BrowserBackend>, ProviderResolveError> {
+    let key = runtime_resource_key(
+        BROWSER_BACKEND_RESOURCE_PREFIX,
+        &config.options.browser_mode.clone(),
+    );
+    if let Some(handle) = runtime_handle {
+        let session_id = session_id.ok_or_else(|| {
+            ProviderResolveError::RuntimeResource(
+                "runtime-backed browser backend requires an attached session".to_string(),
+            )
+        })?;
+        let runtime_session_id =
+            runtime_session_id_for_agent_session(session_id).ok_or_else(|| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "invalid runtime session id for browser backend {}",
+                    session_id.as_str()
+                ))
+            })?;
+        let agent_id = handle
+            .agent_id_for_session(&runtime_session_id)
+            .map_err(|e| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "failed to resolve runtime agent for browser backend {}: {e}",
+                    session_id.as_str()
+                ))
+            })?;
+        let resource = handle
+            .try_get_or_insert_session_resource(
+                &runtime_session_id,
+                &key,
+                || {
+                    let browser_id = handle.create_browser_for_agent(
+                        agent_id.clone(),
+                        RuntimeBrowserConfig {
+                            keep_alive: true,
+                            headless: None,
+                            profile_id: Some(session_id.as_str().to_string()),
+                        },
+                    )?;
+                    let browser_registries = handle.browser_physical_registries(&browser_id)?;
+                    Ok(RuntimeBrowserBackend {
+                        session_id: session_id.as_str().to_string(),
+                        runtime: handle.clone(),
+                        agent_id,
+                        browser_id,
+                        backend: Arc::new(
+                            crate::tools::handlers::browser::RealBackend::with_browser_mode_and_registries(
+                                config.options.browser_mode.clone(),
+                                browser_registries.session_registry(),
+                                browser_registries.script_registry(),
+                            ),
+                        ),
+                    })
+                },
+                |resource: Arc<RuntimeBrowserBackend>| {
+                    let cleaned = resource.backend.cleanup_session(&resource.session_id);
+                    let _ = resource
+                        .runtime
+                        .close_browser_for_agent(&resource.browser_id, &resource.agent_id);
+                    cleaned
+                },
+            )
+            .map_err(|e| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "failed to attach runtime browser backend for {}: {e}",
+                    session_id.as_str()
+                ))
+            })?;
+        let backend: Arc<dyn BrowserBackend> = resource;
+        return Ok(backend);
+    }
+
+    Ok(Arc::new(
+        crate::tools::handlers::browser::RealBackend::with_browser_mode(
+            config.options.browser_mode.clone(),
+        ),
+    ))
+}
+
+fn python_backend_for_runtime_or_config(
+    config: &ProviderRunConfig,
+    runtime_handle: Option<&RuntimeHandle>,
+    session_id: Option<&SessionId>,
+) -> Result<Arc<dyn PythonBackend>, ProviderResolveError> {
+    let key = runtime_resource_key(
+        PYTHON_BACKEND_RESOURCE_PREFIX,
+        &(
+            config.options.browser_mode.clone(),
+            config.options.python_env.clone(),
+        ),
+    );
+    if let (Some(handle), Some(session_id)) = (runtime_handle, session_id) {
+        if let Some(runtime_session_id) = runtime_session_id_for_agent_session(session_id) {
+            let resource = handle
+                .try_get_or_insert_session_resource(
+                    &runtime_session_id,
+                    &key,
+                    || {
+                        start_python_backend(config)
+                            .map(|backend| RuntimePythonBackend { backend })
+                            .map_err(anyhow::Error::from)
+                    },
+                    |_| 1,
+                )
+                .map_err(|e| ProviderResolveError::PythonWorker(e.to_string()))?;
+            return Ok(Arc::clone(&resource.backend));
+        }
+        return Err(ProviderResolveError::RuntimeResource(format!(
+            "invalid runtime session id for python backend {}",
+            session_id.as_str()
+        )));
+    } else if runtime_handle.is_some() {
+        return Err(ProviderResolveError::RuntimeResource(
+            "runtime-backed python backend requires an attached session".to_string(),
+        ));
+    }
+
+    start_python_backend(config)
+}
+
+fn stable_mcp_servers(
+    servers: &HashMap<String, crate::mcp::McpServerConfig>,
+) -> BTreeMap<String, crate::mcp::McpServerConfig> {
+    servers
+        .iter()
+        .map(|(name, config)| (name.clone(), config.clone()))
+        .collect()
+}
+
+fn mcp_client_for_runtime_or_config(
+    config: &ProviderRunConfig,
+    runtime_handle: Option<&RuntimeHandle>,
+    session_id: Option<&SessionId>,
+) -> anyhow::Result<Arc<RuntimeMcpClient>> {
+    let stable_servers = stable_mcp_servers(&config.options.mcp_servers);
+    let key = runtime_resource_key(MCP_CLIENT_RESOURCE_PREFIX, &stable_servers);
+    if let (Some(handle), Some(session_id)) = (runtime_handle, session_id) {
+        if let Some(runtime_session_id) = runtime_session_id_for_agent_session(session_id) {
+            return handle.try_get_or_insert_session_resource(
+                &runtime_session_id,
+                &key,
+                || runtime_mcp_client_from_config(config.options.mcp_servers.clone()),
+                |_| 1,
+            );
+        }
+        anyhow::bail!(
+            "invalid runtime session id for mcp client {}",
+            session_id.as_str()
+        );
+    } else if runtime_handle.is_some() {
+        anyhow::bail!("runtime-backed mcp client requires an attached session");
+    }
+
+    Ok(Arc::new(runtime_mcp_client_from_config(
+        config.options.mcp_servers.clone(),
+    )?))
+}
+
+fn runtime_mcp_client_from_config(
+    servers: HashMap<String, crate::mcp::McpServerConfig>,
+) -> anyhow::Result<RuntimeMcpClient> {
+    let (manager, errors) = McpConnectionManager::connect_all(servers)?;
+    let client: Arc<dyn McpClient> = Arc::new(manager);
+    Ok(RuntimeMcpClient {
+        client,
+        startup_errors: errors
+            .into_iter()
+            .map(|(server, err)| (server, err.to_string()))
+            .collect(),
+    })
+}
+
 fn mailbox_preemption_probe(
     user_input: &Option<(SharedStore, SessionId)>,
+    runtime_handle: Option<&RuntimeHandle>,
 ) -> Option<MailboxPreemptionProbe> {
     let (store, session_id) = user_input.as_ref()?;
     let store = Arc::clone(store);
     let session_id = session_id.as_str().to_string();
+    let runtime_handle = runtime_handle.cloned();
     let probe: MailboxPreemptionProbe = Arc::new(
         move || -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
             let store = Arc::clone(&store);
             let session_id = session_id.clone();
+            let runtime_handle = runtime_handle.clone();
             Box::pin(async move {
-                tokio::task::spawn_blocking(move || {
-                    super::has_pending_agent_mail(&store, &session_id)
-                })
-                .await
-                .unwrap_or(false)
+                if let Some(runtime_handle) = runtime_handle {
+                    let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.clone())
+                    else {
+                        return false;
+                    };
+                    return runtime_handle
+                        .has_pending_agent_mail_for_session(
+                            &runtime_session_id,
+                            RuntimeMailboxDeliveryPhase::CurrentTurn,
+                        )
+                        .unwrap_or(false);
+                }
+                let _ = (store, session_id);
+                false
             })
         },
     );
@@ -217,6 +652,10 @@ pub enum ProviderResolveError {
     ///
     /// [`PythonWorker`]: browser_use_python_worker::PythonWorker
     PythonWorker(String),
+    /// A runtime-backed provider could not attach a live resource to the runtime
+    /// session resource bag. Runtime-owned runs must fail here rather than
+    /// continuing with orphan exec/browser/MCP/Python resources.
+    RuntimeResource(String),
 }
 
 impl std::fmt::Display for ProviderResolveError {
@@ -234,6 +673,9 @@ impl std::fmt::Display for ProviderResolveError {
             }
             ProviderResolveError::PythonWorker(why) => {
                 write!(f, "failed to start python worker: {why}")
+            }
+            ProviderResolveError::RuntimeResource(why) => {
+                write!(f, "failed to attach runtime resource: {why}")
             }
         }
     }
@@ -479,6 +921,7 @@ pub fn resolve_provider(
         recorder,
         user_input,
         tool_cwd,
+        None,
     )
 }
 
@@ -492,6 +935,7 @@ pub fn resolve_provider_with_tool_cwd(
     recorder: Arc<dyn FusionRecorder>,
     user_input: Option<(SharedStore, SessionId)>,
     tool_cwd: std::path::PathBuf,
+    runtime_handle: Option<RuntimeHandle>,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
     resolve_provider_with_tool_paths(
         config,
@@ -503,6 +947,7 @@ pub fn resolve_provider_with_tool_cwd(
         user_input,
         tool_cwd.clone(),
         tool_cwd,
+        runtime_handle,
     )
 }
 
@@ -517,6 +962,7 @@ pub fn resolve_provider_with_tool_paths(
     user_input: Option<(SharedStore, SessionId)>,
     tool_cwd: std::path::PathBuf,
     tool_artifact_root: std::path::PathBuf,
+    runtime_handle: Option<RuntimeHandle>,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
     // The Fake short-circuit lives in the inner builder (so we never spawn a
     // Python worker for a fake/cut/missing-credential run). For a real backend we
@@ -537,6 +983,7 @@ pub fn resolve_provider_with_tool_paths(
         user_input,
         tool_cwd,
         tool_artifact_root,
+        runtime_handle,
     )
 }
 
@@ -587,6 +1034,7 @@ fn resolve_provider_with_python(
     user_input: Option<(SharedStore, SessionId)>,
     tool_cwd: std::path::PathBuf,
     tool_artifact_root: std::path::PathBuf,
+    runtime_handle: Option<RuntimeHandle>,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
     // (1) backend → credentialed provider choice (env-then-store creds; codex from
     //     env/store/~/.codex; None → Err; Fake → None).
@@ -612,7 +1060,11 @@ fn resolve_provider_with_python(
     //      inject a fake.
     let python_backend = match python_backend {
         Some(backend) => backend,
-        None => start_python_backend(config)?,
+        None => python_backend_for_runtime_or_config(
+            config,
+            runtime_handle.as_ref(),
+            user_input.as_ref().map(|(_, session_id)| session_id),
+        )?,
     };
 
     // *** build_sampling_driver is actually CALLED here (production path). ***
@@ -621,23 +1073,22 @@ fn resolve_provider_with_python(
     // its output re-enters the prompt via `recorder`, and the loop re-samples.
     let goal_store = build_goal_store(&user_input);
     let goals_enabled = goal_runtime_enabled(config, &user_input);
-    let preemption_probe = mailbox_preemption_probe(&user_input);
+    let preemption_probe = mailbox_preemption_probe(&user_input, runtime_handle.as_ref());
     let mut driver = build_sampling_driver(transport, Arc::clone(&sink), ctx, max_retries);
     if goals_enabled {
         driver = driver.with_goal_store(goal_store.clone());
     }
-    let mut driver = driver.with_fusion(
-        build_tool_dispatcher_with_cwd_and_goal_store(
-            python_backend,
-            config,
-            user_input,
-            tool_cwd,
-            tool_artifact_root,
-            sink,
-            goal_store,
-        ),
-        recorder,
+    let dispatcher = build_tool_dispatcher_with_cwd_and_goal_store(
+        python_backend,
+        config,
+        user_input,
+        tool_cwd,
+        tool_artifact_root,
+        sink,
+        goal_store,
+        runtime_handle,
     );
+    let mut driver = driver.with_fusion(dispatcher?, recorder);
     if let Some(probe) = preemption_probe {
         driver = driver.with_mailbox_preemption_probe(probe);
     }
@@ -736,7 +1187,9 @@ fn build_tool_dispatcher_with_cwd(
         tool_artifact_root,
         event_sink,
         goal_store,
+        None,
     )
+    .expect("test dispatcher should build")
 }
 
 fn build_tool_dispatcher_with_cwd_and_goal_store(
@@ -747,7 +1200,8 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     tool_artifact_root: std::path::PathBuf,
     event_sink: Arc<dyn EventSink>,
     goal_store: Arc<crate::tools::handlers::goal::GoalStore>,
-) -> Arc<RealToolDispatcher> {
+    runtime_handle: Option<RuntimeHandle>,
+) -> Result<Arc<RealToolDispatcher>, ProviderResolveError> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
     use crate::tools::handlers::capture::{CaptureCurationRequest, CaptureCurationTool};
@@ -770,8 +1224,10 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     // Typed with the production approver (`GuardianApprover`) so the registry, the
     // orchestrator, and the runner all agree on the `(S, A)` seams.
     let mut reg: ToolRegistry<NoneSandboxProvider, GuardianApprover> = ToolRegistry::new();
-    let unified_exec =
-        unified_exec_manager_for_session(user_input.as_ref().map(|(_, session_id)| session_id));
+    let unified_exec = unified_exec_manager_for_runtime_or_session(
+        runtime_handle.as_ref(),
+        user_input.as_ref().map(|(_, session_id)| session_id),
+    )?;
     let unified_exec_emitter = user_input.as_ref().map(|(_, session_id)| {
         Arc::new(crate::tools::UnifiedExecEventEmitter::new(
             Arc::clone(&event_sink),
@@ -836,10 +1292,17 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         true,
         WebSearchTool::new(WebSearchConfig::enabled()),
     );
+    let browser_backend = browser_backend_for_runtime_or_config(
+        config,
+        runtime_handle.as_ref(),
+        user_input.as_ref().map(|(_, session_id)| session_id),
+    )?;
+    let browser_tool = BrowserTool::with_backend(browser_backend)
+        .with_selected_browser_mode(config.options.browser_mode.clone())
+        .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds);
     let browser_tool = match &user_input {
         Some((store, session_id)) => {
-            let tool = BrowserTool::with_browser_mode(config.options.browser_mode.clone())
-                .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds)
+            let tool = browser_tool
                 .with_session_id(session_id.as_str().to_string())
                 .with_persistence(store.clone(), session_id.as_str().to_string());
             if config.options.dynamic_browser_mode_from_store {
@@ -848,8 +1311,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
                 tool
             }
         }
-        None => BrowserTool::with_browser_mode(config.options.browser_mode.clone())
-            .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds),
+        None => browser_tool,
     };
     // `browser`: standalone production backend (`browser-use-browser`, internal
     // session management). parallel_safe = false (single CDP connection).
@@ -892,9 +1354,21 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     // `features.multi_agent_v2`, while legacy v1 tools are exposed only when
     // the legacy collaboration feature is enabled.
     if config.options.multi_agent_v2.enabled {
-        register_subagent_tools(&mut reg, config, &user_input, &tool_cwd);
+        register_subagent_tools(
+            &mut reg,
+            config,
+            &user_input,
+            &tool_cwd,
+            runtime_handle.clone(),
+        );
     } else if config.options.collab_enabled {
-        register_legacy_subagent_tools(&mut reg, config, &user_input, &tool_cwd);
+        register_legacy_subagent_tools(
+            &mut reg,
+            config,
+            &user_input,
+            &tool_cwd,
+            runtime_handle.clone(),
+        );
     }
 
     // Goal tools (`get_goal` / `create_goal` / `update_goal`). All three share ONE
@@ -913,24 +1387,21 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     // manager (which implements `McpClient`). Registered `parallel_safe = false`;
     // the handler's per-request read-only hint still drives its own gate.
     if !config.options.mcp_servers.is_empty() {
-        match McpConnectionManager::connect_all(config.options.mcp_servers.clone()) {
-            Ok((manager, errors)) => {
-                for (server, err) in &errors {
-                    eprintln!("warning: MCP server '{server}' failed to connect: {err}");
-                }
-                let client: Arc<dyn McpClient> = Arc::new(manager);
-                reg.register::<_, McpToolCallRequest>(
-                    "mcp",
-                    definitions::mcp(),
-                    false,
-                    McpTool::new(client),
-                );
-            }
-            // A runtime-build failure (rare) drops the `mcp` tool rather than
-            // aborting the whole run; a model call to `mcp` then returns "unknown
-            // tool". The other tools are unaffected.
-            Err(e) => eprintln!("warning: failed to start MCP runtime, mcp tool disabled: {e}"),
+        let resource = mcp_client_for_runtime_or_config(
+            config,
+            runtime_handle.as_ref(),
+            user_input.as_ref().map(|(_, session_id)| session_id),
+        )
+        .map_err(|e| ProviderResolveError::RuntimeResource(e.to_string()))?;
+        for (server, err) in &resource.startup_errors {
+            eprintln!("warning: MCP server '{server}' failed to connect: {err}");
         }
+        reg.register::<_, McpToolCallRequest>(
+            "mcp",
+            definitions::mcp(),
+            false,
+            McpTool::new(Arc::clone(&resource.client)),
+        );
     }
 
     apply_role_tool_policy(&mut reg, config);
@@ -1009,9 +1480,9 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         policy,
     );
 
-    Arc::new(ToolDispatcher::with_runner_and_specs(
+    Ok(Arc::new(ToolDispatcher::with_runner_and_specs(
         runner, /* supports_parallel_tool_calls */ true, specs,
-    ))
+    )))
 }
 
 fn apply_role_tool_policy<S, A>(
@@ -1138,6 +1609,7 @@ struct ChildAgentRunnerSpawner {
     parent_link: Arc<Mutex<Option<ChildAgentRunnerParentLink>>>,
     store: Option<SharedStore>,
     parent_run_config: ProviderRunConfig,
+    runtime_authoritative: bool,
 }
 
 #[derive(Clone)]
@@ -1149,41 +1621,48 @@ struct ChildAgentRunnerParentLink {
 #[async_trait::async_trait]
 impl ChildSpawner for ChildAgentRunnerSpawner {
     async fn spawn_child(&self, spec: ChildSpec) -> Result<ChildHandle, SubagentError> {
-        let manager_completion_handler = self
-            .parent_link
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .map(|parent_link| {
-                let child_path = spec.agent_path.clone();
-                ChildAgentCompletionHandler::new(move |completion: ChildAgentRunCompletion| {
-                    let outcome = if completion.success {
-                        ChildRunOutcome::success(completion.summary)
-                    } else {
-                        ChildRunOutcome::failure(
-                            completion
-                                .summary
-                                .unwrap_or_else(|| "child agent failed".to_string()),
-                        )
-                    };
-                    let _ = update_parent_from_child_run(
-                        &parent_link.registry,
-                        &parent_link.mailbox,
-                        &child_path,
-                        &outcome,
-                    );
-                    Ok(())
+        let manager_completion_handler = if self.runtime_authoritative {
+            None
+        } else {
+            self.parent_link
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .map(|parent_link| {
+                    let child_path = spec.agent_path.clone();
+                    ChildAgentCompletionHandler::new(move |completion: ChildAgentRunCompletion| {
+                        let outcome = if completion.success {
+                            ChildRunOutcome::success(completion.summary)
+                        } else {
+                            ChildRunOutcome::failure(
+                                completion
+                                    .summary
+                                    .unwrap_or_else(|| "child agent failed".to_string()),
+                            )
+                        };
+                        let _ = update_parent_from_child_run(
+                            &parent_link.registry,
+                            &parent_link.mailbox,
+                            &child_path,
+                            &outcome,
+                        );
+                        Ok(())
+                    })
                 })
-            });
-        let store_completion_handler = self.store.as_ref().map(|store| {
-            let run_id = Some(spec.run_id.clone());
-            crate::tools::handlers::subagent::store_completion_handler(
-                Arc::clone(store),
-                self.parent_session_id.clone(),
-                spec.agent_id.clone(),
-                run_id,
-            )
-        });
+        };
+        let store_completion_handler = if self.runtime_authoritative {
+            None
+        } else {
+            self.store.as_ref().map(|store| {
+                let run_id = Some(spec.run_id.clone());
+                crate::tools::handlers::subagent::store_completion_handler(
+                    Arc::clone(store),
+                    self.parent_session_id.clone(),
+                    spec.agent_id.clone(),
+                    run_id,
+                )
+            })
+        };
         let completion_handler = match (manager_completion_handler, store_completion_handler) {
             (None, None) => None,
             (Some(handler), None) | (None, Some(handler)) => Some(handler),
@@ -1257,6 +1736,29 @@ impl EventSink for SubagentStoreSink {
     }
 }
 
+/// Runtime-backed lifecycle sink for live subagent events.
+///
+/// The event payloads stay byte-compatible with the Store projection, but the
+/// append and publish go through `BrowserUseRuntime`, so active TUI/SDK
+/// subscribers see the same lifecycle facts that SQLite records.
+struct SubagentRuntimeSink {
+    runtime: RuntimeHandle,
+}
+
+impl EventSink for SubagentRuntimeSink {
+    fn emit(&self, ev: PendingEvent) {
+        let Ok(session_id) = RuntimeSessionId::from_string(ev.session_id) else {
+            return;
+        };
+        let _ = self.runtime.append_observed_session_event(
+            session_id,
+            &ev.event_type,
+            ev.payload,
+            RuntimeDurability::Barrier,
+        );
+    }
+}
+
 /// A no-op [`EventSink`] for runs without a session store (tests / headless):
 /// lifecycle events are dropped, but spawn/wait/send still function.
 struct NoopSubagentSink;
@@ -1273,14 +1775,16 @@ impl EventSink for NoopSubagentSink {
 /// children therefore inherit the parent's provider/model from whatever the
 /// entrypoint wired into that runner. When the run config carries no runner,
 /// [`UnconfiguredChildSpawner`] is used so a spawn attempt fails honestly.
-/// Lifecycle events are persisted through a store-backed [`SubagentStoreSink`]
-/// when a session store is available (the live run path), else dropped via
-/// [`NoopSubagentSink`] (tests/headless).
+/// Lifecycle events are persisted through the durable session journal when a
+/// session store is available, else dropped via [`NoopSubagentSink`]
+/// (tests/headless). Live mailbox/send/wait/close behavior is runtime-backed;
+/// the store sink is the debug/replay projection.
 fn register_subagent_tools<S, A>(
     reg: &mut crate::tools::registry::ToolRegistry<S, A>,
     config: &ProviderRunConfig,
     user_input: &Option<(SharedStore, SessionId)>,
     tool_cwd: &std::path::Path,
+    runtime_handle: Option<RuntimeHandle>,
 ) where
     S: crate::tools::sandbox::SandboxProvider,
     A: crate::tools::runtime::Approver,
@@ -1310,19 +1814,19 @@ fn register_subagent_tools<S, A>(
             parent_link: Arc::clone(&parent_link),
             store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
             parent_run_config: config.clone(),
+            runtime_authoritative: runtime_handle.is_some(),
         }),
         None => Arc::new(UnconfiguredChildSpawner),
     };
-    let subagent_thread_limit = config
+    let max_concurrent_threads_per_session = config
         .options
         .multi_agent_v2
-        .max_concurrent_threads_per_session
-        .saturating_sub(1);
+        .max_concurrent_threads_per_session;
     let manager = Arc::new(SubagentManager::with_config_and_limits(
         spawner,
         crate::subagents::role::RoleRegistry::with_user_defined(config.options.agent_roles.clone()),
         crate::subagents::depth::DEFAULT_AGENT_MAX_DEPTH,
-        Some(subagent_thread_limit),
+        Some(max_concurrent_threads_per_session),
     ));
     let spawn_gate = Arc::new(tokio::sync::Mutex::new(()));
     *parent_link
@@ -1332,9 +1836,9 @@ fn register_subagent_tools<S, A>(
         mailbox: manager.mailbox(),
     });
 
-    // The parent context the children hang off. On the live store-backed path,
-    // use the current session's agent path so nested spawns resolve beneath the
-    // child, not always beneath `/root`.
+    // The parent context the children hang off. On the live runtime path, use
+    // the current session's durable agent path so nested spawns resolve beneath
+    // the child, not always beneath `/root`.
     let parent_agent_path =
         parent_agent_path_from_store(user_input).unwrap_or_else(|| "/root".to_string());
     let parent = ParentContext {
@@ -1343,17 +1847,25 @@ fn register_subagent_tools<S, A>(
         base_config: parent_agent_config_layer(config, tool_cwd),
     };
 
-    // Durable lifecycle sink + session scope: the store-backed sink on the live
+    // Durable lifecycle sink + session scope: journal projection on the live
     // run path, a no-op when no session store is wired.
-    let (sink, session_id): (Arc<dyn EventSink>, String) = match user_input {
-        Some((store, sid)) => (
-            Arc::new(SubagentStoreSink {
-                store: store.clone(),
-            }),
-            sid.as_str().to_string(),
-        ),
-        None => (Arc::new(NoopSubagentSink), String::new()),
-    };
+    let (sink, session_id): (Arc<dyn EventSink>, String) =
+        match (runtime_handle.clone(), user_input) {
+            (Some(runtime), Some((_, sid))) => (
+                Arc::new(SubagentRuntimeSink { runtime }),
+                sid.as_str().to_string(),
+            ),
+            (None, Some((store, sid))) => (
+                Arc::new(SubagentStoreSink {
+                    store: store.clone(),
+                }),
+                sid.as_str().to_string(),
+            ),
+            (Some(_), None) | (None, None) => (Arc::new(NoopSubagentSink), String::new()),
+        };
+    let is_spawned_subagent = user_input
+        .as_ref()
+        .is_some_and(|(store, sid)| session_is_spawned_subagent_for_tools(store, sid.as_str()));
 
     let deps = SubagentToolDeps {
         manager,
@@ -1362,7 +1874,8 @@ fn register_subagent_tools<S, A>(
         session_id,
         store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
         child_runner: config.options.child_agent_runner.clone(),
-        cleanup_session_runtime: Some(Arc::new(cleanup_unified_exec_manager_for_session_id)),
+        cleanup_session_runtime: Some(cleanup_session_runtime(runtime_handle.clone())),
+        runtime_handle: runtime_handle.clone(),
         spawn_gate,
         wait_timeouts: WaitAgentTimeoutOptions {
             default_timeout_ms: config.options.multi_agent_v2.default_wait_timeout_ms,
@@ -1370,7 +1883,7 @@ fn register_subagent_tools<S, A>(
             max_timeout_ms: config.options.multi_agent_v2.max_wait_timeout_ms,
         },
         hide_spawn_agent_metadata: config.options.multi_agent_v2.hide_spawn_agent_metadata,
-        max_concurrent_threads_per_session: Some(subagent_thread_limit),
+        max_concurrent_threads_per_session: Some(max_concurrent_threads_per_session),
     };
     let tool_namespace = if provider_supports_tool_namespaces(config) {
         config.options.multi_agent_v2.tool_namespace.clone()
@@ -1406,6 +1919,7 @@ fn register_subagent_tools<S, A>(
                         .multi_agent_v2
                         .max_concurrent_threads_per_session,
                 ),
+                is_spawned_subagent,
             },
         )),
         false,
@@ -1457,6 +1971,7 @@ fn register_legacy_subagent_tools<S, A>(
     config: &ProviderRunConfig,
     user_input: &Option<(SharedStore, SessionId)>,
     tool_cwd: &std::path::Path,
+    runtime_handle: Option<RuntimeHandle>,
 ) where
     S: crate::tools::sandbox::SandboxProvider,
     A: crate::tools::runtime::Approver,
@@ -1482,19 +1997,19 @@ fn register_legacy_subagent_tools<S, A>(
             parent_link: Arc::clone(&parent_link),
             store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
             parent_run_config: config.clone(),
+            runtime_authoritative: runtime_handle.is_some(),
         }),
         None => Arc::new(UnconfiguredChildSpawner),
     };
-    let subagent_thread_limit = config
+    let max_concurrent_threads_per_session = config
         .options
         .multi_agent_v2
-        .max_concurrent_threads_per_session
-        .saturating_sub(1);
+        .max_concurrent_threads_per_session;
     let manager = Arc::new(SubagentManager::with_config_and_limits(
         spawner,
         crate::subagents::role::RoleRegistry::with_user_defined(config.options.agent_roles.clone()),
         crate::subagents::depth::DEFAULT_AGENT_MAX_DEPTH,
-        Some(subagent_thread_limit),
+        Some(max_concurrent_threads_per_session),
     ));
     let spawn_gate = Arc::new(tokio::sync::Mutex::new(()));
     *parent_link
@@ -1527,7 +2042,8 @@ fn register_legacy_subagent_tools<S, A>(
         session_id,
         store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
         child_runner: config.options.child_agent_runner.clone(),
-        cleanup_session_runtime: Some(Arc::new(cleanup_unified_exec_manager_for_session_id)),
+        cleanup_session_runtime: Some(cleanup_session_runtime(runtime_handle.clone())),
+        runtime_handle: runtime_handle.clone(),
         spawn_gate,
         wait_timeouts: WaitAgentTimeoutOptions {
             default_timeout_ms: config.options.multi_agent_v2.default_wait_timeout_ms,
@@ -1535,7 +2051,7 @@ fn register_legacy_subagent_tools<S, A>(
             max_timeout_ms: config.options.multi_agent_v2.max_wait_timeout_ms,
         },
         hide_spawn_agent_metadata: config.options.multi_agent_v2.hide_spawn_agent_metadata,
-        max_concurrent_threads_per_session: Some(subagent_thread_limit),
+        max_concurrent_threads_per_session: Some(max_concurrent_threads_per_session),
     };
 
     let spawn_options = SpawnAgentDefinitionOptions {
@@ -1552,6 +2068,9 @@ fn register_legacy_subagent_tools<S, A>(
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
         ),
+        is_spawned_subagent: user_input
+            .as_ref()
+            .is_some_and(|(store, sid)| session_is_spawned_subagent_for_tools(store, sid.as_str())),
     };
     let wait_options = WaitAgentDefinitionOptions {
         default_timeout_ms: WaitAgentTimeoutOptions::default().default_timeout_ms,
@@ -1616,7 +2135,7 @@ fn agent_type_description(
         }
     }
     format!(
-        "Optional type name for the new agent. If omitted, `default` is used.\nAvailable roles:\n{}",
+        "Optional type name for the new agent. If omitted, `default` is used. For a normal full-history spawn, omit this field; do not send `agent_type: \"default\"`. Set this only to choose a non-default role, and then set `fork_turns` to `none` or a positive integer because full-history forks inherit this setting.\nAvailable roles:\n{}",
         formatted_roles.join("\n")
     )
 }
@@ -1794,6 +2313,27 @@ fn parent_agent_path_from_store(user_input: &Option<(SharedStore, SessionId)>) -
     display_agent_path_for_session(&store, session_id.as_str()).ok()
 }
 
+fn session_is_spawned_subagent_for_tools(store: &SharedStore, session_id: &str) -> bool {
+    let Ok(store) = store.lock() else {
+        return false;
+    };
+    let has_parent = store
+        .load_session(session_id)
+        .ok()
+        .flatten()
+        .and_then(|session| session.parent_id)
+        .is_some();
+    has_parent
+        && store
+            .events_for_session(session_id)
+            .map(|events| {
+                events
+                    .iter()
+                    .any(|event| event.event_type == "agent.context")
+            })
+            .unwrap_or(false)
+}
+
 fn agent_path_depth(agent_path: &str) -> i32 {
     let trimmed = agent_path.trim().trim_matches('/');
     if trimmed.is_empty() || trimmed == "root" {
@@ -1853,16 +2393,15 @@ fn session_allows_goal_tools(store: &SharedStore, session_id: &str) -> bool {
 /// `reg`, all sharing ONE [`GoalStore`].
 ///
 /// The store wraps a [`GoalManager`](crate::goals::GoalManager) whose injected
-/// [`EventSink`] persists durable `goal.*` events: on the live run path it is the
-/// store-backed [`SubagentStoreSink`] (the same `crate::events::EventSink` the
-/// subagent tools use — it appends each event to the session's durable log so the
-/// TUI render / resume-by-replay observe `goal.created` / `goal.updated`), and in
-/// tests/headless it is the no-op [`NoopSubagentSink`]. `create_goal` (and
-/// budget-threshold crossings) emit through the manager's sink automatically;
-/// `update_goal` emits `goal.updated` from its handler.
+/// [`EventSink`] persists durable `goal.*` events: on the live run path it writes
+/// the same journal projection as subagent lifecycle events, so TUI render /
+/// resume-by-replay observe `goal.created` / `goal.updated`; in tests/headless it
+/// is the no-op [`NoopSubagentSink`]. `create_goal` (and budget-threshold
+/// crossings) emit through the manager's sink automatically; `update_goal` emits
+/// `goal.updated` from its handler.
 ///
-/// Mirrors [`register_subagent_tools`]: a shared store + a store-backed event sink
-/// + the session id from the threaded `(SharedStore, SessionId)`.
+/// Mirrors [`register_subagent_tools`]: a shared durable journal sink plus the
+/// session id from the threaded `(SharedStore, SessionId)`.
 fn register_goal_tools<S, A>(
     reg: &mut crate::tools::registry::ToolRegistry<S, A>,
     store: Arc<crate::tools::handlers::goal::GoalStore>,
@@ -2106,6 +2645,7 @@ mod tests {
             None,
             std::env::temp_dir(),
             std::env::temp_dir().join("artifacts"),
+            None,
         )
         .expect("real openai driver must construct offline");
         std::env::remove_var("OPENAI_API_KEY");
@@ -2129,6 +2669,7 @@ mod tests {
             None,
             std::env::temp_dir(),
             std::env::temp_dir().join("artifacts"),
+            None,
         )
         .expect("real anthropic driver must construct offline");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -2174,6 +2715,7 @@ mod tests {
             None,
             std::env::temp_dir(),
             std::env::temp_dir().join("artifacts"),
+            None,
         );
         std::env::remove_var("CODEX_ACCESS_TOKEN");
         std::env::remove_var("CODEX_ACCOUNT_ID");
@@ -2360,6 +2902,70 @@ mod tests {
         }
     }
 
+    struct ScriptLifecycleBrowserBackend;
+    impl BrowserBackend for ScriptLifecycleBrowserBackend {
+        fn command(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _command: &str,
+        ) -> anyhow::Result<BrowserCommandOutput> {
+            anyhow::bail!("command not used")
+        }
+
+        fn run_script(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _code: &str,
+            _timeout_secs: u64,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            anyhow::bail!("run_script not used")
+        }
+
+        fn start_script(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _code: &str,
+            _timeout_secs: u64,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            Ok(browser_use_browser::BrowserScriptOutput {
+                ok: true,
+                status: Some("running".to_string()),
+                run_id: Some("script-1".to_string()),
+                text: "first chunk".to_string(),
+                ..Default::default()
+            })
+        }
+
+        fn observe_script(
+            &self,
+            _session_id: &str,
+            _run_id: &str,
+            _observe_timeout_ms: u64,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            Ok(browser_use_browser::BrowserScriptOutput {
+                ok: true,
+                status: Some("finished".to_string()),
+                run_id: Some("script-1".to_string()),
+                text: "done".to_string(),
+                ..Default::default()
+            })
+        }
+
+        fn cancel_script(
+            &self,
+            _session_id: &str,
+            _run_id: &str,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            anyhow::bail!("cancel_script not used")
+        }
+    }
+
     /// A fake python backend returning a marker output (no real worker/process).
     struct MarkerPythonBackend;
     impl crate::tools::handlers::python::PythonBackend for MarkerPythonBackend {
@@ -2456,6 +3062,68 @@ mod tests {
             "browser must reach the backend, got: {:?}",
             result.output
         );
+    }
+
+    #[test]
+    fn runtime_browser_backend_records_script_lifecycle() -> anyhow::Result<()> {
+        use browser_use_runtime::{BrowserUseRuntime, CreateRootAgentRequest, JournalReader};
+
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: std::env::temp_dir(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id = handle.create_browser(RuntimeBrowserConfig::default());
+        let backend = RuntimeBrowserBackend {
+            session_id: root.session_id().as_str().to_string(),
+            runtime: handle.clone(),
+            agent_id: root.agent_id().clone(),
+            browser_id: browser_id.clone(),
+            backend: Arc::new(ScriptLifecycleBrowserBackend),
+        };
+        let cwd = std::env::temp_dir();
+        let artifact_dir = std::env::temp_dir().join("browser-script-lifecycle");
+
+        let started = backend.start_script(
+            root.session_id().as_str(),
+            &cwd,
+            &artifact_dir,
+            "await page.title()",
+            10,
+        )?;
+        assert_eq!(started.run_id.as_deref(), Some("script-1"));
+        let snapshot = handle.browsers().snapshot(&browser_id)?;
+        assert_eq!(snapshot.active_scripts.len(), 1);
+        assert_eq!(
+            snapshot.active_scripts[0].last_delta.as_deref(),
+            Some("first chunk")
+        );
+
+        let observed = backend.observe_script(root.session_id().as_str(), "script-1", 10)?;
+        assert_eq!(observed.status.as_deref(), Some("finished"));
+        assert!(handle
+            .browsers()
+            .snapshot(&browser_id)?
+            .active_scripts
+            .is_empty());
+
+        let script_events = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .filter(|event| event.event_type.starts_with("browser_script."))
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            script_events,
+            vec![
+                "browser_script.started".to_string(),
+                "browser_script.output_delta".to_string(),
+                "browser_script.completed".to_string(),
+            ]
+        );
+        Ok(())
     }
 
     /// A `python` call REACHES the injected backend through the orchestrator and
@@ -2628,6 +3296,24 @@ mod tests {
     }
 
     #[test]
+    fn spawn_agent_agent_type_guidance_discourages_default_override() {
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model")
+            .with_options(crate::config_overrides::AgentRunOptions::default());
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let spawn = dispatcher
+            .tool_specs()
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .expect("spawn_agent tool");
+        let description = spawn.input_schema["properties"]["agent_type"]
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .expect("agent_type description");
+        assert!(description.contains("do not send `agent_type: \"default\"`"));
+        assert!(description.contains("full-history forks inherit this setting"));
+    }
+
+    #[test]
     fn subagent_tools_are_hidden_when_multi_agent_features_disabled() {
         let options = crate::config_overrides::AgentRunOptions {
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
@@ -2703,7 +3389,7 @@ mod tests {
                 enabled: true,
                 tool_namespace: Some("agents".to_string()),
                 hide_spawn_agent_metadata: true,
-                min_wait_timeout_ms: 0,
+                min_wait_timeout_ms: 1,
                 default_wait_timeout_ms: 100,
                 max_wait_timeout_ms: 1000,
                 usage_hint_text: Some("Use sparingly.".to_string()),
@@ -2736,7 +3422,7 @@ mod tests {
         assert_eq!(
             wait.input_schema["properties"]["timeout_ms"]["description"],
             serde_json::json!(
-                "Optional timeout in milliseconds. Defaults to 100, min 0, max 1000."
+                "Optional timeout in milliseconds. Defaults to 100, min 1, max 1000."
             )
         );
     }
@@ -2814,7 +3500,7 @@ mod tests {
         // spawn_agent call BY NAME through it (the same `dispatch` the production
         // RegistryRunner calls), under the auto-approve stub orchestrator.
         let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
-        register_subagent_tools(&mut reg, &config, &None, &std::env::temp_dir());
+        register_subagent_tools(&mut reg, &config, &None, &std::env::temp_dir(), None);
         assert!(reg.contains("spawn_agent"));
 
         let orch = ToolOrchestrator::stub();
@@ -2855,6 +3541,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_agent_registration_uses_root_inclusive_thread_limit_once() {
+        use crate::config_overrides::{AgentRunOptions, ChildAgentRunner, MultiAgentV2Options};
+        use crate::tools::orchestrator::ToolOrchestrator;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::runtime::ToolCtx;
+        use crate::tools::sandbox::FileSystemSandboxPolicy;
+
+        let runner = ChildAgentRunner::new(|_req| Ok(()));
+        let options = AgentRunOptions {
+            child_agent_runner: Some(runner),
+            multi_agent_v2: MultiAgentV2Options {
+                enabled: true,
+                max_concurrent_threads_per_session: 4,
+                ..Default::default()
+            },
+            ..AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
+        register_subagent_tools(&mut reg, &config, &None, &std::env::temp_dir(), None);
+
+        let orch = ToolOrchestrator::stub();
+        let env = TurnEnv {
+            file_system_sandbox_policy: FileSystemSandboxPolicy {
+                restricted: false,
+                denied_read: false,
+            },
+            managed_network_active: false,
+            strict_auto_review: false,
+            use_guardian: false,
+        };
+        let ctx = ToolCtx {
+            call_id: "c".to_string(),
+            tool_name: "spawn_agent".to_string(),
+            cwd: std::env::temp_dir(),
+            artifact_root: std::env::temp_dir().join("artifacts"),
+        };
+
+        for task_name in ["one", "two", "three"] {
+            reg.dispatch(
+                "spawn_agent",
+                &serde_json::json!({ "task_name": task_name, "message": "go" }),
+                &ctx,
+                &env,
+                AskForApproval::Never,
+                &orch,
+            )
+            .await
+            .expect("cap 4 allows root plus three spawned agents");
+        }
+
+        let err = reg
+            .dispatch(
+                "spawn_agent",
+                &serde_json::json!({ "task_name": "four", "message": "go" }),
+                &ctx,
+                &env,
+                AskForApproval::Never,
+                &orch,
+            )
+            .await
+            .expect_err("fourth spawned agent should exceed root-inclusive cap 4");
+        let error_text = format!("{err:?}");
+        assert!(
+            error_text.contains("agent limit reached: limit 3"),
+            "unexpected error: {error_text}"
+        );
+    }
+
+    #[tokio::test]
     async fn child_runner_completion_wakes_wait_agent() {
         use crate::config_overrides::{AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunner};
         use crate::tools::orchestrator::ToolOrchestrator;
@@ -2883,7 +3640,7 @@ mod tests {
             ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
 
         let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
-        register_subagent_tools(&mut reg, &config, &None, &std::env::temp_dir());
+        register_subagent_tools(&mut reg, &config, &None, &std::env::temp_dir(), None);
 
         let orch = ToolOrchestrator::stub();
         let env = TurnEnv {
@@ -2934,7 +3691,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_backed_child_runner_completion_writes_durable_parent_mail_once() {
+    async fn store_backed_child_runner_completion_writes_projection_once_but_wait_requires_runtime()
+    {
         use crate::config_overrides::{AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunner};
         use crate::tools::orchestrator::ToolOrchestrator;
         use crate::tools::registry::ToolRegistry;
@@ -2994,8 +3752,8 @@ mod tests {
             child_agent_runner: Some(runner),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: true,
-                min_wait_timeout_ms: 0,
-                default_wait_timeout_ms: 0,
+                min_wait_timeout_ms: 1,
+                default_wait_timeout_ms: 1,
                 max_wait_timeout_ms: 1000,
                 ..Default::default()
             },
@@ -3010,6 +3768,7 @@ mod tests {
             &config,
             &Some((Arc::clone(&shared_store), SessionId(root_id.clone()))),
             temp.path(),
+            None,
         );
 
         let orch = ToolOrchestrator::stub();
@@ -3044,20 +3803,21 @@ mod tests {
             cwd: temp.path().to_path_buf(),
             artifact_root: temp.path().join("artifacts"),
         };
-        let wait_out = reg
+        let wait_err = reg
             .dispatch(
                 "wait_agent",
-                &serde_json::json!({ "timeout_ms": 0 }),
+                &serde_json::json!({ "timeout_ms": 1 }),
                 &wait_ctx,
                 &env,
                 AskForApproval::Never,
                 &orch,
             )
             .await
-            .expect("wait_agent should read durable parent mail");
-        let wait_body: serde_json::Value = serde_json::from_str(&wait_out.stdout).unwrap();
-        assert_eq!(wait_body["message"], "Wait completed.");
-        assert_eq!(wait_body["timed_out"], false);
+            .expect_err("wait_agent requires a live runtime mailbox");
+        assert!(
+            format!("{wait_err:?}").contains("wait_agent requires a live runtime mailbox"),
+            "{wait_err:?}"
+        );
 
         let store = shared_store.lock().unwrap();
         let parent_events = store.events_for_session(&root_id).unwrap();
@@ -3070,12 +3830,10 @@ mod tests {
             "completion should be recorded once"
         );
         let parent_mail = store.messages_for_agent(&root_id).unwrap();
-        assert_eq!(
-            parent_mail.len(),
-            1,
-            "completion mail should be queued once"
+        assert!(
+            parent_mail.is_empty(),
+            "Store completion projection must not enqueue live mailbox rows"
         );
-        assert!(parent_mail[0].content.contains("<subagent_notification>"));
     }
 
     /// The production dispatcher advertises the three goal tools
@@ -3338,8 +4096,8 @@ mod tests {
     /// dispatcher (BY NAME via `dispatch_ordered`, the same path the turn loop
     /// uses for a model tool-call) into the shared `GoalStore`: a follow-up
     /// `get_goal` observes the goal, AND a durable `goal.created` event lands in
-    /// the session store (proving the store-backed event sink is wired, not just
-    /// the tool listed). `update_goal` then emits a durable `goal.updated`.
+    /// the session journal (proving durable projection is wired, not just the
+    /// tool listed). `update_goal` then emits a durable `goal.updated`.
     #[tokio::test]
     async fn create_goal_routes_into_store_and_emits_durable_event() {
         use browser_use_llm::schema::{ContentPart, MessageRole};
@@ -3606,6 +4364,334 @@ mod tests {
                 "exec_command output should contain {expected:?}, got {text:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_unified_exec_manager_is_shared_by_session_resource() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = handle
+            .create_root_agent(browser_use_runtime::CreateRootAgentRequest {
+                cwd: tempdir.path().to_path_buf(),
+                task: "root task".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("root agent");
+        let session_id = SessionId(root.session_id().as_str().to_string());
+
+        let first = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id))
+            .expect("runtime exec manager resource");
+        let started = first
+            .spawn_process(crate::tools::unified_exec::SpawnProcessRequest {
+                argv: vec!["sh".to_string(), "-c".to_string(), "sleep 2".to_string()],
+                cwd: tempdir.path().to_path_buf(),
+                env: std::collections::HashMap::new(),
+                tty: false,
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                timeout_ms: Some(5_000),
+                kill_on_cancel: true,
+                call_id: "call-start".to_string(),
+                tool_name: "exec_command".to_string(),
+                emitter: None,
+                cancel: None,
+            })
+            .await
+            .expect("spawn process");
+        assert!(started.running);
+
+        let second = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id))
+            .expect("runtime exec manager resource");
+        assert_eq!(
+            second.terminate_all().await,
+            1,
+            "second provider borrow must see the process created by the first borrow"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_unified_exec_manager_is_isolated_between_agents() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let first = handle
+            .create_root_agent(browser_use_runtime::CreateRootAgentRequest {
+                cwd: tempdir.path().to_path_buf(),
+                task: "first task".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("first root agent");
+        let second = handle
+            .create_root_agent(browser_use_runtime::CreateRootAgentRequest {
+                cwd: tempdir.path().to_path_buf(),
+                task: "second task".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("second root agent");
+        let first_session_id = SessionId(first.session_id().as_str().to_string());
+        let second_session_id = SessionId(second.session_id().as_str().to_string());
+
+        let first_manager =
+            unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&first_session_id))
+                .expect("first runtime exec manager resource");
+        let second_manager =
+            unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&second_session_id))
+                .expect("second runtime exec manager resource");
+        let started = first_manager
+            .spawn_process(crate::tools::unified_exec::SpawnProcessRequest {
+                argv: vec!["sh".to_string(), "-c".to_string(), "sleep 2".to_string()],
+                cwd: tempdir.path().to_path_buf(),
+                env: std::collections::HashMap::new(),
+                tty: false,
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                timeout_ms: Some(5_000),
+                kill_on_cancel: true,
+                call_id: "call-start".to_string(),
+                tool_name: "exec_command".to_string(),
+                emitter: None,
+                cancel: None,
+            })
+            .await
+            .expect("spawn process");
+        assert!(started.running);
+
+        let cross_agent = second_manager
+            .write_stdin(crate::tools::unified_exec::WriteStdinRequest {
+                session_id: started.session_id,
+                chars: String::new(),
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                call_id: "call-cross-agent".to_string(),
+                tool_name: "write_stdin".to_string(),
+                emitter: None,
+            })
+            .await
+            .expect_err("second agent must not access first agent process id");
+        let cross_agent_debug = format!("{cross_agent:?}");
+        assert!(
+            cross_agent_debug.contains("unknown session"),
+            "unexpected cross-agent write_stdin error: {cross_agent_debug}"
+        );
+        assert_eq!(
+            first_manager.terminate_all().await,
+            1,
+            "first manager should still own the original process"
+        );
+        assert_eq!(
+            second_manager.terminate_all().await,
+            0,
+            "second manager should not own first manager's process"
+        );
+    }
+
+    #[test]
+    fn runtime_unattached_unified_exec_does_not_use_global_fallback() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let session_id = SessionId("missing-runtime-session".to_string());
+        unified_exec_managers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        let err = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id))
+            .expect_err("unattached runtime session should fail loudly");
+        assert!(
+            matches!(err, ProviderResolveError::RuntimeResource(_)),
+            "expected runtime resource error, got {err:?}"
+        );
+
+        assert!(
+            !unified_exec_managers()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(session_id.as_str()),
+            "runtime-backed lookup failures must not silently fall back to the legacy global manager"
+        );
+    }
+
+    #[test]
+    fn runtime_backed_browser_backend_is_shared_by_session_resource() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = handle
+            .create_root_agent(browser_use_runtime::CreateRootAgentRequest {
+                cwd: tempdir.path().to_path_buf(),
+                task: "root task".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("root agent");
+        let session_id = SessionId(root.session_id().as_str().to_string());
+        let options = crate::config_overrides::AgentRunOptions {
+            browser_mode: Some("managed-headless".to_string()),
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+
+        let first =
+            browser_backend_for_runtime_or_config(&config, Some(&handle), Some(&session_id))
+                .expect("runtime browser backend resource");
+        let second =
+            browser_backend_for_runtime_or_config(&config, Some(&handle), Some(&session_id))
+                .expect("runtime browser backend resource");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "provider borrows for the same runtime session should reuse the browser backend"
+        );
+        first
+            .command(
+                session_id.as_str(),
+                tempdir.path(),
+                tempdir.path(),
+                "browser status --json",
+            )
+            .expect("browser status should create a browser-use-browser session");
+        assert!(
+            !browser_use_browser::BrowserSessionRegistry::global()
+                .contains_session(session_id.as_str()),
+            "runtime-backed browser backend must not create sessions in the global browser registry"
+        );
+        let browser_snapshots = handle.snapshot().browsers;
+        assert_eq!(browser_snapshots.len(), 1);
+        assert_eq!(
+            browser_snapshots[0].status,
+            browser_use_runtime::BrowserStatus::Released,
+            "browser calls should claim and release the runtime browser lease"
+        );
+        assert!(
+            browser_snapshots[0].active_agent_id.is_none(),
+            "browser lease should not remain active after a synchronous browser command"
+        );
+        assert_eq!(
+            handle
+                .cleanup_session_resources(root.session_id())
+                .expect("cleanup browser runtime resource"),
+            1,
+            "runtime resource cleanup should close the underlying browser session"
+        );
+    }
+
+    #[test]
+    fn runtime_unattached_browser_backend_fails_loudly() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let session_id = SessionId("missing-runtime-session".to_string());
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+
+        let err = match browser_backend_for_runtime_or_config(
+            &config,
+            Some(&handle),
+            Some(&session_id),
+        ) {
+            Ok(_) => panic!("unattached runtime session should fail loudly"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, ProviderResolveError::RuntimeResource(_)),
+            "expected runtime resource error, got {err:?}"
+        );
+        assert!(
+            handle.snapshot().browsers.is_empty(),
+            "failed runtime browser resource attachment must not create browser handles"
+        );
+    }
+
+    #[test]
+    fn runtime_backed_mcp_client_is_shared_by_session_resource() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = handle
+            .create_root_agent(browser_use_runtime::CreateRootAgentRequest {
+                cwd: tempdir.path().to_path_buf(),
+                task: "root task".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("root agent");
+        let session_id = SessionId(root.session_id().as_str().to_string());
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "missing".to_string(),
+            crate::mcp::McpServerConfig {
+                transport: crate::mcp::McpServerTransport::Stdio {
+                    command: "__browser_use_missing_mcp_test_command__".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                },
+                startup_timeout_ms: Some(50),
+                tool_timeout_ms: Some(50),
+                enabled_tools: None,
+                disabled_tools: None,
+            },
+        );
+        let options = crate::config_overrides::AgentRunOptions {
+            mcp_servers: servers,
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+
+        let first = mcp_client_for_runtime_or_config(&config, Some(&handle), Some(&session_id))
+            .expect("first mcp resource");
+        let second = mcp_client_for_runtime_or_config(&config, Some(&handle), Some(&session_id))
+            .expect("second mcp resource");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "provider borrows for the same runtime session should reuse the MCP manager"
+        );
+        assert_eq!(
+            first.startup_errors.len(),
+            1,
+            "startup errors should be retained with the runtime-owned MCP resource"
+        );
+    }
+
+    #[test]
+    fn runtime_unattached_mcp_client_fails_loudly() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let session_id = SessionId("missing-runtime-session".to_string());
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "missing".to_string(),
+            crate::mcp::McpServerConfig {
+                transport: crate::mcp::McpServerTransport::Stdio {
+                    command: "__browser_use_missing_mcp_test_command__".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                },
+                startup_timeout_ms: Some(50),
+                tool_timeout_ms: Some(50),
+                enabled_tools: None,
+                disabled_tools: None,
+            },
+        );
+        let options = crate::config_overrides::AgentRunOptions {
+            mcp_servers: servers,
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+
+        let err = match mcp_client_for_runtime_or_config(&config, Some(&handle), Some(&session_id))
+        {
+            Ok(_) => panic!("unattached runtime session should fail loudly"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("unknown agent"),
+            "unexpected mcp error: {err}"
+        );
     }
 
     /// `AskForApproval::Never` (the default) AUTO-APPROVES: a gated `shell` call

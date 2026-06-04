@@ -8,7 +8,6 @@ use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 #[cfg(not(test))]
@@ -55,7 +54,9 @@ use browser_use_providers::{
     parse_claude_code_authorization_input, ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST,
     CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
 };
-use browser_use_store::{resolve_state_dir, Store, StoreNotification, StoreNotifier};
+#[cfg(test)]
+use browser_use_store::StoreNotifier;
+use browser_use_store::{resolve_state_dir, Store, StoreNotification};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
@@ -82,6 +83,16 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use signal_hook::consts::signal::SIGUSR2;
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
+static BROWSER_USE_TERMINAL_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn browser_use_terminal_home_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    BROWSER_USE_TERMINAL_HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 mod clipboard_paste;
 mod composer;
 mod markdown;
@@ -104,7 +115,10 @@ use render::{
     lines_plain_text, main_viewport_height, native_scrollback_lines, render, render_dump,
     APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
-use runtime::{cancel_agent_run, run_agent_thread};
+use runtime::{
+    cancel_agent_run, has_live_runtime_agent, pending_runtime_trigger_turn_agent_mailbox_count,
+    spawn_tui_agent_run, submit_runtime_user_input,
+};
 use settings::{
     browser_use_cloud_env_key_present, bundled_openai_model_ids, bundled_openrouter_model_ids,
     display_and_provider_model_for_input, display_model_for_provider_model, fallback_model_choices,
@@ -157,6 +171,7 @@ const SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT: &str = "session.queued_followup.c
 pub(crate) const SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT: &str = "session.followup.pending";
 const SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT: &str = "session.followup.interrupt_sent";
 pub(crate) const SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT: &str = "session.followup.cancelled";
+const SESSION_MAILBOX_CONTINUATION_STARTED_EVENT: &str = "session.mailbox_continuation.started";
 const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
 const SESSION_STOPPED_REASON: &str = "stopped from terminal";
 pub(crate) const SESSION_PAUSED_REASON: &str = "session paused";
@@ -231,6 +246,7 @@ enum Surface {
     Mode,
     Browser,
     BrowserSelect,
+    DefaultProfile,
     CookieSync,
     Context,
     Goal,
@@ -255,6 +271,7 @@ impl Surface {
                 | Self::Mode
                 | Self::Browser
                 | Self::BrowserSelect
+                | Self::DefaultProfile
                 | Self::CookieSync
                 | Self::Context
                 | Self::Goal
@@ -459,6 +476,37 @@ impl Default for CookieSyncState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DefaultProfileStatus {
+    Loading,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct DefaultProfileEvent {
+    result: Result<serde_json::Value, String>,
+}
+
+#[derive(Debug)]
+struct DefaultProfileState {
+    status: DefaultProfileStatus,
+    profiles: Vec<CookieSyncProfile>,
+    current_profile_id: Option<String>,
+    rx: Option<mpsc::Receiver<DefaultProfileEvent>>,
+}
+
+impl Default for DefaultProfileState {
+    fn default() -> Self {
+        Self {
+            status: DefaultProfileStatus::Loading,
+            profiles: Vec::new(),
+            current_profile_id: None,
+            rx: None,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Feedback questionnaire state
 
@@ -583,6 +631,7 @@ enum AppCommand {
     SignIn,
     ConfigureTelemetry,
     ChangeBrowser,
+    ChangeDefaultProfile,
     SyncCookies,
     Reload,
     Update,
@@ -592,6 +641,7 @@ enum AppCommand {
     OpenModelSearch,
     SaveCustomModel(String),
     SaveBrowser(usize),
+    SaveDefaultProfile(usize),
     SaveAuth(String),
     SaveTelemetry(String),
     OpenFeedback,
@@ -706,7 +756,18 @@ pub(crate) fn event_payload_text(event: &EventRecord) -> Option<String> {
 
 fn event_is_pre_output_after_submission(event: &EventRecord, target_seq: i64) -> bool {
     match event.event_type.as_str() {
-        "model.turn.request" | "model.thinking_delta" | "session.status" => true,
+        "model.turn.request"
+        | "model.thinking_delta"
+        | "session.status"
+        | "agent.created"
+        | "agent.resumed"
+        | "agent.input.accepted"
+        | "agent.input.consumed"
+        | "agent.started"
+        | "agent.queued"
+        | "agent.run.started"
+        | "agent.continuation_started"
+        | "agent.turn.started" => true,
         "workspace.context"
         | "model.switch_context"
         | "model.personality_context"
@@ -1084,6 +1145,7 @@ struct App {
     claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
     codex_login: Option<CodexLoginFlow>,
     cookie_sync: CookieSyncState,
+    default_profile: DefaultProfileState,
     pending_cookie_sync_after_auth: bool,
     browser_notice: Option<String>,
     status_notice: Option<String>,
@@ -1136,6 +1198,7 @@ struct AppStateCache {
     sessions: Vec<SessionMeta>,
     events_by_session: HashMap<String, Vec<EventRecord>>,
     last_seq_by_session: HashMap<String, i64>,
+    runtime_projection: Option<browser_use_runtime::RuntimeSnapshot>,
     revision: u64,
     projected: WorkbenchState,
     projection_key: Option<ProjectionKey>,
@@ -1164,6 +1227,7 @@ impl AppStateCache {
             sessions,
             events_by_session,
             last_seq_by_session,
+            runtime_projection: None,
             revision: 0,
             projected: empty_workbench_state(browser),
             projection_key: None,
@@ -1280,6 +1344,18 @@ impl AppStateCache {
         Ok(true)
     }
 
+    fn apply_runtime_projection(
+        &mut self,
+        projection: Option<browser_use_runtime::RuntimeSnapshot>,
+    ) -> bool {
+        let changed = self.runtime_projection != projection;
+        if changed {
+            self.runtime_projection = projection;
+            self.mark_changed();
+        }
+        changed
+    }
+
     fn upsert_session(&mut self, session: SessionMeta) -> bool {
         if let Some(existing) = self
             .sessions
@@ -1313,12 +1389,13 @@ impl AppStateCache {
             return &self.projected;
         }
 
+        let projected_sessions = self.projected_sessions();
         let current_events = selected_session_id
             .and_then(|id| self.events_by_session.get(id))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let all_events = if history_tasks_visible {
-            self.sessions
+            projected_sessions
                 .iter()
                 .map(|session| {
                     (
@@ -1335,8 +1412,7 @@ impl AppStateCache {
             let mut index = 0;
             while index < session_ids.len() {
                 let parent_id = session_ids[index].clone();
-                for session in self
-                    .sessions
+                for session in projected_sessions
                     .iter()
                     .filter(|session| session.parent_id.as_deref() == Some(parent_id.as_str()))
                 {
@@ -1362,7 +1438,7 @@ impl AppStateCache {
             Vec::new()
         };
         self.projected = project_workbench(
-            &self.sessions,
+            &projected_sessions,
             current_events,
             &all_events,
             selected_session_id,
@@ -1378,6 +1454,66 @@ impl AppStateCache {
             .get(session_id)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    fn projected_sessions(&self) -> Vec<SessionMeta> {
+        let mut sessions = self.sessions.clone();
+        let Some(projection) = self.runtime_projection.as_ref() else {
+            return sessions;
+        };
+        let synthetic_ts = browser_use_store::now_ms();
+        for agent in &projection.agents {
+            if let Some(session) = sessions
+                .iter_mut()
+                .find(|session| session.id == agent.session_id.as_str())
+            {
+                if let Some(next_status) =
+                    runtime_status_overlay_for_store_status(&session.status, &agent.status)
+                {
+                    session.status = next_status;
+                }
+                session.updated_ms = session.updated_ms.max(synthetic_ts);
+                continue;
+            }
+            sessions.push(SessionMeta {
+                id: agent.session_id.as_str().to_string(),
+                parent_id: agent
+                    .parent_session_id
+                    .as_ref()
+                    .map(|session_id| session_id.as_str().to_string()),
+                cwd: agent.cwd.display().to_string(),
+                artifact_root: agent.cwd.display().to_string(),
+                status: runtime_status_overlay_for_store_status(
+                    &SessionStatus::Created,
+                    &agent.status,
+                )
+                .unwrap_or(SessionStatus::Created),
+                created_ms: synthetic_ts,
+                updated_ms: synthetic_ts,
+            });
+        }
+        sessions.sort_by(|left, right| right.updated_ms.cmp(&left.updated_ms));
+        sessions
+    }
+}
+
+fn runtime_status_overlay_for_store_status(
+    store_status: &SessionStatus,
+    runtime_status: &browser_use_runtime::AgentThreadStatus,
+) -> Option<SessionStatus> {
+    match runtime_status {
+        browser_use_runtime::AgentThreadStatus::Queued
+        | browser_use_runtime::AgentThreadStatus::Running
+        | browser_use_runtime::AgentThreadStatus::Cancelling => Some(SessionStatus::Running),
+        browser_use_runtime::AgentThreadStatus::Completed => Some(SessionStatus::Done),
+        browser_use_runtime::AgentThreadStatus::Failed => Some(SessionStatus::Failed),
+        browser_use_runtime::AgentThreadStatus::Cancelled => Some(SessionStatus::Cancelled),
+        browser_use_runtime::AgentThreadStatus::Closed => {
+            store_status.is_active().then_some(SessionStatus::Cancelled)
+        }
+        browser_use_runtime::AgentThreadStatus::Created => {
+            store_status.is_active().then(|| store_status.clone())
+        }
     }
 }
 
@@ -2016,6 +2152,7 @@ impl App {
             claude_code_oauth: None,
             codex_login: None,
             cookie_sync: CookieSyncState::default(),
+            default_profile: DefaultProfileState::default(),
             pending_cookie_sync_after_auth: false,
             browser_notice: None,
             status_notice: None,
@@ -2088,6 +2225,7 @@ impl App {
     }
 
     fn refresh_cached_projection(&mut self) -> &WorkbenchState {
+        self.apply_runtime_status_overlay();
         let selected_session_id = self.selected_session_id.clone();
         let browser = self.browser.clone();
         let history_tasks_visible = self.history_tasks_are_visible();
@@ -2096,6 +2234,13 @@ impl App {
             &browser,
             history_tasks_visible,
         )
+    }
+
+    fn apply_runtime_status_overlay(&mut self) -> bool {
+        let Ok(snapshot) = runtime::runtime_snapshot(&self.args.state_dir) else {
+            return false;
+        };
+        self.state_cache.apply_runtime_projection(snapshot)
     }
 
     fn drain_store_notifications(&mut self) -> Result<bool> {
@@ -2120,6 +2265,7 @@ impl App {
             self.last_followup_check_session = self.selected_session_id.clone();
             if self.flush_ready_pending_active_followups()?
                 || self.flush_ready_queued_followups()?
+                || self.flush_ready_agent_mailbox_continuation()?
             {
                 changed = true;
                 self.state_cache.refresh_all(&self.store)?;
@@ -2263,6 +2409,60 @@ impl App {
         Ok(true)
     }
 
+    fn drain_default_profile_notifications(&mut self) -> Result<bool> {
+        let mut events = Vec::new();
+        if let Some(rx) = self.default_profile.rx.as_ref() {
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+        }
+        if events.is_empty() {
+            return Ok(false);
+        }
+        self.default_profile.rx = None;
+        for event in events {
+            self.apply_default_profile_event(event);
+        }
+        Ok(true)
+    }
+
+    fn apply_default_profile_event(&mut self, event: DefaultProfileEvent) {
+        match event.result {
+            Ok(value) => match value.get("status").and_then(serde_json::Value::as_str) {
+                Some("needs-user-action") | Some("ok") | None => {
+                    self.default_profile.profiles = cookie_sync_profiles_from_value(&value);
+                    if let Some(current) = self.default_profile.current_profile_id.as_deref() {
+                        if let Some(index) = self
+                            .default_profile
+                            .profiles
+                            .iter()
+                            .position(|profile| profile.id == current)
+                        {
+                            self.selected_row = index;
+                        }
+                    }
+                    self.default_profile.status = DefaultProfileStatus::Ready;
+                }
+                Some("failed") => {
+                    let error = value
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Profile scan failed")
+                        .to_string();
+                    self.default_profile.status = DefaultProfileStatus::Failed(error);
+                }
+                Some(_) => {
+                    self.default_profile.status = DefaultProfileStatus::Failed(
+                        "Unexpected profile scan response.".to_string(),
+                    );
+                }
+            },
+            Err(error) => {
+                self.default_profile.status = DefaultProfileStatus::Failed(error);
+            }
+        }
+    }
+
     fn apply_cookie_sync_event(&mut self, event: CookieSyncEvent) {
         match event.result {
             Ok(value) => match event.kind {
@@ -2312,7 +2512,10 @@ impl App {
         if changed {
             self.refresh_cached_projection();
         }
-        if self.flush_ready_pending_active_followups()? || self.flush_ready_queued_followups()? {
+        if self.flush_ready_pending_active_followups()?
+            || self.flush_ready_queued_followups()?
+            || self.flush_ready_agent_mailbox_continuation()?
+        {
             changed = true;
             self.state_cache.refresh_all(&self.store)?;
             self.refresh_cached_projection();
@@ -2828,6 +3031,52 @@ impl App {
             )?;
         }
         self.status_notice = Some("Sent queued follow-up.".to_string());
+        self.start_agent_for_session(session_id)?;
+        Ok(true)
+    }
+
+    fn flush_ready_agent_mailbox_continuation(&mut self) -> Result<bool> {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(false);
+        };
+        let Some(session) = self.store.load_session(&session_id)? else {
+            return Ok(false);
+        };
+        if session.status != SessionStatus::Done {
+            return Ok(false);
+        }
+        let mailbox_count =
+            pending_runtime_trigger_turn_agent_mailbox_count(&self.args.state_dir, &session_id)?
+                .unwrap_or(0);
+        if mailbox_count == 0 {
+            return Ok(false);
+        }
+        let selection = self.session_model_selection_or_current(&session_id)?;
+        if !self.ensure_agent_ready_for_selection(&selection)? {
+            return Ok(false);
+        }
+        self.store.append_event(
+            &session_id,
+            SESSION_MAILBOX_CONTINUATION_STARTED_EVENT,
+            serde_json::json!({
+                "reason": "pending_agent_mailbox",
+                "mailbox_messages": mailbox_count,
+            }),
+        )?;
+        self.store.append_event(
+            &session_id,
+            "session.status",
+            serde_json::json!({
+                "status": "running",
+                "reason": "pending_agent_mailbox",
+                "mailbox_messages": mailbox_count,
+            }),
+        )?;
+        self.status_notice = Some(if mailbox_count == 1 {
+            "Resuming for subagent result.".to_string()
+        } else {
+            format!("Resuming for {mailbox_count} subagent results.")
+        });
         self.start_agent_for_session(session_id)?;
         Ok(true)
     }
@@ -3884,6 +4133,7 @@ impl App {
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
+            AppCommand::ChangeDefaultProfile => self.open_default_profile()?,
             AppCommand::SyncCookies => self.open_cookie_sync()?,
             AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
@@ -3893,6 +4143,7 @@ impl App {
             AppCommand::OpenModelSearch => self.open_model_search()?,
             AppCommand::SaveCustomModel(model_id) => self.save_provider_model(model_id)?,
             AppCommand::SaveBrowser(index) => self.save_browser(index)?,
+            AppCommand::SaveDefaultProfile(index) => self.save_default_profile(index)?,
             AppCommand::SaveAuth(secret) => self.save_auth(secret)?,
             AppCommand::SaveTelemetry(secret) => self.save_telemetry(secret)?,
             AppCommand::OpenFeedback => {
@@ -3981,6 +4232,100 @@ impl App {
         }
         let mut payload =
             typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
+        if active && has_live_runtime_agent(&self.args.state_dir, &session_id) {
+            payload["delivery"] = serde_json::json!(FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL);
+            payload["runtime_mailbox_id"] = serde_json::json!("pending");
+            let followup_record = self.store.append_event(
+                &session_id,
+                SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                payload,
+            )?;
+            let input_items = followup_record.payload.get("items").cloned();
+            match submit_runtime_user_input(
+                &self.args.state_dir,
+                &session_id,
+                submission.text.clone(),
+                input_items,
+                true,
+                browser_use_runtime::MailboxDeliveryPhase::CurrentTurn,
+                serde_json::json!({
+                    "source": "tui",
+                    "pending_from_seq": followup_record.seq,
+                    "runtime_marker_event_id": followup_record.id,
+                }),
+            ) {
+                Ok(mailbox_item) => {
+                    let _ = self.store.append_event(
+                        &session_id,
+                        "session.followup.runtime_queued",
+                        serde_json::json!({
+                            "followup_seq": followup_record.seq,
+                            "runtime_mailbox_id": mailbox_item.id,
+                            "runtime_mailbox_seq": mailbox_item.seq,
+                        }),
+                    );
+                    product_analytics::capture_user_message(
+                        &self.store,
+                        "tui",
+                        &session_id,
+                        session.parent_id.is_some(),
+                        product_analytics::MESSAGE_KIND_FOLLOWUP,
+                        followup_record.seq,
+                        &submission.text,
+                    );
+                    self.prompt_history.record_submission(&submission.text);
+                    if let Some(options) = options.as_ref() {
+                        self.maybe_append_message_history(
+                            &session_id,
+                            &submission.text,
+                            Path::new(&session.cwd),
+                            options,
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = self.store.append_event(
+                        &session_id,
+                        SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT,
+                        serde_json::json!({
+                            "followup_seq": followup_record.seq,
+                            "reason": format!("runtime enqueue failed: {error:#}"),
+                        }),
+                    );
+                    let mut fallback_payload =
+                        typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
+                    fallback_payload["delivery"] =
+                        serde_json::json!(FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL);
+                    let fallback_record = self.store.append_event(
+                        &session_id,
+                        SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                        fallback_payload,
+                    )?;
+                    product_analytics::capture_user_message(
+                        &self.store,
+                        "tui",
+                        &session_id,
+                        session.parent_id.is_some(),
+                        product_analytics::MESSAGE_KIND_FOLLOWUP,
+                        fallback_record.seq,
+                        &submission.text,
+                    );
+                    self.prompt_history.record_submission(&submission.text);
+                    if let Some(options) = options.as_ref() {
+                        self.maybe_append_message_history(
+                            &session_id,
+                            &submission.text,
+                            Path::new(&session.cwd),
+                            options,
+                        );
+                    }
+                    self.status_notice =
+                        Some("Follow-up queued through durable fallback.".to_string());
+                    return Ok(());
+                }
+            }
+        }
         if active {
             payload["delivery"] = serde_json::json!(FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL);
         }
@@ -4068,43 +4413,18 @@ impl App {
         let config_profile = self.args.config_profile.clone();
         let config_overrides = self.parsed_config_overrides()?;
         let notifier = self.store.notifier();
-        thread::Builder::new()
-            .name(format!("browser-use-agent-{session_id}"))
-            .spawn(move || {
-                let failure_state_dir = state_dir.clone();
-                let failure_session_id = session_id.clone();
-                let failure_notifier = notifier.clone();
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    run_agent_thread(
-                        state_dir,
-                        session_id,
-                        backend,
-                        model,
-                        model_provider_id,
-                        browser,
-                        collaboration_mode,
-                        config_profile,
-                        config_overrides,
-                        notifier,
-                    )
-                }));
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => record_agent_failure(
-                        failure_state_dir,
-                        failure_session_id,
-                        failure_notifier,
-                        format!("agent thread failed: {error:#}"),
-                    ),
-                    Err(panic) => record_agent_panic(
-                        failure_state_dir,
-                        failure_session_id,
-                        failure_notifier,
-                        panic_payload_message(panic),
-                    ),
-                }
-            })
-            .context("spawn agent thread")?;
+        spawn_tui_agent_run(
+            state_dir,
+            session_id,
+            backend,
+            model,
+            model_provider_id,
+            browser,
+            collaboration_mode,
+            config_profile,
+            config_overrides,
+            notifier,
+        )?;
         Ok(())
     }
 
@@ -4135,11 +4455,14 @@ impl App {
         if !self.current_task_is_active()? {
             return Ok(false);
         }
-        let cancelled_live_run = cancel_agent_run(&id);
+        let cancelled_live_run = cancel_agent_run(&self.args.state_dir, &id);
         self.pause_active_goal_for_interrupt(&id)?;
+        if cancelled_live_run {
+            return Ok(true);
+        }
         self.store.request_cancel(&id, reason)?;
         cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |session_id| {
-            usize::from(cancel_agent_run(session_id))
+            usize::from(cancel_agent_run(&self.args.state_dir, session_id))
         })?;
         if !cancelled_live_run {
             self.status_notice = if reason == SESSION_PAUSED_REASON {
@@ -5114,6 +5437,9 @@ impl App {
             Surface::BrowserSelect => {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
+            Surface::DefaultProfile => {
+                self.dispatch(AppCommand::SaveDefaultProfile(self.selected_row))?;
+            }
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
             Surface::Context | Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
@@ -5374,6 +5700,7 @@ impl App {
         match action {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
+            PaletteAction::DefaultProfile => self.dispatch(AppCommand::ChangeDefaultProfile)?,
             PaletteAction::Context => self.open_surface(Surface::Context),
             PaletteAction::Goal => self.show_current_goal()?,
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
@@ -5804,9 +6131,8 @@ impl App {
     /// engine's low-level appender: it emits the developer-instructions override
     /// (the one block the TUI can reconstruct from `AgentRunOptions`) as a
     /// `permissions`-kind `workspace.context` event. The engine fn is async and
-    /// takes a `SharedStore`, so — like `runtime::run_agent_thread` — we clone
-    /// the store into an `Arc<Mutex<…>>` and block on a current-thread Tokio
-    /// runtime, preserving origin/main's synchronous call shape.
+    /// takes a `SharedStore`, so this one-shot context append reopens the store
+    /// and blocks on a current-thread Tokio runtime.
     fn append_workspace_context_event_blocking(
         &self,
         session_id: &str,
@@ -6503,6 +6829,14 @@ impl App {
         }
     }
 
+    fn default_profile_row_count(&self) -> usize {
+        match &self.default_profile.status {
+            DefaultProfileStatus::Ready => self.default_profile.profiles.len().max(1),
+            DefaultProfileStatus::Failed(_) => 1,
+            DefaultProfileStatus::Loading => 0,
+        }
+    }
+
     fn request_open_browser(&mut self) -> Result<()> {
         let Some(session_id) = self.selected_session_id.clone() else {
             self.browser_notice = Some("No current browser task yet.".to_string());
@@ -6545,6 +6879,94 @@ impl App {
         self.open_surface(Surface::CookieSync);
         self.status_notice = None;
         self.start_cookie_sync_profile_load()
+    }
+
+    fn open_default_profile(&mut self) -> Result<()> {
+        self.open_surface(Surface::DefaultProfile);
+        self.status_notice = None;
+        self.start_default_profile_load()
+    }
+
+    fn start_default_profile_load(&mut self) -> Result<()> {
+        self.default_profile.status = DefaultProfileStatus::Loading;
+        self.default_profile.profiles.clear();
+        self.default_profile.current_profile_id = self
+            .store
+            .get_setting("browser.preference.profile")?
+            .filter(|value| !value.trim().is_empty());
+        let cwd = std::env::current_dir()?;
+        let artifact_root = self.store.state_dir().join("profile-settings-artifacts");
+        fs::create_dir_all(&artifact_root)?;
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("browser-use-profile-settings".to_string())
+            .spawn(move || {
+                let result = run_standalone_browser_command_with_browser_use_api_key(
+                    "tui-profile-settings",
+                    &cwd,
+                    &artifact_root,
+                    "browser local profiles --json",
+                    None,
+                )
+                .map_err(|error| format!("{error:#}"));
+                let _ = tx.send(DefaultProfileEvent { result });
+            })
+            .context("spawn profile settings thread")?;
+        self.default_profile.rx = Some(rx);
+        Ok(())
+    }
+
+    fn save_default_profile(&mut self, index: usize) -> Result<()> {
+        match &self.default_profile.status {
+            DefaultProfileStatus::Ready => {}
+            DefaultProfileStatus::Failed(_) => {
+                self.close_surface();
+                return Ok(());
+            }
+            DefaultProfileStatus::Loading => return Ok(()),
+        }
+        let Some(profile) = self
+            .default_profile
+            .profiles
+            .get(index.min(self.default_profile.profiles.len().saturating_sub(1)))
+            .cloned()
+        else {
+            self.status_notice = Some("No local Chromium profiles found.".to_string());
+            self.close_surface();
+            return Ok(());
+        };
+        self.store
+            .set_setting("browser.preference.profile", &profile.id)?;
+        let profile_label = human_profile_label(&profile);
+        self.store
+            .set_setting("browser.preference.profile_label", &profile_label)?;
+        self.default_profile.current_profile_id = Some(profile.id.clone());
+        self.status_notice = Some(format!("Default Chrome profile: {profile_label}"));
+        self.close_surface();
+        Ok(())
+    }
+
+    pub(crate) fn browser_status_label(&self) -> String {
+        if self.browser != settings::BROWSER_LOCAL_CHROME {
+            return self.browser.clone();
+        }
+        let profile_label = self
+            .store
+            .get_setting("browser.preference.profile_label")
+            .ok()
+            .flatten()
+            .filter(|label| !label.trim().is_empty())
+            .or_else(|| {
+                self.store
+                    .get_setting("browser.preference.profile")
+                    .ok()
+                    .flatten()
+                    .filter(|profile| !profile.trim().is_empty())
+            });
+        match profile_label {
+            Some(profile) => format!("{} · {}", self.browser, concise_profile_label(&profile)),
+            None => self.browser.clone(),
+        }
     }
 
     fn start_cookie_sync_profile_load(&mut self) -> Result<()> {
@@ -6758,6 +7180,7 @@ impl App {
             Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
+            Surface::DefaultProfile => self.default_profile_row_count(),
             Surface::CookieSync => self.cookie_sync_row_count(),
             Surface::Context | Surface::Goal => 0,
             Surface::History => self.history_visible_indices()?.len(),
@@ -7190,11 +7613,32 @@ fn codex_env_auth_present() -> bool {
 fn cookie_sync_profiles_from_value(value: &serde_json::Value) -> Vec<CookieSyncProfile> {
     value
         .get("profiles")
+        .or_else(|| value.get("local_profiles"))
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(cookie_sync_profile_from_value)
         .collect()
+}
+
+fn concise_profile_label(label: &str) -> String {
+    let trimmed = label.trim();
+    let without_browser = trimmed.strip_prefix("Google Chrome - ").unwrap_or(trimmed);
+    without_browser
+        .rsplit_once(':')
+        .map(|(_, profile)| profile)
+        .unwrap_or(without_browser)
+        .trim()
+        .to_string()
+}
+
+pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
+    let profile_name = concise_profile_label(&profile.profile_name);
+    if profile_name.trim().is_empty() {
+        concise_profile_label(&profile.display_name)
+    } else {
+        profile_name
+    }
 }
 
 fn cookie_sync_profile_from_value(value: &serde_json::Value) -> Option<CookieSyncProfile> {
@@ -7769,6 +8213,7 @@ fn install_agent_panic_hook() {
     });
 }
 
+#[cfg(test)]
 fn record_agent_panic(
     state_dir: PathBuf,
     session_id: String,
@@ -7783,6 +8228,7 @@ fn record_agent_panic(
     );
 }
 
+#[cfg(test)]
 fn record_agent_failure(
     state_dir: PathBuf,
     session_id: String,
@@ -7796,16 +8242,6 @@ fn record_agent_failure(
             serde_json::json!({ "error": error }),
         );
     }
-}
-
-fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "non-string panic payload".to_string()
 }
 
 fn main() -> Result<()> {
@@ -7948,6 +8384,7 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_codex_login_notifications()?;
             draw_needed |= app.drain_clipboard_paste_notifications()?;
             draw_needed |= app.drain_cookie_sync_notifications()?;
+            draw_needed |= app.drain_default_profile_notifications()?;
             draw_needed |= app.drain_provider_fetch()?;
             draw_needed |= app.drain_feedback_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
@@ -9371,8 +9808,6 @@ fn seed_demo_if_requested(store: &Store, mode: Option<&str>) -> Result<()> {
 mod redesign_tests {
     use super::*;
 
-    static BROWSER_USE_TERMINAL_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn args(temp: &tempfile::TempDir) -> Args {
         Args {
             state_dir: temp.path().to_path_buf(),
@@ -9869,6 +10304,50 @@ mod redesign_tests {
         Ok(())
     }
 
+    #[test]
+    fn cancel_current_task_uses_live_runtime_without_store_cancel_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep working"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Working..."}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+        let runtime = runtime::tui_runtime_handle(&app.args.state_dir)?;
+        let runtime_session_id = browser_use_runtime::SessionId::from_string(session.id.clone())?;
+        runtime.attach_root_agent(browser_use_runtime::AttachRootAgentRequest {
+            session_id: runtime_session_id.clone(),
+            cwd: temp.path().to_path_buf(),
+            task: "keep working".to_string(),
+            max_concurrent_threads_per_session:
+                browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        })?;
+        let token = runtime.register_run(runtime_session_id);
+
+        assert!(app.cancel_current_task()?);
+
+        assert!(token.is_cancelled());
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent.cancel_requested"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "session.cancel_requested"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "session.cancelled"));
+        Ok(())
+    }
+
     fn write_test_png(path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -9879,9 +10358,7 @@ mod redesign_tests {
     }
 
     fn with_browser_use_terminal_home<T>(app_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _lock = BROWSER_USE_TERMINAL_HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _lock = crate::browser_use_terminal_home_test_lock();
         let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
         unsafe {
             std::env::set_var("BROWSER_USE_TERMINAL_HOME", app_home);
@@ -10287,6 +10764,7 @@ mod redesign_tests {
             Surface::ModelSearch => "Model",
             Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
+            Surface::DefaultProfile => "Profile",
             Surface::CookieSync => "Cookie Sync",
             Surface::Context => "Context",
             Surface::Goal => "Goal",
@@ -11670,6 +12148,104 @@ mod redesign_tests {
     }
 
     #[test]
+    fn root_runtime_agent_completion_does_not_render_as_subagent_lifecycle() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        let session_id = session.id.clone();
+        app.store.append_event(
+            &session_id,
+            "session.input",
+            serde_json::json!({"text": "answer directly"}),
+        )?;
+        app.store.append_event(
+            &session_id,
+            "session.done",
+            serde_json::json!({"result": "Final answer from the main task."}),
+        )?;
+        app.store.append_event(
+            &session_id,
+            "agent.completed",
+            serde_json::json!({
+                "runtime_event_id": "runtime-main-completed",
+                "root_id": session_id.clone(),
+                "agent_id": session_id.clone(),
+                "payload": {
+                    "runtime_owned": true,
+                    "result": "Final answer from the main task.",
+                    "terminal_event_type": "session.done",
+                    "terminal_event_seq": 2,
+                },
+            }),
+        )?;
+
+        app.selected_session_id = Some(session_id);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("Final answer from the main task."));
+        assert!(!screen.contains("subagent finished"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_child_completion_payload_still_renders_as_subagent_lifecycle() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo-explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "inspect repository"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.spawned",
+            serde_json::json!({"child_session_id": child.id, "nickname": "repo-explorer"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.completed",
+            serde_json::json!({
+                "runtime_event_id": "runtime-child-completed",
+                "root_id": parent.id.clone(),
+                "agent_id": parent.id.clone(),
+                "payload": {
+                    "child_session_id": child.id.clone(),
+                    "status": "done",
+                    "runtime_owned": true,
+                    "payload": {
+                        "child_session_id": child.id,
+                        "status": "done",
+                        "result": "Nested helper summary must stay hidden.",
+                        "runtime_owned": true,
+                    },
+                },
+            }),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "Parent final answer."}),
+        )?;
+
+        app.selected_session_id = Some(parent.id);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("• subagent repo-explorer started"));
+        assert!(screen.contains("• subagent repo-explorer finished"));
+        assert!(screen.contains("Parent final answer."));
+        assert!(!screen.contains("Nested helper summary must stay hidden."));
+        Ok(())
+    }
+
+    #[test]
     fn command_palette_filters_and_exposes_only_product_actions() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -11686,10 +12262,12 @@ mod redesign_tests {
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
+        assert!(screen.contains("/profile"));
         assert!(!app
             .slash_palette_items()
             .iter()
             .any(|item| item.command == "/mode"));
+        assert!(!screen.lines().any(|line| line.contains("/mode ")));
         assert!(!screen.contains("/plan"));
         assert!(screen.contains("/model"));
         assert!(!screen.contains("/auth"));
@@ -12873,6 +13451,7 @@ wire_api = "responses"
     #[test]
     fn up_down_keys_navigate_every_choice_menu() -> Result<()> {
         fn assert_nav(app: &mut App, expected_count: usize) -> Result<()> {
+            assert!(expected_count > 0, "surface {:?}", app.surface);
             app.selected_row = 0;
             for _ in 0..expected_count - 1 {
                 assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
@@ -12884,6 +13463,14 @@ wire_api = "responses"
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
             assert_eq!(app.selected_row, expected_count - 1);
             Ok(())
+        }
+        fn assert_nav_current(app: &mut App) -> Result<()> {
+            let expected_count = if app.is_slash_palette_active() {
+                app.slash_palette_items().len()
+            } else {
+                app.selectable_row_count()?
+            };
+            assert_nav(app, expected_count)
         }
 
         let first_run_temp = tempfile::tempdir()?;
@@ -12900,15 +13487,34 @@ wire_api = "responses"
             Surface::Mode,
             Surface::Browser,
             Surface::BrowserSelect,
+            Surface::DefaultProfile,
             Surface::CookieSync,
         ] {
             app.open_surface(surface);
+            if surface == Surface::DefaultProfile {
+                app.default_profile.status = DefaultProfileStatus::Ready;
+                app.default_profile.profiles = vec![
+                    CookieSyncProfile {
+                        id: "google-chrome:Default".to_string(),
+                        display_name: "Google Chrome - Work".to_string(),
+                        browser_name: "Google Chrome".to_string(),
+                        profile_name: "Work".to_string(),
+                    },
+                    CookieSyncProfile {
+                        id: "google-chrome:Profile 1".to_string(),
+                        display_name: "Google Chrome - Personal".to_string(),
+                        browser_name: "Google Chrome".to_string(),
+                        profile_name: "Personal".to_string(),
+                    },
+                ];
+            }
             let count = match surface {
                 Surface::Setup => app.setup_row_count(),
                 Surface::Account => ACCOUNT_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
                 Surface::Mode => 2,
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
+                Surface::DefaultProfile => app.default_profile_row_count(),
                 Surface::CookieSync => app.cookie_sync_row_count(),
                 _ => unreachable!(),
             };
@@ -12930,13 +13536,13 @@ wire_api = "responses"
                 serde_json::json!({"text": format!("history task {idx}")}),
             )?;
         }
+        app.refresh_state_cache_from_store()?;
         app.open_surface(Surface::History);
-        assert_nav(&mut app, 3)?;
+        assert_nav_current(&mut app)?;
         app.close_surface();
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
-        let slash_palette_count = app.slash_palette_items().len();
-        assert_nav(&mut app, slash_palette_count)?;
+        assert_nav_current(&mut app)?;
         app.close_slash_palette();
 
         let failed = app.store.create_session(None, std::env::current_dir()?)?;
@@ -12951,7 +13557,8 @@ wire_api = "responses"
             serde_json::json!({"error": "OpenRouter API key is missing"}),
         )?;
         app.selected_session_id = Some(failed.id);
-        assert_nav(&mut app, 4)?;
+        app.refresh_state_cache_from_store()?;
+        assert_nav_current(&mut app)?;
 
         let cancelled = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
@@ -12961,7 +13568,8 @@ wire_api = "responses"
         )?;
         app.store.request_cancel(&cancelled.id, "test cancel")?;
         app.selected_session_id = Some(cancelled.id);
-        assert_nav(&mut app, 3)?;
+        app.refresh_state_cache_from_store()?;
+        assert_nav_current(&mut app)?;
         Ok(())
     }
 
@@ -14354,6 +14962,315 @@ wire_api = "responses"
         assert!(!text.contains("writing Mapping the main crates."));
         assert!(!text.contains("Mapping the main crates."));
         assert!(!text.contains("spawn_agent requested"));
+        Ok(())
+    }
+
+    #[test]
+    fn store_backed_pending_subagent_mailbox_does_not_resume_done_parent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "research this repo"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "Spawned agents; waiting later."}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo_explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.selected_session_id = Some(parent.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.store.send_agent_message(
+            &child.id,
+            &parent.id,
+            "<subagent_notification><agent_name>/root/repo_explorer</agent_name><status>completed</status></subagent_notification>",
+            false,
+        )?;
+        app.drain_store_notifications()?;
+
+        assert_eq!(
+            app.store
+                .load_session(&parent.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Done)
+        );
+        assert_eq!(app.store.messages_for_agent(&parent.id)?.len(), 1);
+        let events = app.store.events_for_session(&parent.id)?;
+        assert!(!events.iter().any(|event| {
+            event.event_type == SESSION_MAILBOX_CONTINUATION_STARTED_EVENT
+                && event
+                    .payload
+                    .get("mailbox_messages")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+        }));
+        let screen = render_dump(&mut app)?;
+        assert!(!screen.contains("subagent results ready"), "{screen}");
+        assert!(!screen.contains("1 mailbox update queued"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_mailbox_counts_materialize_from_sqlite_before_existing_live_attach() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = ready_app(&temp)?;
+        let cwd = std::env::current_dir()?;
+        let parent = app.store.create_session(None, cwd.clone())?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "research this repo"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "Spawned agents; waiting later."}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            cwd,
+            Some("/root/repo_explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        let parent_session_id = browser_use_runtime::SessionId::from_string(parent.id.clone())?;
+        let parent_agent_id = browser_use_runtime::AgentId::from_string(parent.id.clone())?;
+        let child_agent_id = browser_use_runtime::AgentId::from_string(child.id.clone())?;
+        let mailbox_item = browser_use_runtime::MailboxItem {
+            seq: 9,
+            id: "mail-9".to_string(),
+            kind: browser_use_runtime::MailboxItemKind::Completion,
+            author_agent_id: child_agent_id,
+            target_agent_id: parent_agent_id.clone(),
+            target_path: Some("/root/repo_explorer".to_string()),
+            content: "<subagent_notification><status>completed</status></subagent_notification>"
+                .to_string(),
+            trigger_turn: false,
+            delivery_phase: browser_use_runtime::MailboxDeliveryPhase::NextTurn,
+            payload: serde_json::json!({"source": "test"}),
+        };
+        let mailbox_event = browser_use_runtime::RuntimeEvent::new(
+            browser_use_runtime::RuntimeEventKind::MailboxEnqueued,
+            browser_use_runtime::Durability::Barrier,
+        )
+        .with_session_id(parent_session_id)
+        .with_agent_id(parent_agent_id)
+        .with_payload(serde_json::json!({
+            "mailbox_item": mailbox_item,
+            "trigger_turn": false,
+        }));
+        app.store.append_event(
+            &parent.id,
+            mailbox_event.event_type(),
+            mailbox_event.journal_payload(),
+        )?;
+
+        assert_eq!(
+            runtime::pending_runtime_agent_mailbox_count(&app.args.state_dir, &parent.id)?,
+            Some(1)
+        );
+        assert_eq!(
+            runtime::pending_runtime_trigger_turn_agent_mailbox_count(
+                &app.args.state_dir,
+                &parent.id
+            )?,
+            Some(0)
+        );
+        assert_eq!(
+            runtime::runtime_active_child_session_count(&app.args.state_dir, &parent.id)?,
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_pending_subagent_mail_keeps_done_parent_visible() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cwd = std::env::current_dir()?;
+        let parent = app.store.create_session(None, cwd.clone())?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "research this repo"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "Spawned agents; waiting later."}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            cwd.clone(),
+            Some("/root/repo_explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "stale durable child projection"}),
+        )?;
+        app.selected_session_id = Some(parent.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        let runtime = runtime::tui_runtime_handle(&app.args.state_dir)?;
+        runtime.attach_root_agent(browser_use_runtime::AttachRootAgentRequest {
+            session_id: browser_use_runtime::SessionId::from_string(parent.id.clone())?,
+            cwd: cwd.clone(),
+            task: "research this repo".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        runtime.attach_child_agent(browser_use_runtime::AttachChildAgentRequest {
+            parent_agent_id: browser_use_runtime::AgentId::from_string(parent.id.clone())?,
+            child_agent_id: browser_use_runtime::AgentId::from_string(child.id.clone())?,
+            child_session_id: browser_use_runtime::SessionId::from_string(child.id.clone())?,
+            cwd,
+            agent_path: "/root/repo_explorer".to_string(),
+            nickname: Some("repo-explorer".to_string()),
+            role: Some("explorer".to_string()),
+        })?;
+        assert_eq!(
+            runtime::runtime_active_child_session_count(&app.args.state_dir, &parent.id)?,
+            Some(1)
+        );
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+        assert!(text.contains("Working..."), "{text}");
+        assert!(text.contains("(1 subagent running)"), "{text}");
+
+        runtime.send_agent_message(browser_use_runtime::SendAgentMessageRequest {
+            author_agent_id: browser_use_runtime::AgentId::from_string(child.id.clone())?,
+            target_agent_id: browser_use_runtime::AgentId::from_string(parent.id.clone())?,
+            content: "<subagent_notification><agent_name>/root/repo_explorer</agent_name><status>completed</status></subagent_notification>".to_string(),
+            trigger_turn: false,
+            kind: browser_use_runtime::MailboxItemKind::Completion,
+            delivery_phase: browser_use_runtime::MailboxDeliveryPhase::NextTurn,
+            payload: serde_json::json!({"source": "test"}),
+        })?;
+
+        assert_eq!(
+            runtime::pending_runtime_agent_mailbox_count(&app.args.state_dir, &parent.id)?,
+            Some(1)
+        );
+        assert_eq!(
+            runtime::pending_runtime_trigger_turn_agent_mailbox_count(
+                &app.args.state_dir,
+                &parent.id
+            )?,
+            Some(0)
+        );
+        assert!(
+            !app.flush_ready_agent_mailbox_continuation()?,
+            "non-triggering child completion mail must not auto-resume an idle parent"
+        );
+        app.refresh_state_cache_from_store()?;
+        assert_eq!(
+            app.store
+                .load_session(&parent.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Done)
+        );
+        let parent_events = app.store.events_for_session(&parent.id)?;
+        assert!(parent_events
+            .iter()
+            .all(|event| event.event_type != SESSION_MAILBOX_CONTINUATION_STARTED_EVENT));
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+
+        assert!(text.contains("subagent results ready"), "{text}");
+        assert!(text.contains("(1 subagent result queued)"), "{text}");
+        assert!(!text.contains("Working..."), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_status_overlay_marks_live_running_session_without_store_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cwd = std::env::current_dir()?;
+        let session = app.store.create_session(None, cwd.clone())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep running"}),
+        )?;
+        app.store
+            .set_status(&session.id, browser_use_protocol::SessionStatus::Done)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        let runtime = runtime::tui_runtime_handle(&app.args.state_dir)?;
+        let thread = runtime.attach_root_agent(browser_use_runtime::AttachRootAgentRequest {
+            session_id: browser_use_runtime::SessionId::from_string(session.id.clone())?,
+            cwd,
+            task: "keep running".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        thread.set_status(browser_use_runtime::AgentThreadStatus::Running);
+
+        let state = app.workbench_state()?;
+        assert_eq!(
+            state
+                .current_session
+                .as_ref()
+                .map(|session| &session.status),
+            Some(&SessionStatus::Running)
+        );
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Done),
+            "runtime overlay must not mutate durable SQLite history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_created_status_does_not_reactivate_terminal_store_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cwd = std::env::current_dir()?;
+        let session = app.store.create_session(None, cwd.clone())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "done parent"}),
+        )?;
+        app.store
+            .set_status(&session.id, browser_use_protocol::SessionStatus::Done)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        let runtime = runtime::tui_runtime_handle(&app.args.state_dir)?;
+        runtime.attach_root_agent(browser_use_runtime::AttachRootAgentRequest {
+            session_id: browser_use_runtime::SessionId::from_string(session.id.clone())?,
+            cwd,
+            task: "done parent".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let state = app.workbench_state()?;
+        assert_eq!(
+            state
+                .current_session
+                .as_ref()
+                .map(|session| &session.status),
+            Some(&SessionStatus::Done)
+        );
         Ok(())
     }
 
@@ -16567,6 +17484,47 @@ wire_api = "responses"
     }
 
     #[test]
+    fn escape_reclaim_treats_runtime_lifecycle_as_pre_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        let submitted = app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "take this back"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "agent.resumed",
+            serde_json::json!({
+                "agent_id": session.id,
+                "root_id": session.id,
+                "payload": {
+                    "agent_path": "/root",
+                    "materialized_from_replay": true,
+                    "role": "default",
+                },
+            }),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert_eq!(app.composer.input(), "take this back");
+        assert!(app
+            .store
+            .events_for_session(&session.id)?
+            .iter()
+            .any(|event| {
+                event.event_type == SESSION_ROLLBACK_EVENT
+                    && event.payload["action"] == "take_back"
+                    && event.payload["target_seq"] == submitted.seq
+            }));
+        Ok(())
+    }
+
+    #[test]
     fn escape_once_reclaims_followup_before_output_without_clearing_history() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -16634,13 +17592,17 @@ wire_api = "responses"
             serde_json::json!({"text": "visible output"}),
         )?;
         app.selected_session_id = Some(session.id.clone());
-        app.drain_store_notifications()?;
+        app.refresh_state_cache_from_store()?;
 
+        assert!(app.current_task_is_active()?);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
 
         assert!(app.composer.input().is_empty());
         assert!(!app.escape_stop_is_pending());
         let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.cancel_requested"));
         assert!(!events
             .iter()
             .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
@@ -16744,6 +17706,7 @@ wire_api = "responses"
         let screen = render_dump(&mut app)?;
         assert_eq!(app.surface, Surface::Main);
         assert!(screen.contains("stopped"));
+        assert_eq!(app.surface, Surface::Main);
         Ok(())
     }
 

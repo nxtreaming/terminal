@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
 
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
+use browser_use_agent::config_overrides::ChildAgentCompletionHandler;
 use browser_use_agent::config_overrides::{
     load_mcp_servers_for_profile, resolve_agent_roles_for_profile,
     resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
@@ -13,7 +14,10 @@ use browser_use_agent::config_overrides::{
 use browser_use_agent::context::{
     typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
 };
-use browser_use_agent::entrypoint::run_session_with_config_with_cancel;
+use browser_use_agent::live_executor::{
+    ensure_agent_attached as ensure_runtime_agent_attached, RuntimeAgentExecutor,
+    RuntimeAgentExecutorConfig, RuntimeAgentRunRequest,
+};
 use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_agent::rollout::fork_events_by_turn;
 use browser_use_agent::session::{
@@ -22,33 +26,255 @@ use browser_use_agent::session::{
 };
 use browser_use_agent::subagents::{display_agent_path_for_session, session_was_interrupted};
 use browser_use_protocol::{failure_from_events, session_result_from_events, SessionMeta};
+use browser_use_runtime::{
+    spawn_local_runtime_server, AgentId, AgentThreadStatus, BrowserUseRuntime,
+    CompleteAgentRequest, FailAgentRequest, LiveThreadPersistence, MailboxDeliveryPhase,
+    MailboxItem, RunId as RuntimeRunId, RuntimeHandle, RuntimeSnapshot, SessionId,
+    SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
+};
 use browser_use_store::{Store, StoreNotifier};
-use tokio_util::sync::CancellationToken;
 
 use crate::settings::{
     browser_use_cloud_env_key_present, AgentBackend, BROWSER_USE_CLOUD,
     BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
-static ACTIVE_AGENT_RUNS: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
+static TUI_LIVE_RUNTIMES: OnceLock<Mutex<HashMap<PathBuf, RuntimeHandle>>> = OnceLock::new();
+static TUI_RUNTIME_AGENT_EXECUTORS: OnceLock<Mutex<HashMap<PathBuf, RuntimeAgentExecutor>>> =
+    OnceLock::new();
 
-fn active_agent_runs() -> &'static Mutex<HashMap<String, CancellationToken>> {
-    ACTIVE_AGENT_RUNS.get_or_init(|| Mutex::new(HashMap::new()))
+fn tui_live_runtimes() -> &'static Mutex<HashMap<PathBuf, RuntimeHandle>> {
+    TUI_LIVE_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn cancel_agent_run(session_id: &str) -> bool {
-    let Some(token) = active_agent_runs()
-        .lock()
-        .ok()
-        .and_then(|runs| runs.get(session_id).cloned())
-    else {
+fn tui_runtime_agent_executors() -> &'static Mutex<HashMap<PathBuf, RuntimeAgentExecutor>> {
+    TUI_RUNTIME_AGENT_EXECUTORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn cancel_agent_run(state_dir: &Path, session_id: &str) -> bool {
+    let Ok(Some(handle)) = existing_tui_runtime_handle(state_dir) else {
         return false;
     };
-    token.cancel();
-    true
+    let Ok(session_id) = SessionId::from_string(session_id.to_string()) else {
+        return false;
+    };
+    handle.cancel_run(&session_id)
 }
 
-pub(crate) fn run_agent_thread(
+pub(crate) fn pending_runtime_agent_mailbox_count(
+    state_dir: &Path,
+    session_id: &str,
+) -> Result<Option<usize>> {
+    let handle = tui_runtime_handle_with_attached_agent(state_dir, session_id)?;
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    let session_id = SessionId::from_string(session_id.to_string())?;
+    match handle.pending_agent_mail_for_session(&session_id) {
+        Ok(items) => Ok(Some(items.len())),
+        Err(_) => Ok(None),
+    }
+}
+
+pub(crate) fn pending_runtime_trigger_turn_agent_mailbox_count(
+    state_dir: &Path,
+    session_id: &str,
+) -> Result<Option<usize>> {
+    let handle = tui_runtime_handle_with_attached_agent(state_dir, session_id)?;
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    let session_id = SessionId::from_string(session_id.to_string())?;
+    match handle.pending_agent_mail_for_session(&session_id) {
+        Ok(items) => Ok(Some(
+            items.into_iter().filter(|item| item.trigger_turn).count(),
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+pub(crate) fn runtime_active_child_session_count(
+    state_dir: &Path,
+    root_session_id: &str,
+) -> Result<Option<usize>> {
+    let handle = tui_runtime_handle_with_attached_agent(state_dir, root_session_id)?;
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    Ok(Some(
+        handle
+            .snapshot()
+            .agents
+            .into_iter()
+            .filter(|agent| {
+                agent
+                    .parent_session_id
+                    .as_ref()
+                    .is_some_and(|parent| parent.as_str() == root_session_id)
+                    && runtime_agent_status_is_active(&agent.status)
+            })
+            .count(),
+    ))
+}
+
+pub(crate) fn runtime_snapshot(state_dir: &Path) -> Result<Option<RuntimeSnapshot>> {
+    let Some(handle) = existing_tui_runtime_handle(state_dir)? else {
+        return Ok(None);
+    };
+    Ok(Some(handle.snapshot()))
+}
+
+fn runtime_agent_status_is_active(status: &AgentThreadStatus) -> bool {
+    matches!(
+        status,
+        AgentThreadStatus::Created
+            | AgentThreadStatus::Queued
+            | AgentThreadStatus::Running
+            | AgentThreadStatus::Cancelling
+    )
+}
+
+pub(crate) fn has_live_runtime_agent(state_dir: &Path, session_id: &str) -> bool {
+    let Ok(Some(handle)) = tui_runtime_handle_with_attached_agent(state_dir, session_id) else {
+        return false;
+    };
+    let Ok(agent_id) = AgentId::from_string(session_id.to_string()) else {
+        return false;
+    };
+    handle.agents().thread(&agent_id).is_ok()
+}
+
+fn existing_tui_runtime_handle(state_dir: &Path) -> Result<Option<RuntimeHandle>> {
+    tui_live_runtimes()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("TUI live runtime registry lock poisoned"))
+        .map(|runtimes| runtimes.get(state_dir).cloned())
+}
+
+fn tui_runtime_handle_with_attached_agent(
+    state_dir: &Path,
+    session_id: &str,
+) -> Result<Option<RuntimeHandle>> {
+    let store = Store::open(state_dir)?;
+    if store.load_session(session_id)?.is_none() {
+        return Ok(None);
+    }
+    let handle = match existing_tui_runtime_handle(state_dir)? {
+        Some(handle) => handle,
+        None => tui_runtime_handle_with_notifier(state_dir, None)?,
+    };
+    ensure_tui_agent_attached(
+        &handle,
+        &store,
+        session_id,
+        browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+    )?;
+    Ok(Some(handle))
+}
+
+pub(crate) fn submit_runtime_user_input(
+    state_dir: &Path,
+    session_id: &str,
+    content: String,
+    input_items: Option<serde_json::Value>,
+    trigger_turn: bool,
+    delivery_phase: MailboxDeliveryPhase,
+    payload: serde_json::Value,
+) -> Result<MailboxItem> {
+    let handle = existing_tui_runtime_handle(state_dir)?
+        .context("no live TUI runtime is attached for this state dir")?;
+    let store = Store::open(state_dir)?;
+    ensure_tui_agent_attached(
+        &handle,
+        &store,
+        session_id,
+        browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+    )?;
+    let agent_id = AgentId::from_string(session_id.to_string())?;
+    let response = handle.submit_followup(SubmitInputRequest {
+        target_agent_id: agent_id,
+        content,
+        trigger_turn,
+        delivery_phase,
+        input_items,
+        payload,
+    })?;
+    Ok(response.mailbox_item)
+}
+
+#[cfg(test)]
+pub(crate) fn tui_runtime_handle(state_dir: &Path) -> Result<RuntimeHandle> {
+    tui_runtime_handle_with_notifier(state_dir, None)
+}
+
+fn tui_runtime_handle_with_notifier(
+    state_dir: &Path,
+    notifier: Option<StoreNotifier>,
+) -> Result<RuntimeHandle> {
+    let state_dir = state_dir.to_path_buf();
+    if let Some(handle) = tui_live_runtimes()
+        .lock()
+        .ok()
+        .and_then(|runtimes| runtimes.get(&state_dir).cloned())
+    {
+        return Ok(handle);
+    }
+
+    let journal = Arc::new(SqliteJournal::from_store(
+        Store::open_with_optional_notifier(&state_dir, notifier)?,
+    ));
+    let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+    let state_index: Arc<dyn StateIndex> = journal;
+    let handle = BrowserUseRuntime::new(persistence, state_index).handle();
+    spawn_local_runtime_server(&state_dir, handle.clone())?;
+    let mut runtimes = tui_live_runtimes()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("TUI live runtime registry lock poisoned"))?;
+    Ok(runtimes.entry(state_dir).or_insert_with(|| handle).clone())
+}
+
+fn tui_runtime_agent_executor_with_notifier(
+    state_dir: &Path,
+    notifier: Option<StoreNotifier>,
+) -> Result<RuntimeAgentExecutor> {
+    let state_dir = state_dir.to_path_buf();
+    if let Some(executor) = tui_runtime_agent_executors()
+        .lock()
+        .ok()
+        .and_then(|executors| executors.get(&state_dir).cloned())
+    {
+        return Ok(executor);
+    }
+    let runtime = tui_runtime_handle_with_notifier(&state_dir, notifier.clone())?;
+    let executor = RuntimeAgentExecutor::new(
+        RuntimeAgentExecutorConfig::new(state_dir.clone(), runtime)
+            .with_notifier(notifier)
+            .with_worker_threads(2),
+    )?;
+    let mut executors = tui_runtime_agent_executors()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("TUI live executor registry lock poisoned"))?;
+    Ok(executors
+        .entry(state_dir)
+        .or_insert_with(|| executor)
+        .clone())
+}
+
+fn ensure_tui_agent_attached(
+    runtime: &RuntimeHandle,
+    store: &Store,
+    session_id: &str,
+    max_concurrent_threads_per_session: usize,
+) -> Result<()> {
+    ensure_runtime_agent_attached(
+        runtime,
+        store,
+        session_id,
+        max_concurrent_threads_per_session,
+    )
+}
+
+pub(crate) fn spawn_tui_agent_run(
     state_dir: PathBuf,
     session_id: String,
     backend: AgentBackend,
@@ -60,7 +286,43 @@ pub(crate) fn run_agent_thread(
     config_overrides: ConfigOverrides,
     notifier: Option<StoreNotifier>,
 ) -> Result<()> {
-    let store = Store::open_with_optional_notifier(&state_dir, notifier)?;
+    let (executor, config) = prepare_tui_agent_run(
+        state_dir,
+        &session_id,
+        backend,
+        model,
+        model_provider_id,
+        browser,
+        collaboration_mode,
+        config_profile,
+        config_overrides,
+        notifier,
+    )?;
+    executor.spawn_background(
+        format!("browser-use-agent-{session_id}"),
+        RuntimeAgentRunRequest::new(session_id.clone(), config),
+        move |completion| {
+            if let Some(error) = completion.error_message() {
+                eprintln!("tui agent failed: {error}");
+            }
+        },
+    )?;
+    Ok(())
+}
+
+fn prepare_tui_agent_run(
+    state_dir: PathBuf,
+    session_id: &str,
+    backend: AgentBackend,
+    model: String,
+    model_provider_id: Option<String>,
+    browser: String,
+    collaboration_mode: CollaborationModeKind,
+    config_profile: Option<String>,
+    config_overrides: ConfigOverrides,
+    notifier: Option<StoreNotifier>,
+) -> Result<(RuntimeAgentExecutor, ProviderRunConfig)> {
+    let store = Store::open_with_optional_notifier(&state_dir, notifier.clone())?;
     let browser_use_cloud_api_key = if browser == BROWSER_USE_CLOUD {
         browser_use_cloud_api_key(&store)?
     } else {
@@ -94,7 +356,19 @@ pub(crate) fn run_agent_thread(
             config_overrides.clone(),
         )?)
         .with_fake_result("Fake result from the Rust TUI agent loop.");
+    let executor = tui_runtime_agent_executor_with_notifier(&state_dir, notifier)?;
+    let runtime_handle = executor.runtime_handle();
+    ensure_tui_agent_attached(
+        &runtime_handle,
+        &store,
+        session_id,
+        config
+            .options
+            .multi_agent_v2
+            .max_concurrent_threads_per_session,
+    )?;
     attach_tui_child_agent_runner(
+        runtime_handle.clone(),
         state_dir.clone(),
         backend,
         model,
@@ -105,45 +379,7 @@ pub(crate) fn run_agent_thread(
         config_overrides,
         &mut config,
     );
-    // The async engine takes a `SharedStore` (`Arc<Mutex<Store>>`) and is driven
-    // on a Tokio runtime. The live model transport opens streams through
-    // `block_in_place`, so this must be a multi-thread runtime even though the
-    // TUI still keeps the existing one OS thread per session entrypoint.
-    let shared_store = Arc::new(Mutex::new(store));
-    let runtime = build_agent_runtime()?;
-    let cancel = CancellationToken::new();
-    if let Ok(mut runs) = active_agent_runs().lock() {
-        runs.insert(session_id.clone(), cancel.clone());
-    }
-    let result = runtime.block_on(run_session_with_config_with_cancel(
-        Arc::clone(&shared_store),
-        &session_id,
-        config,
-        cancel,
-    ));
-    if let Ok(mut runs) = active_agent_runs().lock() {
-        runs.remove(&session_id);
-    }
-    if let Err(error) = result {
-        if let Ok(store) = shared_store.lock() {
-            let _ = store.append_event(
-                &session_id,
-                "session.failed",
-                serde_json::json!({ "error": error.to_string() }),
-            );
-        }
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn build_agent_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("browser-use-agent-runtime")
-        .worker_threads(2)
-        .build()
-        .context("build TUI agent tokio runtime")
+    Ok((executor, config))
 }
 
 fn browser_use_cloud_api_key(store: &Store) -> Result<Option<String>> {
@@ -160,6 +396,7 @@ fn browser_use_cloud_api_key(store: &Store) -> Result<Option<String>> {
 }
 
 fn attach_tui_child_agent_runner(
+    runtime_handle: RuntimeHandle,
     state_dir: PathBuf,
     backend: AgentBackend,
     model: String,
@@ -172,6 +409,7 @@ fn attach_tui_child_agent_runner(
 ) {
     let runner = ChildAgentRunner::new(move |request| {
         spawn_tui_child_agent(
+            runtime_handle.clone(),
             state_dir.clone(),
             backend,
             model.clone(),
@@ -187,6 +425,7 @@ fn attach_tui_child_agent_runner(
 }
 
 fn spawn_tui_child_agent(
+    runtime_handle: RuntimeHandle,
     state_dir: PathBuf,
     backend: AgentBackend,
     model: String,
@@ -198,7 +437,19 @@ fn spawn_tui_child_agent(
     request: ChildAgentRunRequest,
 ) -> Result<()> {
     let store = Store::open(&state_dir)?;
-    let child = create_tui_child_session_from_request(&store, &request)?;
+    ensure_tui_agent_attached(
+        &runtime_handle,
+        &store,
+        &request.parent_session_id,
+        config_overrides
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "features.multi_agent_v2.max_concurrent_threads_per_session")
+            .and_then(|(_, value)| value.as_integer())
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION),
+    )?;
+    let child = create_tui_child_session_from_request(&runtime_handle, &store, &request)?;
     let child_id = child.id.clone();
     record_child_run_marker_from_request(&store, &child_id, &request)?;
     let child_model = request
@@ -226,42 +477,51 @@ fn spawn_tui_child_agent(
             toml::Value::String(service_tier),
         ));
     }
-    thread::Builder::new()
-        .name(format!("browser-use-tui-child-{child_id}"))
-        .spawn(move || {
-            let run_state_dir = state_dir.clone();
-            let result = run_agent_thread(
-                run_state_dir,
-                child_id.clone(),
-                child_backend,
-                child_model,
-                child_model_provider_id,
-                child_browser,
-                collaboration_mode,
-                config_profile,
-                config_overrides,
-                None,
+    let (executor, child_config) = prepare_tui_agent_run(
+        state_dir.clone(),
+        &child_id,
+        child_backend,
+        child_model,
+        child_model_provider_id,
+        child_browser,
+        collaboration_mode,
+        config_profile,
+        config_overrides,
+        None,
+    )?;
+    let mut run_request = RuntimeAgentRunRequest::new(child_id.clone(), child_config);
+    if let Some(run_id) = request.run_id.as_ref() {
+        run_request = run_request.with_run_id(RuntimeRunId::from_string(run_id.clone())?);
+    }
+    executor.spawn_background(
+        format!("browser-use-tui-child-{child_id}"),
+        run_request,
+        move |completion| {
+            let error = completion.error_message();
+            notify_tui_child_completion(
+                &runtime_handle,
+                &state_dir,
+                &child_id,
+                &request,
+                error.as_deref(),
             );
-            notify_tui_child_completion(&state_dir, &child_id, &request, result.as_ref().err());
-            if let Err(error) = result {
-                eprintln!("tui child agent failed: {error:#}");
+            if let Some(error) = error {
+                eprintln!("tui child agent failed: {error}");
             }
-        })
-        .context("spawn TUI child agent thread")?;
+        },
+    )?;
     Ok(())
 }
 
 fn notify_tui_child_completion(
+    runtime_handle: &RuntimeHandle,
     state_dir: &Path,
     child_id: &str,
-    request: &ChildAgentRunRequest,
-    run_error: Option<&anyhow::Error>,
+    _request: &ChildAgentRunRequest,
+    run_error: Option<&str>,
 ) {
-    let Some(handler) = request.completion_handler.clone() else {
-        return;
-    };
     let completion = match run_error {
-        Some(error) => ChildAgentRunCompletion::failure(format!("{error:#}")),
+        Some(error) => ChildAgentRunCompletion::failure(error.to_string()),
         None => {
             let events = Store::open(state_dir)
                 .and_then(|store| store.events_for_session(child_id))
@@ -278,8 +538,29 @@ fn notify_tui_child_completion(
             ChildAgentRunCompletion::success(summary)
         }
     };
-    if let Err(error) = handler.notify(completion) {
-        eprintln!("tui child agent completion notification failed: {error:#}");
+    let child_agent_id = match AgentId::from_string(child_id.to_string()) {
+        Ok(child_agent_id) => child_agent_id,
+        Err(error) => {
+            eprintln!("tui child agent completion runtime id failed: {error:#}");
+            return;
+        }
+    };
+    let runtime_result = if completion.success {
+        runtime_handle.complete_agent(CompleteAgentRequest {
+            child_agent_id,
+            result: completion.summary.clone().unwrap_or_default(),
+        })
+    } else {
+        runtime_handle.fail_agent(FailAgentRequest {
+            child_agent_id,
+            error: completion
+                .summary
+                .clone()
+                .unwrap_or_else(|| "child agent failed".to_string()),
+        })
+    };
+    if let Err(error) = runtime_result {
+        eprintln!("tui child agent completion runtime update failed: {error:#}");
     }
 }
 
@@ -288,23 +569,37 @@ fn child_run_was_interrupted_from_events(events: &[browser_use_protocol::EventRe
 }
 
 fn create_tui_child_session_from_request(
+    runtime_handle: &RuntimeHandle,
     store: &Store,
     request: &ChildAgentRunRequest,
 ) -> Result<SessionMeta> {
     if let Some(existing) = store.load_session(&request.child_session_id)? {
         return Ok(existing);
     }
-    let parent = store
+    store
         .load_session(&request.parent_session_id)?
         .with_context(|| format!("unknown parent session id: {}", request.parent_session_id))?;
-    let child = store.create_child_session_with_id(
-        &request.parent_session_id,
-        Path::new(&parent.cwd),
-        request.agent_path.as_deref(),
-        request.nickname.as_deref(),
-        request.role.as_deref(),
-        request.child_session_id.clone(),
-    )?;
+    let parent_agent_id = AgentId::from_string(request.parent_session_id.clone())?;
+    let child_agent_id = AgentId::from_string(request.child_session_id.clone())?;
+    let child_session_id = SessionId::from_string(request.child_session_id.clone())?;
+    runtime_handle.spawn_child(SpawnChildRequest {
+        parent_agent_id,
+        child_agent_id: Some(child_agent_id),
+        child_session_id: Some(child_session_id),
+        task_name: task_name_from_agent_path(request.agent_path.as_deref())
+            .unwrap_or_else(|| request.child_session_id.clone()),
+        message: request.message.clone(),
+        nickname: request.nickname.clone(),
+        role: request.role.clone(),
+    })?;
+    let child = store
+        .load_session(&request.child_session_id)?
+        .with_context(|| {
+            format!(
+                "runtime did not create child session {}",
+                request.child_session_id
+            )
+        })?;
     let parent_events = store.events_for_session(&request.parent_session_id)?;
     store.append_event(
         &child.id,
@@ -335,6 +630,12 @@ fn create_tui_child_session_from_request(
         }),
     )?;
     Ok(child)
+}
+
+fn task_name_from_agent_path(agent_path: Option<&str>) -> Option<String> {
+    agent_path
+        .and_then(|path| path.rsplit('/').find(|segment| !segment.trim().is_empty()))
+        .map(ToOwned::to_owned)
 }
 
 fn record_child_run_marker_from_request(
@@ -606,9 +907,6 @@ fn tui_agent_options(
 mod tests {
     use super::*;
     use browser_use_agent::tools::AskForApproval;
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn env_value<'a>(options: &'a AgentRunOptions, key: &str) -> Option<&'a str> {
         options
@@ -620,7 +918,12 @@ mod tests {
 
     #[test]
     fn tui_agent_runtime_supports_block_in_place() {
-        let runtime = build_agent_runtime().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("browser-use-live-agent-runtime-test")
+            .worker_threads(2)
+            .build()
+            .unwrap();
         let result = runtime.block_on(async { tokio::task::block_in_place(|| 42) });
         assert_eq!(result, 42);
     }
@@ -757,10 +1060,7 @@ mod tests {
 
     #[test]
     fn tui_agent_options_apply_runtime_config_layer() {
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned");
+        let _guard = crate::browser_use_terminal_home_test_lock();
         let temp = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
         unsafe {
@@ -803,13 +1103,21 @@ command = "test-mcp"
     }
 
     #[test]
-    fn tui_child_runner_request_creates_store_child_session() {
+    fn tui_child_runner_request_creates_runtime_backed_store_child_session() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
         let cwd = temp.path().join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
         let store = Store::open(&state_dir).unwrap();
         let parent = store.create_session(None, &cwd).unwrap();
+        let runtime = tui_runtime_handle(&state_dir).unwrap();
+        ensure_tui_agent_attached(
+            &runtime,
+            &store,
+            &parent.id,
+            browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        )
+        .unwrap();
         let request = ChildAgentRunRequest {
             parent_session_id: parent.id.clone(),
             child_session_id: "00000000dcba".to_string(),
@@ -831,11 +1139,15 @@ command = "test-mcp"
             completion_handler: None,
         };
 
-        let child = create_tui_child_session_from_request(&store, &request).unwrap();
+        let child = create_tui_child_session_from_request(&runtime, &store, &request).unwrap();
         record_child_run_marker_from_request(&store, &child.id, &request).unwrap();
 
         assert_eq!(child.id, "00000000dcba");
         assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+        assert!(runtime
+            .agents()
+            .thread(&AgentId::from_string(child.id.clone()).unwrap())
+            .is_ok());
         let child_events = store.events_for_session(&child.id).unwrap();
         assert!(child_events
             .iter()
@@ -864,5 +1176,125 @@ command = "test-mcp"
             .iter()
             .any(|event| event.event_type == "agent.spawned"
                 && event.payload["child_session_id"] == child.id));
+    }
+
+    #[test]
+    fn tui_child_completion_updates_runtime_parent_mailbox_without_legacy_handler() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = Store::open(&state_dir).unwrap();
+        let parent = store.create_session(None, &cwd).unwrap();
+        let runtime = tui_runtime_handle(&state_dir).unwrap();
+        ensure_tui_agent_attached(
+            &runtime,
+            &store,
+            &parent.id,
+            browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        )
+        .unwrap();
+        let request = ChildAgentRunRequest {
+            parent_session_id: parent.id.clone(),
+            child_session_id: "00000000feed".to_string(),
+            run_id: Some("run-2".to_string()),
+            message: "Handle the child task".to_string(),
+            input_items: None,
+            input_is_inter_agent_communication: false,
+            agent_path: Some("/root/worker_2".to_string()),
+            nickname: None,
+            role: None,
+            fork_turns: Some("none".to_string()),
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            config_overrides: Vec::new(),
+            completion_handler: None,
+        };
+        let child = create_tui_child_session_from_request(&runtime, &store, &request).unwrap();
+        store
+            .append_event(
+                &child.id,
+                "session.done",
+                serde_json::json!({ "output": "child finished" }),
+            )
+            .unwrap();
+
+        notify_tui_child_completion(&runtime, &state_dir, &child.id, &request, None);
+
+        let root_agent = runtime
+            .agents()
+            .thread(&AgentId::from_string(parent.id.clone()).unwrap())
+            .unwrap();
+        let pending = root_agent.mailbox().pending_items();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].author_agent_id.as_str(), child.id);
+        assert!(!pending[0].trigger_turn);
+        assert_eq!(
+            runtime
+                .agents()
+                .thread(&AgentId::from_string(child.id.clone()).unwrap())
+                .unwrap()
+                .snapshot()
+                .status,
+            browser_use_runtime::AgentThreadStatus::Completed
+        );
+    }
+
+    #[test]
+    fn tui_child_completion_runtime_failure_does_not_call_legacy_handler() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = Store::open(&state_dir).unwrap();
+        let parent = store.create_session(None, &cwd).unwrap();
+        let runtime = tui_runtime_handle(&state_dir).unwrap();
+        ensure_tui_agent_attached(
+            &runtime,
+            &store,
+            &parent.id,
+            browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        )
+        .unwrap();
+        let handler_called = Arc::new(Mutex::new(false));
+        let handler_called_for_callback = Arc::clone(&handler_called);
+        let request = ChildAgentRunRequest {
+            parent_session_id: parent.id.clone(),
+            child_session_id: "00000000beef".to_string(),
+            run_id: Some("run-3".to_string()),
+            message: "Handle the missing child task".to_string(),
+            input_items: None,
+            input_is_inter_agent_communication: false,
+            agent_path: Some("/root/missing_worker".to_string()),
+            nickname: None,
+            role: None,
+            fork_turns: Some("none".to_string()),
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            config_overrides: Vec::new(),
+            completion_handler: Some(ChildAgentCompletionHandler::new(move |_| {
+                *handler_called_for_callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                Ok(())
+            })),
+        };
+
+        notify_tui_child_completion(
+            &runtime,
+            &state_dir,
+            &request.child_session_id,
+            &request,
+            None,
+        );
+
+        assert!(
+            !*handler_called
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "runtime-launched TUI child completion must not fall back to the legacy store handler"
+        );
     }
 }

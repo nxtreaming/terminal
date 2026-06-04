@@ -8,11 +8,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -31,6 +31,9 @@ const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
 const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
+const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+const BROWSER_CONNECT_ATTACH_DEADLINE: Duration = Duration::from_secs(8);
+const BROWSER_CONNECT_CDP_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct BrowserCommandOutput {
@@ -193,6 +196,10 @@ struct BrowserSession {
     last_target_id: Option<String>,
     last_session_id: Option<String>,
     last_emitted_browser_payload: Option<Value>,
+    preferred_target_marker: Option<String>,
+    preferred_profile_id: Option<String>,
+    active_local_profile_id: Option<String>,
+    preferred_browser_context_id: Option<String>,
     logs: VecDeque<String>,
 }
 
@@ -217,13 +224,17 @@ impl Default for BrowserSession {
             last_target_id: None,
             last_session_id: None,
             last_emitted_browser_payload: None,
+            preferred_target_marker: None,
+            preferred_profile_id: None,
+            active_local_profile_id: None,
+            preferred_browser_context_id: None,
             logs: VecDeque::new(),
         }
     }
 }
 
-static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
-static BROWSER_SCRIPT_RUNS: OnceLock<Mutex<HashMap<String, BrowserScriptRun>>> = OnceLock::new();
+static BROWSER_SESSIONS: OnceLock<BrowserSessionRegistry> = OnceLock::new();
+static BROWSER_SCRIPT_RUNS: OnceLock<BrowserScriptRunRegistry> = OnceLock::new();
 static BROWSER_SCRIPT_OBSERVING: OnceLock<Mutex<HashMap<String, BrowserScriptObserveMarker>>> =
     OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -231,6 +242,7 @@ static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct BrowserScriptRun {
     id: String,
     session_id: String,
+    session_registry: BrowserSessionRegistry,
     child: Child,
     stdout_reader: Option<thread::JoinHandle<Vec<u8>>>,
     stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
@@ -245,6 +257,47 @@ struct BrowserScriptRun {
     last_output_at_ms: Option<u128>,
     timeout_seconds: u64,
     deadline: Instant,
+}
+
+#[derive(Clone, Default)]
+pub struct BrowserScriptRunRegistry {
+    runs: Arc<Mutex<HashMap<String, BrowserScriptRun>>>,
+}
+
+impl std::fmt::Debug for BrowserScriptRunRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserScriptRunRegistry")
+            .field("active_run_count", &self.active_run_count())
+            .finish()
+    }
+}
+
+impl BrowserScriptRunRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn global() -> Self {
+        browser_script_runs().clone()
+    }
+
+    pub fn active_run_count(&self) -> usize {
+        self.lock()
+            .expect("browser_script run registry poisoned")
+            .len()
+    }
+
+    pub fn active_run_count_for_session(&self, session_id: &str) -> usize {
+        self.lock()
+            .expect("browser_script run registry poisoned")
+            .values()
+            .filter(|run| run.session_id == session_id)
+            .count()
+    }
+
+    fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, HashMap<String, BrowserScriptRun>>> {
+        self.runs.lock()
+    }
 }
 
 #[derive(Clone)]
@@ -266,8 +319,124 @@ struct BrowserScriptDelta {
     consumed_bytes: u64,
 }
 
-fn browser_script_runs() -> &'static Mutex<HashMap<String, BrowserScriptRun>> {
-    BROWSER_SCRIPT_RUNS.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Clone, Default)]
+pub struct BrowserSessionRegistry {
+    sessions: Arc<Mutex<HashMap<String, BrowserSession>>>,
+    checked_out_statuses: Arc<Mutex<HashMap<String, Value>>>,
+    captures: Arc<Mutex<HashMap<String, SessionCaptureHandle>>>,
+}
+
+impl std::fmt::Debug for BrowserSessionRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserSessionRegistry")
+            .field("active_session_count", &self.active_session_count())
+            .field(
+                "checked_out_session_count",
+                &self.checked_out_session_count(),
+            )
+            .field("active_capture_count", &self.active_capture_count())
+            .finish()
+    }
+}
+
+impl BrowserSessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn global() -> Self {
+        browser_sessions().clone()
+    }
+
+    pub fn active_session_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .expect("browser session registry poisoned")
+            .len()
+    }
+
+    pub fn checked_out_session_count(&self) -> usize {
+        self.checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .len()
+    }
+
+    pub fn active_capture_count(&self) -> usize {
+        self.captures
+            .lock()
+            .expect("session capture registry poisoned")
+            .len()
+    }
+
+    pub fn contains_session(&self, session_id: &str) -> bool {
+        if self
+            .sessions
+            .lock()
+            .expect("browser session registry poisoned")
+            .contains_key(session_id)
+        {
+            return true;
+        }
+        self.checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .contains_key(session_id)
+    }
+
+    fn checked_out_status_json(&self, session_id: &str) -> Option<Value> {
+        let mut status = self
+            .checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .get(session_id)
+            .cloned()?;
+        if let Some(object) = status.as_object_mut() {
+            object.insert("busy".to_string(), Value::Bool(true));
+        }
+        Some(status)
+    }
+
+    fn checkout_session(&self, session_id: &str) -> Result<BrowserSession> {
+        let session = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("browser session registry poisoned");
+            sessions.remove(session_id).ok_or_else(|| {
+                anyhow!("browser is not connected or is busy; run `browser status --json`")
+            })?
+        };
+        self.checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .insert(session_id.to_string(), session.status_json());
+        Ok(session)
+    }
+
+    fn return_session(&self, session_id: &str, session: BrowserSession) {
+        self.sessions
+            .lock()
+            .expect("browser session registry poisoned")
+            .insert(session_id.to_string(), session);
+        self.checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .remove(session_id);
+    }
+}
+
+fn browser_sessions() -> &'static BrowserSessionRegistry {
+    BROWSER_SESSIONS.get_or_init(BrowserSessionRegistry::new)
+}
+
+#[cfg(test)]
+fn sessions() -> &'static Mutex<HashMap<String, BrowserSession>> {
+    &browser_sessions().sessions
+}
+
+fn browser_script_runs() -> &'static BrowserScriptRunRegistry {
+    BROWSER_SCRIPT_RUNS.get_or_init(BrowserScriptRunRegistry::new)
 }
 
 fn browser_script_observing() -> &'static Mutex<HashMap<String, BrowserScriptObserveMarker>> {
@@ -294,10 +463,17 @@ fn attach_browser_script_timing(run: &BrowserScriptRun, output: &mut BrowserScri
 }
 
 fn active_browser_script_runs_json(session_id: &str) -> Value {
+    active_browser_script_runs_json_with_registry(session_id, browser_script_runs())
+}
+
+fn active_browser_script_runs_json_with_registry(
+    session_id: &str,
+    registry: &BrowserScriptRunRegistry,
+) -> Value {
     let mut active = Vec::new();
     let mut seen = HashSet::new();
     {
-        let mut runs = browser_script_runs()
+        let mut runs = registry
             .lock()
             .expect("browser_script run registry poisoned");
         for run in runs.values_mut().filter(|run| run.session_id == session_id) {
@@ -404,6 +580,44 @@ pub fn run_browser_command_with_options(
     raw_cmd: &str,
     options: BrowserCommandOptions,
 ) -> Result<BrowserCommandOutput> {
+    run_browser_command_with_options_and_script_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        raw_cmd,
+        options,
+        browser_script_runs(),
+    )
+}
+
+pub fn run_browser_command_with_options_and_script_registry(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    raw_cmd: &str,
+    options: BrowserCommandOptions,
+    script_registry: &BrowserScriptRunRegistry,
+) -> Result<BrowserCommandOutput> {
+    run_browser_command_with_options_and_registries(
+        session_id,
+        cwd,
+        artifact_dir,
+        raw_cmd,
+        options,
+        script_registry,
+        browser_sessions(),
+    )
+}
+
+pub fn run_browser_command_with_options_and_registries(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    raw_cmd: &str,
+    options: BrowserCommandOptions,
+    script_registry: &BrowserScriptRunRegistry,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<BrowserCommandOutput> {
     let mut argv = shell_words(raw_cmd)?;
     if argv.first().is_some_and(|arg| arg == "browser") {
         argv.remove(0);
@@ -413,16 +627,21 @@ pub fn run_browser_command_with_options(
     }
 
     if argv.first().map(String::as_str) == Some("script") {
+        if session_registry
+            .checked_out_status_json(session_id)
+            .is_none()
         {
-            let mut sessions = sessions()
+            let mut sessions = session_registry
+                .sessions
                 .lock()
                 .expect("browser session registry poisoned");
             let session = sessions.entry(session_id.to_string()).or_default();
             session.session_id = Some(session_id.to_string());
             session.log(format!("browser {}", argv.join(" ")));
         }
-        let content = dispatch_script_runtime(session_id, &argv)?;
-        let mut sessions = sessions()
+        let content = dispatch_script_runtime(session_id, &argv, script_registry)?;
+        let mut sessions = session_registry
+            .sessions
             .lock()
             .expect("browser session registry poisoned");
         let events = sessions
@@ -432,7 +651,21 @@ pub fn run_browser_command_with_options(
         return Ok(BrowserCommandOutput { events, content });
     }
 
-    let mut sessions = sessions()
+    if let Some(content) = session_registry.checked_out_status_json(session_id) {
+        if argv.first().map(String::as_str) == Some("status") {
+            return Ok(BrowserCommandOutput {
+                events: Vec::new(),
+                content,
+            });
+        }
+        bail!(
+            "browser session is busy with an active browser_script; observe or cancel that script before running browser {}",
+            argv.join(" ")
+        );
+    }
+
+    let mut sessions = session_registry
+        .sessions
         .lock()
         .expect("browser session registry poisoned");
     let session = sessions.entry(session_id.to_string()).or_default();
@@ -444,6 +677,7 @@ pub fn run_browser_command_with_options(
         artifact_dir.as_ref(),
         &argv,
         &options,
+        script_registry,
     )?;
     let events = session.browser_events();
     let connected = session.connection.is_some();
@@ -451,7 +685,9 @@ pub fn run_browser_command_with_options(
     // Tool-agnostic recording: once the browser is connected (via any `browser`
     // command), start session-layer 2fps capture if it isn't already running.
     if connected {
-        start_session_capture(session_id, artifact_dir.as_ref());
+        start_session_capture_with_registry(session_id, artifact_dir.as_ref(), session_registry);
+    } else {
+        stop_session_capture_with_registry(session_id, session_registry);
     }
     Ok(BrowserCommandOutput { events, content })
 }
@@ -463,7 +699,32 @@ pub fn run_browser_script(
     code: &str,
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
-    let mut run = spawn_browser_script(session_id, cwd, artifact_dir, code, timeout_seconds)?;
+    run_browser_script_with_session_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        browser_sessions(),
+    )
+}
+
+pub fn run_browser_script_with_session_registry(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    code: &str,
+    timeout_seconds: u64,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<BrowserScriptOutput> {
+    let mut run = spawn_browser_script_with_session_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        session_registry,
+    )?;
     loop {
         if run.child.try_wait()?.is_some() {
             return finish_browser_script_run(run, false);
@@ -482,7 +743,52 @@ pub fn start_browser_script(
     code: &str,
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
-    let mut run = spawn_browser_script(session_id, cwd, artifact_dir, code, timeout_seconds)?;
+    start_browser_script_with_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        browser_script_runs(),
+    )
+}
+
+pub fn start_browser_script_with_registry(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    code: &str,
+    timeout_seconds: u64,
+    registry: &BrowserScriptRunRegistry,
+) -> Result<BrowserScriptOutput> {
+    start_browser_script_with_registries(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        registry,
+        browser_sessions(),
+    )
+}
+
+pub fn start_browser_script_with_registries(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    code: &str,
+    timeout_seconds: u64,
+    script_registry: &BrowserScriptRunRegistry,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<BrowserScriptOutput> {
+    let mut run = spawn_browser_script_with_session_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        session_registry,
+    )?;
     let initial_deadline = Instant::now() + Duration::from_millis(BROWSER_SCRIPT_INITIAL_WAIT_MS);
     loop {
         if run.child.try_wait()?.is_some() {
@@ -522,7 +828,7 @@ pub fn start_browser_script(
             };
             attach_inline_window_stitch(&mut run, &mut output);
             attach_browser_script_timing(&run, &mut output);
-            browser_script_runs()
+            script_registry
                 .lock()
                 .expect("browser_script run registry poisoned")
                 .insert(run_id, run);
@@ -537,14 +843,28 @@ pub fn observe_browser_script(
     run_id: &str,
     observe_timeout_ms: u64,
 ) -> Result<BrowserScriptOutput> {
-    let mut run = browser_script_runs()
+    observe_browser_script_with_registry(
+        session_id,
+        run_id,
+        observe_timeout_ms,
+        browser_script_runs(),
+    )
+}
+
+pub fn observe_browser_script_with_registry(
+    session_id: &str,
+    run_id: &str,
+    observe_timeout_ms: u64,
+    registry: &BrowserScriptRunRegistry,
+) -> Result<BrowserScriptOutput> {
+    let mut run = registry
         .lock()
         .expect("browser_script run registry poisoned")
         .remove(run_id)
         .ok_or_else(|| anyhow!("unknown browser_script run_id {run_id:?}"))?;
     if run.session_id != session_id {
         let owner = run.session_id.clone();
-        browser_script_runs()
+        registry
             .lock()
             .expect("browser_script run registry poisoned")
             .insert(run.id.clone(), run);
@@ -592,7 +912,7 @@ pub fn observe_browser_script(
             attach_inline_window_stitch(&mut run, &mut output);
             attach_browser_script_timing(&run, &mut output);
             let run_id = run.id.clone();
-            browser_script_runs()
+            registry
                 .lock()
                 .expect("browser_script run registry poisoned")
                 .insert(run_id.clone(), run);
@@ -607,7 +927,7 @@ pub fn observe_browser_script(
             attach_inline_window_stitch(&mut run, &mut output);
             attach_browser_script_timing(&run, &mut output);
             let run_id = run.id.clone();
-            browser_script_runs()
+            registry
                 .lock()
                 .expect("browser_script run registry poisoned")
                 .insert(run_id.clone(), run);
@@ -622,14 +942,22 @@ pub fn observe_browser_script(
 }
 
 pub fn cancel_browser_script(session_id: &str, run_id: &str) -> Result<BrowserScriptOutput> {
-    let mut run = browser_script_runs()
+    cancel_browser_script_with_registry(session_id, run_id, browser_script_runs())
+}
+
+pub fn cancel_browser_script_with_registry(
+    session_id: &str,
+    run_id: &str,
+    registry: &BrowserScriptRunRegistry,
+) -> Result<BrowserScriptOutput> {
+    let mut run = registry
         .lock()
         .expect("browser_script run registry poisoned")
         .remove(run_id)
         .ok_or_else(|| anyhow!("unknown browser_script run_id {run_id:?}"))?;
     if run.session_id != session_id {
         let owner = run.session_id.clone();
-        browser_script_runs()
+        registry
             .lock()
             .expect("browser_script run registry poisoned")
             .insert(run.id.clone(), run);
@@ -639,18 +967,19 @@ pub fn cancel_browser_script(session_id: &str, run_id: &str) -> Result<BrowserSc
     finish_cancelled_browser_script_run(run)
 }
 
-fn spawn_browser_script(
+fn spawn_browser_script_with_session_registry(
     session_id: &str,
     cwd: impl AsRef<Path>,
     artifact_dir: impl AsRef<Path>,
     code: &str,
     timeout_seconds: u64,
+    session_registry: &BrowserSessionRegistry,
 ) -> Result<BrowserScriptRun> {
     fs::create_dir_all(artifact_dir.as_ref())
         .with_context(|| format!("create artifact dir {}", artifact_dir.as_ref().display()))?;
     // Ensure session-layer capture is running (idempotent) so browser_script
     // runs are recorded by the same tool-agnostic capture as `browser`.
-    start_session_capture(session_id, artifact_dir.as_ref());
+    start_session_capture_with_registry(session_id, artifact_dir.as_ref(), session_registry);
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind browser_script bridge")?;
     let bridge_addr = listener.local_addr()?;
     listener
@@ -661,8 +990,15 @@ fn spawn_browser_script(
     let bridge_stop = stop.clone();
     let bridge_error_sink = bridge_errors.clone();
     let bridge_session_id = session_id.to_string();
+    let bridge_session_registry = session_registry.clone();
     let bridge = thread::spawn(move || {
-        run_bridge(listener, bridge_session_id, bridge_stop, bridge_error_sink)
+        run_bridge(
+            listener,
+            bridge_session_id,
+            bridge_stop,
+            bridge_error_sink,
+            bridge_session_registry,
+        )
     });
 
     let agent_workspace_dir = agent_workspace_dir_for(artifact_dir.as_ref());
@@ -697,6 +1033,7 @@ fn spawn_browser_script(
     Ok(BrowserScriptRun {
         id: run_id,
         session_id: session_id.to_string(),
+        session_registry: session_registry.clone(),
         child,
         stdout_reader,
         stderr_reader,
@@ -753,7 +1090,11 @@ fn finish_browser_script_run(
             status: Some("failed".to_string()),
             run_id: Some(run.id.clone()),
             text: std::mem::take(&mut delta.text),
-            diagnosis: Some(browser_script_failure_diagnosis(&run.session_id, &error)),
+            diagnosis: Some(browser_script_failure_diagnosis(
+                &run.session_id,
+                &error,
+                &run.session_registry,
+            )),
             error: Some(error),
             outputs: std::mem::take(&mut delta.outputs),
             summary: std::mem::take(&mut delta.summary),
@@ -787,7 +1128,11 @@ fn finish_browser_script_run(
             } else {
                 std::mem::take(&mut delta.text)
             },
-            diagnosis: Some(browser_script_failure_diagnosis(&run.session_id, &error)),
+            diagnosis: Some(browser_script_failure_diagnosis(
+                &run.session_id,
+                &error,
+                &run.session_registry,
+            )),
             error: Some(error),
             outputs: std::mem::take(&mut delta.outputs),
             summary: std::mem::take(&mut delta.summary),
@@ -850,7 +1195,11 @@ fn finish_browser_script_run(
             .error
             .as_deref()
             .unwrap_or("browser_script failed without an error message");
-        response.diagnosis = Some(browser_script_failure_diagnosis(&run.session_id, error));
+        response.diagnosis = Some(browser_script_failure_diagnosis(
+            &run.session_id,
+            error,
+            &run.session_registry,
+        ));
     }
     response.status = Some(if response.ok { "finished" } else { "failed" }.to_string());
     response.run_id = Some(run.id.clone());
@@ -902,8 +1251,12 @@ struct BrowserIssueState {
     next_step: Option<String>,
 }
 
-fn browser_script_failure_diagnosis(session_id: &str, error: &str) -> BrowserIssueDiagnosis {
-    let state = browser_issue_state_for_session(session_id);
+fn browser_script_failure_diagnosis(
+    session_id: &str,
+    error: &str,
+    session_registry: &BrowserSessionRegistry,
+) -> BrowserIssueDiagnosis {
+    let state = browser_issue_state_for_session(session_id, session_registry);
     browser_issue_diagnosis(
         classify_browser_script_failure(error),
         state.browser_connected,
@@ -912,8 +1265,11 @@ fn browser_script_failure_diagnosis(session_id: &str, error: &str) -> BrowserIss
     )
 }
 
-fn browser_issue_state_for_session(session_id: &str) -> BrowserIssueState {
-    let Ok(sessions) = sessions().lock() else {
+fn browser_issue_state_for_session(
+    session_id: &str,
+    session_registry: &BrowserSessionRegistry,
+) -> BrowserIssueState {
+    let Ok(sessions) = session_registry.sessions.lock() else {
         return BrowserIssueState::default();
     };
     let Some(session) = sessions.get(session_id) else {
@@ -1410,9 +1766,31 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn cleanup_session(session_id: &str) -> usize {
-    cancel_browser_script_runs_for_session(session_id);
+    cleanup_session_with_script_registry(session_id, browser_script_runs())
+}
+
+pub fn cleanup_session_with_script_registry(
+    session_id: &str,
+    script_registry: &BrowserScriptRunRegistry,
+) -> usize {
+    cleanup_session_with_registries(session_id, script_registry, browser_sessions())
+}
+
+pub fn cleanup_session_with_registries(
+    session_id: &str,
+    script_registry: &BrowserScriptRunRegistry,
+    session_registry: &BrowserSessionRegistry,
+) -> usize {
+    cancel_browser_script_runs_for_session(session_id, script_registry);
+    stop_session_capture_with_registry(session_id, session_registry);
+    session_registry
+        .checked_out_statuses
+        .lock()
+        .expect("browser checked-out session registry poisoned")
+        .remove(session_id);
     let session = {
-        let mut sessions = sessions()
+        let mut sessions = session_registry
+            .sessions
             .lock()
             .expect("browser session registry poisoned");
         sessions.remove(session_id)
@@ -1428,9 +1806,12 @@ pub fn cleanup_session(session_id: &str) -> usize {
     }
 }
 
-fn cancel_browser_script_runs_for_session(session_id: &str) {
+fn cancel_browser_script_runs_for_session(
+    session_id: &str,
+    script_registry: &BrowserScriptRunRegistry,
+) {
     let runs = {
-        let mut registry = browser_script_runs()
+        let mut registry = script_registry
             .lock()
             .expect("browser_script run registry poisoned");
         let run_ids = registry
@@ -1448,20 +1829,20 @@ fn cancel_browser_script_runs_for_session(session_id: &str) {
     }
 }
 
-fn sessions() -> &'static Mutex<HashMap<String, BrowserSession>> {
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn dispatch_browser_command(
     session: &mut BrowserSession,
     cwd: &Path,
     artifact_dir: &Path,
     argv: &[String],
     options: &BrowserCommandOptions,
+    script_registry: &BrowserScriptRunRegistry,
 ) -> Result<Value> {
     match argv.first().map(String::as_str).unwrap_or("help") {
         "help" | "--help" | "-h" => Ok(Value::String(browser_help().to_string())),
-        "status" => Ok(session.status_json()),
+        "status" => {
+            session.refresh_connection_health();
+            Ok(session.status_json())
+        }
         "doctor" => {
             let doctor = session.doctor(cwd)?;
             if has_flag(argv, "--json") {
@@ -1481,25 +1862,32 @@ fn dispatch_browser_command(
                 .session_id
                 .as_deref()
                 .ok_or_else(|| anyhow!("browser script runtime is missing session id"))?;
-            dispatch_script_runtime(session_id, argv)
+            dispatch_script_runtime(session_id, argv, script_registry)
         }
         "runtime" => dispatch_runtime(session, argv),
         other => bail!("unknown browser command: {other}. Run `browser help`."),
     }
 }
 
-fn dispatch_script_runtime(session_id: &str, argv: &[String]) -> Result<Value> {
+fn dispatch_script_runtime(
+    session_id: &str,
+    argv: &[String],
+    script_registry: &BrowserScriptRunRegistry,
+) -> Result<Value> {
     match argv.get(1).map(String::as_str) {
         Some("runs") => Ok(json!({
             "status": "ok",
-            "active_scripts": active_browser_script_runs_json(session_id),
+            "active_scripts": active_browser_script_runs_json_with_registry(
+                session_id,
+                script_registry,
+            ),
         })),
         Some("cancel") => {
             let run_id = argv
                 .get(2)
                 .map(String::as_str)
                 .ok_or_else(|| anyhow!("browser script cancel requires <run_id>"))?;
-            let output = cancel_browser_script(session_id, run_id)?;
+            let output = cancel_browser_script_with_registry(session_id, run_id, script_registry)?;
             Ok(json!({
                 "status": output.status.unwrap_or_else(|| "cancelled".to_string()),
                 "run_id": output.run_id,
@@ -1584,12 +1972,24 @@ fn dispatch_connect(session: &mut BrowserSession, argv: &[String]) -> Result<Val
 }
 
 fn dispatch_local(
-    _session: &mut BrowserSession,
+    session: &mut BrowserSession,
     argv: &[String],
     _artifact_dir: &Path,
 ) -> Result<Value> {
     match argv.get(1).map(String::as_str) {
         Some("list") => Ok(json!({ "candidates": local_candidates() })),
+        Some("open") => {
+            let profile_ref = option_value(argv, "--profile")
+                .or_else(|| {
+                    argv.get(2)
+                        .filter(|value| !value.starts_with("--"))
+                        .cloned()
+                })
+                .ok_or_else(|| anyhow!("browser local open requires --profile <profile-id>"))?;
+            let profiles = detect_local_profiles();
+            let profile = resolve_local_profile(&profiles, &profile_ref)?;
+            open_local_profile(session, &profile)
+        }
         Some("setup") => {
             // The agent decides how to open the URL
             let profile_ref = option_value(argv, "--profile");
@@ -1604,8 +2004,83 @@ fn dispatch_local(
         }
         Some("profiles") => dispatch_local_profiles(argv),
         Some(other) => bail!("unknown browser local command: {other}"),
-        None => bail!("browser local requires list, setup, or profiles"),
+        None => bail!("browser local requires list, open, setup, or profiles"),
     }
+}
+
+fn open_local_profile(
+    session: &mut BrowserSession,
+    profile: &LocalBrowserProfile,
+) -> Result<Value> {
+    let profile_directory_arg = format!("--profile-directory={}", profile.profile_dir);
+    let needs_marker = local_candidates()
+        .iter()
+        .any(|candidate| candidate.browser_running == Some(true));
+    let marker = needs_marker.then(|| {
+        format!(
+            "browser-use-profile-target-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default()
+        )
+    });
+    let target_url = marker.as_ref().map(|marker| {
+        format!("data:text/html,<title>Browser%20Use</title><meta%20name=browser-use-profile-target%20content={marker}>")
+    });
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new(&profile.browser_path);
+        command.arg(format!(
+            "--user-data-dir={}",
+            profile.user_data_dir.display()
+        ));
+        command.arg(&profile_directory_arg);
+        if let Some(target_url) = target_url.as_deref() {
+            command.arg(target_url);
+        } else {
+            command.arg("--no-startup-window");
+        }
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut command = {
+        let mut command = Command::new(&profile.browser_path);
+        command.arg(&profile_directory_arg);
+        if let Some(target_url) = target_url.as_deref() {
+            command.arg(target_url);
+        } else {
+            command.arg("--no-startup-window");
+        }
+        command
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "open {} with profile {}",
+                profile.browser_name, profile.profile_name
+            )
+        })?;
+    session.preferred_target_marker = marker.clone();
+    session.preferred_profile_id = Some(profile.id.clone());
+    let mut response = json!({
+        "status": "ok",
+        "opened": true,
+        "profile": profile,
+        "profile_targeting": if marker.is_some() { "marker" } else { "profile-launch" },
+        "next_step": "Give Chrome a moment to start, then run browser connect local.",
+    });
+    if let Some(marker) = marker {
+        response["target_marker"] = json!(marker);
+    }
+    if let Some(target_url) = target_url {
+        response["target_url"] = json!(target_url);
+    }
+    Ok(response)
 }
 
 fn local_setup_user_action_response(profile: Option<LocalBrowserProfile>) -> Value {
@@ -1938,6 +2413,8 @@ impl BrowserSession {
             "owner": self.owner.as_str(),
             "browser": self.browser_name,
             "profile": self.profile,
+            "local_profile_id": self.active_local_profile_id,
+            "profile_context_id": self.preferred_browser_context_id,
             "endpoint": self.endpoint.as_ref().map(|endpoint| json!({
                 "kind": endpoint.kind,
                 "http_url": endpoint.http_url,
@@ -1997,7 +2474,7 @@ impl BrowserSession {
             Some("browser connect local")
         } else if matches!(
             self.last_error_kind.as_deref(),
-            Some("browser-closed" | "stale-port")
+            Some("browser-closed" | "stale-port" | "browser-not-running")
         ) && self.mode == BrowserMode::Local
         {
             Some("Open Chrome with the selected profile, then run browser connect local")
@@ -2119,11 +2596,48 @@ impl BrowserSession {
             ws_url: candidate.ws_url.clone(),
             candidate_id: Some(candidate.id.clone()),
         };
-        if let Err(error) =
-            self.connect_endpoint(endpoint, BrowserMode::Local, BrowserOwner::External)
-        {
+        if self.can_reuse_local_endpoint(&endpoint) {
+            if self.preferred_target_marker.is_some() || self.preferred_profile_id.is_some() {
+                if let Err(error) = self.attach_first_page_with_deadline(
+                    Instant::now() + BROWSER_CONNECT_ATTACH_DEADLINE,
+                ) {
+                    let message = format!("{error:#}");
+                    let kind =
+                        self.normalize_local_connectivity_error(classify_browser_error(&message));
+                    self.last_error = Some(message.clone());
+                    self.last_error_kind = Some(kind.to_string());
+                    return Ok(json!({
+                        "status": "blocked",
+                        "state": kind,
+                        "reason": local_connect_error_reason(kind, &message),
+                        "candidate": candidate,
+                        "raw_error": message,
+                        "next_step": local_connect_next_step(kind),
+                    }));
+                }
+            }
+            self.endpoint = Some(endpoint);
+            self.browser_name = Some(candidate.browser_name.clone());
+            self.profile = Some(candidate.profile_path.display().to_string());
+            self.last_error = None;
+            self.last_error_kind = None;
+            self.close_remote_debugging_setup_targets();
+            return Ok(json!({
+                "status": "connected",
+                "candidate": candidate,
+                "browser": self.status_json(),
+                "reused_connection": true,
+            }));
+        }
+        if let Err(error) = self.connect_endpoint_with_attach_deadline(
+            endpoint,
+            BrowserMode::Local,
+            BrowserOwner::External,
+            Instant::now() + BROWSER_CONNECT_ATTACH_DEADLINE,
+        ) {
             let message = format!("{error:#}");
-            let kind = classify_browser_error(&message);
+            let kind = self.normalize_local_connectivity_error(classify_browser_error(&message));
+            self.clear_failed_connection_state();
             self.last_error = Some(message.clone());
             self.last_error_kind = Some(kind.to_string());
             return Ok(json!({
@@ -2137,6 +2651,7 @@ impl BrowserSession {
         }
         self.browser_name = Some(candidate.browser_name.clone());
         self.profile = Some(candidate.profile_path.display().to_string());
+        self.close_remote_debugging_setup_targets();
         Ok(json!({
             "status": "connected",
             "candidate": candidate,
@@ -2351,10 +2866,61 @@ impl BrowserSession {
         Ok(())
     }
 
+    fn connect_endpoint_with_attach_deadline(
+        &mut self,
+        endpoint: Endpoint,
+        mode: BrowserMode,
+        owner: BrowserOwner,
+        attach_deadline: Instant,
+    ) -> Result<()> {
+        let ws_url = endpoint.ws_url.clone();
+        let connection =
+            CdpDispatcher::connect_with_timeout(&ws_url, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?;
+        self.endpoint = Some(endpoint);
+        self.connection = Some(connection);
+        self.mode = mode;
+        self.owner = owner;
+        self.connection_generation += 1;
+        self.last_error = None;
+        self.last_error_kind = None;
+        self.last_target_id = None;
+        self.last_session_id = None;
+        if let Err(error) = self.attach_first_page_with_deadline(attach_deadline) {
+            self.clear_failed_connection_state();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn clear_failed_connection_state(&mut self) {
+        self.connection = None;
+        self.current_session_id = None;
+        self.current_target_id = None;
+        self.last_target_id = None;
+        self.last_session_id = None;
+        self.connection_generation += 1;
+    }
+
     fn reconnect_websocket(&mut self) -> Result<Value> {
         let Some(endpoint) = self.endpoint.clone() else {
             bail!("no browser endpoint is configured");
         };
+        if self.mode == BrowserMode::Local {
+            let probe = probe_endpoint(&endpoint);
+            if !probe.ok && matches!(probe.state, "browser-closed" | "websocket-dropped") {
+                self.connection = None;
+                self.last_target_id = self.current_target_id.take();
+                self.last_session_id = self.current_session_id.take();
+                let kind = self.normalize_local_connectivity_error(probe.state);
+                self.last_error = Some(probe.detail);
+                self.last_error_kind = Some(kind.to_string());
+                self.connection_generation += 1;
+                bail!(
+                    "local Chrome endpoint is not reachable; state: {kind}; next_step: {}",
+                    self.next_step().unwrap_or("browser connect local")
+                );
+            }
+        }
         self.connection = Some(CdpDispatcher::connect(&endpoint.ws_url)?);
         self.connection_generation += 1;
         if self.current_target_id.is_some() {
@@ -2368,6 +2934,92 @@ impl BrowserSession {
         }))
     }
 
+    fn refresh_connection_health(&mut self) {
+        if self.connection.is_none() || self.mode != BrowserMode::Local {
+            return;
+        }
+        let Some(endpoint) = self.endpoint.clone() else {
+            return;
+        };
+        let probe = probe_endpoint(&endpoint);
+        if probe.ok {
+            return;
+        }
+        let kind = self.normalize_local_connectivity_error(probe.state);
+        if !should_drop_browser_connection(kind) {
+            return;
+        }
+        self.connection = None;
+        self.last_target_id = self.current_target_id.take();
+        self.last_session_id = self.current_session_id.take();
+        self.last_error = Some(probe.detail);
+        self.last_error_kind = Some(kind.to_string());
+        self.connection_generation += 1;
+    }
+
+    fn can_reuse_local_endpoint(&mut self, endpoint: &Endpoint) -> bool {
+        if self.connection.is_none()
+            || self.mode != BrowserMode::Local
+            || self.owner != BrowserOwner::External
+        {
+            return false;
+        }
+        let Some(current_endpoint) = self.endpoint.as_ref() else {
+            return false;
+        };
+        if current_endpoint.ws_url != endpoint.ws_url {
+            return false;
+        }
+        let probe = probe_endpoint(endpoint);
+        if probe.ok {
+            return true;
+        }
+        let kind = self.normalize_local_connectivity_error(probe.state);
+        if should_drop_browser_connection(kind) {
+            self.connection = None;
+            self.last_target_id = self.current_target_id.take();
+            self.last_session_id = self.current_session_id.take();
+            self.last_error = Some(probe.detail);
+            self.last_error_kind = Some(kind.to_string());
+            self.connection_generation += 1;
+        }
+        false
+    }
+
+    fn normalize_local_connectivity_error(&self, kind: &'static str) -> &'static str {
+        if self.mode != BrowserMode::Local {
+            return kind;
+        }
+        if !matches!(
+            kind,
+            "permission-blocked"
+                | "cdp-disabled"
+                | "browser-closed"
+                | "websocket-dropped"
+                | "browser-not-running"
+                | "stale-port"
+        ) {
+            return kind;
+        }
+        let candidates = local_candidates();
+        if candidates.iter().any(|candidate| candidate.connectable) {
+            return kind;
+        }
+        if candidates
+            .iter()
+            .any(|candidate| candidate.state == "cdp-disabled")
+        {
+            return "cdp-disabled";
+        }
+        if candidates.iter().any(|candidate| candidate.stale) {
+            return "stale-port";
+        }
+        if candidates.is_empty() {
+            return "browser-not-running";
+        }
+        kind
+    }
+
     fn reattach_same_target(&mut self) -> Result<Value> {
         let target_id = self
             .current_target_id
@@ -2375,11 +3027,22 @@ impl BrowserSession {
             .ok_or_else(|| anyhow!("no previous target_id to reattach"))?;
         let targets = self.targets()?;
         if !targets.iter().any(|target| target["targetId"] == target_id) {
+            let debug = target_gone_debug(&target_id, &targets);
+            self.log(format!(
+                "browser target gone while reattaching {}; debug: {}",
+                target_id,
+                json!({
+                    "target_id": target_id,
+                    "available_target_count": targets.len(),
+                    "available_targets": targets,
+                })
+            ));
             return Ok(json!({
                 "status": "target-gone",
                 "target_id": target_id,
-                "available_targets": targets,
-                "next_step": "Use browser_script list_tabs()/switch_tab(...) or browser_script new_tab(...).",
+                "reason": "Previous browser tab target is gone.",
+                "next_step": "Select an existing tab or create a new tab, then continue from the last checkpoint.",
+                "debug": debug,
             }));
         }
         let session_id = self.attach_target(&target_id)?;
@@ -2594,11 +3257,29 @@ impl BrowserSession {
                             }
                         }
                         Ok(recovery) => {
-                            let failure = format!(
-                                "CDP {method} failed because the current session is stale and reattach did not recover it: {message}; reattach result: {recovery}"
-                            );
+                            self.log(format!(
+                                "CDP {method} stale-session recovery did not reattach; original_error: {message}; recovery: {recovery}"
+                            ));
+                            let failure = if recovery.get("status").and_then(Value::as_str)
+                                == Some("target-gone")
+                            {
+                                format!(
+                                    "CDP {method} failed because the previous browser tab target is gone."
+                                )
+                            } else {
+                                format!(
+                                    "CDP {method} failed because the current session is stale and reattach did not recover it."
+                                )
+                            };
                             self.last_error = Some(failure.clone());
-                            self.last_error_kind = Some("target-gone".to_string());
+                            self.last_error_kind = Some(
+                                recovery
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .filter(|status| *status == "target-gone")
+                                    .unwrap_or("session-gone")
+                                    .to_string(),
+                            );
                             bail!(failure);
                         }
                         Err(recovery_error) => {
@@ -2652,7 +3333,8 @@ impl BrowserSession {
                         }
                     }
                 }
-                let final_error_kind = classify_browser_error(&message);
+                let final_error_kind =
+                    self.normalize_local_connectivity_error(classify_browser_error(&message));
                 self.last_error = Some(message.clone());
                 self.last_error_kind = Some(final_error_kind.to_string());
                 if should_drop_browser_connection(final_error_kind) {
@@ -2666,12 +3348,73 @@ impl BrowserSession {
     }
 
     fn attach_first_page(&mut self) -> Result<()> {
-        let targets = self.targets()?;
-        let target_id = targets
-            .iter()
-            .find(|target| is_real_page_target(target))
-            .and_then(|target| target.get("targetId").and_then(Value::as_str))
-            .map(ToOwned::to_owned);
+        let preferred_marker = self.preferred_target_marker.clone();
+        let mut attached_profile_marker = false;
+        let mut attached_launched_profile = false;
+        let mut attached_browser_context_id = None;
+        let mut attached_profile_id = None;
+        let target_id = if let Some(marker) = preferred_marker.as_deref() {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut target_info = None;
+            while Instant::now() < deadline {
+                let targets = self.targets()?;
+                target_info = targets
+                    .into_iter()
+                    .find(|target| target_url_contains_marker(target, marker));
+                if target_info.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            match target_info {
+                Some(target_info) => {
+                    self.preferred_target_marker = None;
+                    attached_profile_marker = true;
+                    attached_profile_id = self.preferred_profile_id.take();
+                    attached_browser_context_id = target_info
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    target_info
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                }
+                None => {
+                    bail!(
+                        "selected Chrome profile target did not appear; refusing to attach to an arbitrary existing profile"
+                    );
+                }
+            }
+        } else {
+            let targets = self.targets()?;
+            let launched_profile_id = self.preferred_profile_id.take();
+            let target_info = if launched_profile_id.is_some() {
+                targets
+                    .iter()
+                    .find(|target| is_page_target(target) && !is_profile_marker_target(target))
+                    .cloned()
+            } else {
+                targets
+                    .iter()
+                    .find(|target| is_real_page_target(target))
+                    .cloned()
+            };
+            if launched_profile_id.is_some() {
+                attached_profile_id = launched_profile_id;
+                attached_browser_context_id = target_info
+                    .as_ref()
+                    .and_then(|target| target.get("browserContextId"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                attached_launched_profile = attached_profile_id.is_some();
+            }
+            target_info
+                .as_ref()
+                .and_then(|target| target.get("targetId"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        };
         let target_id = match target_id {
             Some(target_id) => target_id,
             None => self
@@ -2681,12 +3424,217 @@ impl BrowserSession {
                 .ok_or_else(|| anyhow!("Target.createTarget response missing targetId"))?
                 .to_string(),
         };
+        if attached_profile_id.is_some() && attached_browser_context_id.is_none() {
+            attached_browser_context_id = self
+                .targets()
+                .ok()
+                .and_then(|targets| {
+                    targets.into_iter().find(|target| {
+                        target.get("targetId").and_then(Value::as_str) == Some(target_id.as_str())
+                    })
+                })
+                .and_then(|target| {
+                    target
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+            attached_launched_profile = true;
+        }
         let session_id = self.attach_target(&target_id)?;
         self.current_target_id = Some(target_id);
         self.current_session_id = Some(session_id);
+        if attached_profile_marker || attached_launched_profile {
+            self.preferred_browser_context_id = attached_browser_context_id.clone();
+            self.active_local_profile_id = attached_profile_id;
+        } else {
+            self.clear_local_profile_context();
+        }
         let _ = self.cdp_current("Runtime.enable", json!({}));
         let _ = self.cdp_current("Page.enable", json!({}));
+        if attached_profile_marker {
+            let current_target = self.current_target_id.clone();
+            self.close_profile_marker_targets(
+                attached_browser_context_id.as_deref(),
+                current_target.as_deref(),
+            );
+        }
         Ok(())
+    }
+
+    fn attach_first_page_with_deadline(&mut self, deadline: Instant) -> Result<()> {
+        let preferred_marker = self.preferred_target_marker.clone();
+        let mut attached_profile_marker = false;
+        let mut attached_launched_profile = false;
+        let mut attached_browser_context_id = None;
+        let mut attached_profile_id = None;
+        let target_id = if let Some(marker) = preferred_marker.as_deref() {
+            let mut target_info = None;
+            while Instant::now() < deadline {
+                let targets = self.targets_with_deadline(deadline)?;
+                target_info = targets
+                    .into_iter()
+                    .find(|target| target_url_contains_marker(target, marker));
+                if target_info.is_some() {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                thread::sleep(remaining.min(Duration::from_millis(150)));
+            }
+            match target_info {
+                Some(target_info) => {
+                    self.preferred_target_marker = None;
+                    attached_profile_marker = true;
+                    attached_profile_id = self.preferred_profile_id.take();
+                    attached_browser_context_id = target_info
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    target_info
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                }
+                None => {
+                    bail!(
+                        "selected Chrome profile target did not appear; refusing to attach to an arbitrary existing profile"
+                    );
+                }
+            }
+        } else {
+            let targets = self.targets_with_deadline(deadline)?;
+            let launched_profile_id = self.preferred_profile_id.take();
+            let target_info = if launched_profile_id.is_some() {
+                targets
+                    .iter()
+                    .find(|target| is_page_target(target) && !is_profile_marker_target(target))
+                    .cloned()
+            } else {
+                targets
+                    .iter()
+                    .find(|target| is_real_page_target(target))
+                    .cloned()
+            };
+            if launched_profile_id.is_some() {
+                attached_profile_id = launched_profile_id;
+                attached_browser_context_id = target_info
+                    .as_ref()
+                    .and_then(|target| target.get("browserContextId"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                attached_launched_profile = attached_profile_id.is_some();
+            }
+            target_info
+                .as_ref()
+                .and_then(|target| target.get("targetId"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        };
+        let target_id = match target_id {
+            Some(target_id) => target_id,
+            None => self
+                .cdp_with_attach_deadline(
+                    "Target.createTarget",
+                    None,
+                    json!({ "url": "about:blank" }),
+                    deadline,
+                )?
+                .get("targetId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("Target.createTarget response missing targetId"))?
+                .to_string(),
+        };
+        if attached_profile_id.is_some() && attached_browser_context_id.is_none() {
+            attached_browser_context_id = self
+                .targets_with_deadline(deadline)
+                .ok()
+                .and_then(|targets| {
+                    targets.into_iter().find(|target| {
+                        target.get("targetId").and_then(Value::as_str) == Some(target_id.as_str())
+                    })
+                })
+                .and_then(|target| {
+                    target
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+            attached_launched_profile = true;
+        }
+        let session_id = self.attach_target_with_deadline(&target_id, deadline)?;
+        self.current_target_id = Some(target_id);
+        self.current_session_id = Some(session_id);
+        if attached_profile_marker || attached_launched_profile {
+            self.preferred_browser_context_id = attached_browser_context_id.clone();
+            self.active_local_profile_id = attached_profile_id;
+        } else {
+            self.clear_local_profile_context();
+        }
+        let _ = self.cdp_current_with_deadline("Runtime.enable", json!({}), deadline);
+        let _ = self.cdp_current_with_deadline("Page.enable", json!({}), deadline);
+        if attached_profile_marker {
+            let current_target = self.current_target_id.clone();
+            self.close_profile_marker_targets(
+                attached_browser_context_id.as_deref(),
+                current_target.as_deref(),
+            );
+        }
+        Ok(())
+    }
+
+    fn close_profile_marker_targets(
+        &mut self,
+        browser_context_id: Option<&str>,
+        keep_target_id: Option<&str>,
+    ) {
+        let Ok(targets) = self.targets() else {
+            return;
+        };
+        for target in targets {
+            if !is_profile_marker_target(&target) {
+                continue;
+            }
+            if browser_context_id.is_some()
+                && target.get("browserContextId").and_then(Value::as_str) != browser_context_id
+            {
+                continue;
+            }
+            let Some(target_id) = target.get("targetId").and_then(Value::as_str) else {
+                continue;
+            };
+            if Some(target_id) == keep_target_id {
+                continue;
+            }
+            let _ = self.cdp("Target.closeTarget", None, json!({ "targetId": target_id }));
+        }
+    }
+
+    fn close_remote_debugging_setup_targets(&mut self) {
+        let Ok(targets) = self.targets() else {
+            return;
+        };
+        let current_target_id = self.current_target_id.clone();
+        for target in targets {
+            if !is_remote_debugging_setup_target(&target) {
+                continue;
+            }
+            let Some(target_id) = target.get("targetId").and_then(Value::as_str) else {
+                continue;
+            };
+            if current_target_id.as_deref() == Some(target_id) {
+                continue;
+            }
+            let _ = self.cdp("Target.closeTarget", None, json!({ "targetId": target_id }));
+        }
+    }
+
+    fn clear_local_profile_context(&mut self) {
+        self.preferred_profile_id = None;
+        self.active_local_profile_id = None;
+        self.preferred_browser_context_id = None;
     }
 
     fn cdp_current(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -2696,8 +3644,46 @@ impl BrowserSession {
         self.cdp(method, Some(&session_id), params)
     }
 
+    fn cdp_with_attach_deadline(
+        &mut self,
+        method: &str,
+        session_id: Option<&str>,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value> {
+        let timeout = connect_attach_call_timeout(deadline)?;
+        let Some(connection) = self.connection.as_mut() else {
+            bail!(
+                "browser is not connected. Run `browser status --json` or `browser connect ...`."
+            );
+        };
+        connection.call_with_timeout(method, session_id, params, timeout)
+    }
+
+    fn cdp_current_with_deadline(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value> {
+        let session_id = self.current_session_id.clone().ok_or_else(|| {
+            anyhow!("no current browser session; run `browser recover reattach-same-target`")
+        })?;
+        self.cdp_with_attach_deadline(method, Some(&session_id), params, deadline)
+    }
+
     fn targets(&mut self) -> Result<Vec<Value>> {
         let result = self.cdp("Target.getTargets", None, json!({}))?;
+        Ok(result
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn targets_with_deadline(&mut self, deadline: Instant) -> Result<Vec<Value>> {
+        let result =
+            self.cdp_with_attach_deadline("Target.getTargets", None, json!({}), deadline)?;
         Ok(result
             .get("targetInfos")
             .and_then(Value::as_array)
@@ -2718,23 +3704,41 @@ impl BrowserSession {
             .ok_or_else(|| anyhow!("Target.attachToTarget response missing sessionId"))
     }
 
+    fn attach_target_with_deadline(
+        &mut self,
+        target_id: &str,
+        deadline: Instant,
+    ) -> Result<String> {
+        let result = self.cdp_with_attach_deadline(
+            "Target.attachToTarget",
+            None,
+            json!({ "targetId": target_id, "flatten": true }),
+            deadline,
+        )?;
+        result
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow!("Target.attachToTarget response missing sessionId"))
+    }
+
     fn current_page_probe_mut(&mut self) -> Result<Value> {
-        let title = self
-            .cdp_current(
-                "Runtime.evaluate",
-                json!({ "expression": "document.title", "returnByValue": true }),
-            )
-            .ok()
-            .and_then(|value| value.pointer("/result/value").cloned());
-        let url = self
-            .cdp_current(
-                "Runtime.evaluate",
-                json!({ "expression": "location.href", "returnByValue": true }),
-            )
-            .ok()
-            .and_then(|value| value.pointer("/result/value").cloned());
+        let current_target_id = self.current_target_id.clone();
+        let current_target = current_target_id.as_deref().and_then(|target_id| {
+            self.targets().ok().and_then(|targets| {
+                targets.into_iter().find(|target| {
+                    target.get("targetId").and_then(Value::as_str) == Some(target_id)
+                })
+            })
+        });
+        let title = current_target
+            .as_ref()
+            .and_then(|target| target.get("title").cloned());
+        let url = current_target
+            .as_ref()
+            .and_then(|target| target.get("url").cloned());
         Ok(json!({
-            "target_id": self.current_target_id,
+            "target_id": current_target_id,
             "session_id": self.current_session_id,
             "title": title,
             "url": url,
@@ -2876,6 +3880,32 @@ impl CdpDispatcher {
         let (mut socket, _) =
             connect(ws_url).with_context(|| format!("connect CDP websocket {ws_url}"))?;
         set_cdp_dispatcher_socket_timeouts(&mut socket);
+        Self::from_socket(socket)
+    }
+
+    fn connect_with_timeout(ws_url: &str, timeout: Duration) -> Result<Arc<Self>> {
+        if local_ws_socket_addr(ws_url)?.is_none() {
+            return Self::connect(ws_url);
+        }
+
+        let ws_url = ws_url.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let result = Self::connect(&ws_url);
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                bail!("browser connect timed out while opening CDP websocket")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("browser connect worker exited before opening CDP websocket")
+            }
+        }
+    }
+
+    fn from_socket(socket: WebSocket<MaybeTlsStream<TcpStream>>) -> Result<Arc<Self>> {
         let (tx, rx) = std::sync::mpsc::channel::<CdpDispatchCmd>();
         let reader = thread::spawn(move || cdp_dispatcher_loop(socket, rx));
         Ok(Arc::new(Self {
@@ -2886,6 +3916,16 @@ impl CdpDispatcher {
     }
 
     fn call(&self, method: &str, session_id: Option<&str>, params: Value) -> Result<Value> {
+        self.call_with_timeout(method, session_id, params, Duration::from_secs(30))
+    }
+
+    fn call_with_timeout(
+        &self,
+        method: &str,
+        session_id: Option<&str>,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut msg = json!({ "id": id, "method": method, "params": params });
         if let Some(session_id) = session_id {
@@ -2901,7 +3941,7 @@ impl CdpDispatcher {
                 resp: rtx,
             })
             .map_err(|_| anyhow!("CDP dispatcher is shut down"))?;
-        match rrx.recv_timeout(Duration::from_secs(30)) {
+        match rrx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let _ = self
@@ -2909,6 +3949,9 @@ impl CdpDispatcher {
                     .lock()
                     .expect("cdp tx lock poisoned")
                     .send(CdpDispatchCmd::Cancel { id });
+                if timeout < Duration::from_secs(30) {
+                    bail!("browser connect timed out while waiting for CDP {method}")
+                }
                 bail!("CDP {method} timed out")
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -3027,9 +4070,59 @@ fn set_cdp_socket_timeouts_for(
     }
 }
 
+fn connect_attach_call_timeout(deadline: Instant) -> Result<Duration> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| anyhow!("browser connect timed out while attaching to a page"))?;
+    Ok(remaining.min(BROWSER_CONNECT_CDP_CALL_TIMEOUT))
+}
+
+fn local_ws_socket_addr(ws_url: &str) -> Result<Option<SocketAddr>> {
+    let Some(rest) = ws_url.strip_prefix("ws://") else {
+        return Ok(None);
+    };
+    let authority = rest
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some((host, after_host)) = after_bracket.split_once(']') else {
+            return Ok(None);
+        };
+        let Some(port) = after_host.strip_prefix(':') else {
+            return Ok(None);
+        };
+        (host, port)
+    } else {
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return Ok(None);
+        };
+        (host, port)
+    };
+    let ip = if host.eq_ignore_ascii_case("localhost") {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        match host.parse::<IpAddr>() {
+            Ok(ip) if ip.is_loopback() => ip,
+            _ => return Ok(None),
+        }
+    };
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("parse local CDP websocket port from {ws_url}"))?;
+    Ok(Some(SocketAddr::new(ip, port)))
+}
+
 fn classify_browser_error(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("403 forbidden") || lower.contains("http error: 403") {
+        "permission-blocked"
+    } else if lower.contains("interrupted handshake")
+        && (lower.contains("wouldblock") || lower.contains("would block"))
+    {
         "permission-blocked"
     } else if lower.contains("target")
         && (lower.contains("not found")
@@ -3039,16 +4132,21 @@ fn classify_browser_error(message: &str) -> &'static str {
         "target-gone"
     } else if is_stale_session_error(message) {
         "session-gone"
-    } else if (lower.contains("resource temporarily unavailable")
+    } else if lower.contains("browser connect timed out") {
+        "browser-connect-timeout"
+    } else if ((lower.contains("resource temporarily unavailable")
         || lower.contains("would block")
         || lower.contains("timed out"))
-        && lower.contains("read cdp")
+        && lower.contains("read cdp"))
+        || (lower.contains("cdp ") && lower.contains(" timed out"))
     {
         "cdp-read-timeout"
     } else if is_cdp_command_error(message) {
         "cdp-command-error"
     } else if lower.contains("browser is not connected") {
         "browser-disconnected"
+    } else if lower.contains("selected chrome profile target did not appear") {
+        "profile-target-missing"
     } else if lower.contains("connection refused")
         || lower.contains("couldn't connect to server")
         || lower.contains("unable to connect")
@@ -3074,6 +4172,7 @@ fn classify_browser_script_failure(message: &str) -> &'static str {
         "cdp-command-error"
     } else if lower.contains("read cdp")
         || lower.contains("send cdp")
+        || (lower.contains("cdp ") && lower.contains(" timed out"))
         || lower.contains("cdp websocket")
         || lower.contains("browser is not connected")
         || lower.contains("connection refused")
@@ -3226,7 +4325,9 @@ fn browser_issue_diagnosis(
         "permission-blocked" => (
             "Chrome rejected browser control.",
             "The browser endpoint returned a permission or 403 error for CDP control.",
-            status_next_step.unwrap_or("Run browser local setup, then reconnect.").to_string(),
+            status_next_step
+                .unwrap_or("Ask the user to click Allow in Chrome's 'Allow remote debugging?' popup, then reconnect.")
+                .to_string(),
             false,
             false,
         ),
@@ -3253,6 +4354,13 @@ fn browser_issue_diagnosis(
             false,
             false,
         ),
+        "browser-connect-timeout" => (
+            "Browser connection did not become usable before the attach deadline.",
+            "Chrome exposed a local DevTools endpoint, but the runtime could not attach to a page quickly enough.",
+            "browser recover reconnect-websocket".to_string(),
+            false,
+            false,
+        ),
         _ => (
             if page_usable {
                 "The browser page may still be reusable, but the failure needs checking."
@@ -3276,7 +4384,10 @@ fn browser_issue_diagnosis(
 }
 
 fn should_drop_browser_connection(error_kind: &str) -> bool {
-    matches!(error_kind, "browser-closed" | "websocket-dropped")
+    matches!(
+        error_kind,
+        "browser-closed" | "websocket-dropped" | "stale-port" | "browser-not-running"
+    )
 }
 
 fn is_cdp_command_error(message: &str) -> bool {
@@ -3316,15 +4427,28 @@ fn local_connect_error_reason(kind: &str, raw_error: &str) -> String {
         "browser-closed" => {
             "Chrome is not currently exposing the selected local CDP endpoint. It may have been closed, restarted, or stopped its debug server.".to_string()
         }
+        "browser-connect-timeout" => {
+            "Chrome exposed a local CDP endpoint, but attaching to a page timed out before browser control was usable.".to_string()
+        }
         "target-gone" => "The previous browser tab target is gone.".to_string(),
+        "profile-target-missing" => {
+            "The selected Chrome profile window did not expose the expected tab target. Chrome may have ignored the requested profile because another profile window is already running.".to_string()
+        }
         _ => format!("Local browser CDP connection failed: {raw_error}"),
     }
 }
 
 fn local_connect_next_step(kind: &str) -> &'static str {
     match kind {
-        "permission-blocked" | "cdp-disabled" => "browser local setup",
+        "permission-blocked" => {
+            "Ask the user to click Allow in Chrome's 'Allow remote debugging?' popup, then run browser connect local"
+        }
+        "cdp-disabled" => "browser local setup",
         "browser-closed" => "Open Chrome with the selected profile, then run browser connect local",
+        "browser-connect-timeout" => "browser recover reconnect-websocket",
+        "profile-target-missing" => {
+            "Close other Chrome profile windows or manually open the selected Chrome profile, then run browser connect local again"
+        }
         "target-gone" => "Use browser_script list_tabs()/switch_tab(...) or open a new tab",
         _ => "browser doctor --json",
     }
@@ -4897,11 +6021,12 @@ fn run_bridge(
     session_id: String,
     stop: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<String>>>,
+    session_registry: BrowserSessionRegistry,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Err(error) = handle_bridge_stream(stream, &session_id) {
+                if let Err(error) = handle_bridge_stream(stream, &session_id, &session_registry) {
                     errors
                         .lock()
                         .expect("browser_script bridge error registry poisoned")
@@ -4924,7 +6049,11 @@ fn run_bridge(
     }
 }
 
-fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
+fn handle_bridge_stream(
+    mut stream: TcpStream,
+    session_id: &str,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<()> {
     // The listener is nonblocking so the bridge thread can poll the stop flag.
     // On macOS, accepted streams can still surface EWOULDBLOCK on large writes
     // unless the child socket is forced back to blocking mode. Screenshots are
@@ -4938,7 +6067,7 @@ fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let request: Value = serde_json::from_str(&line)?;
-    let response = match bridge_request(session_id, &request) {
+    let response = match bridge_request(session_id, &request, session_registry) {
         Ok(value) => json!({ "ok": true, "result": value }),
         Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
     };
@@ -4949,7 +6078,11 @@ fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn bridge_request(session_id: &str, request: &Value) -> Result<Value> {
+fn bridge_request(
+    session_id: &str,
+    request: &Value,
+    session_registry: &BrowserSessionRegistry,
+) -> Result<Value> {
     #[cfg(test)]
     {
         let kind = request.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -4962,20 +6095,10 @@ fn bridge_request(session_id: &str, request: &Value) -> Result<Value> {
         }
     }
 
-    let mut session = {
-        let mut sessions = sessions()
-            .lock()
-            .expect("browser session registry poisoned");
-        sessions.remove(session_id).ok_or_else(|| {
-            anyhow!("browser is not connected or is busy; run `browser status --json`")
-        })?
-    };
+    let mut session = session_registry.checkout_session(session_id)?;
     session.session_id = Some(session_id.to_string());
     let result = bridge_request_with_session(&mut session, request);
-    sessions()
-        .lock()
-        .expect("browser session registry poisoned")
-        .insert(session_id.to_string(), session);
+    session_registry.return_session(session_id, session);
     result
 }
 
@@ -5274,7 +6397,26 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                 .get("method")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("bridge cdp request missing method"))?;
-            let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+            let mut params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+            if let Some(browser_context_id) = session.preferred_browser_context_id.clone() {
+                if method == "Target.createTarget" {
+                    match params.get("browserContextId").and_then(Value::as_str) {
+                        Some(requested) if requested != browser_context_id => {
+                            bail!(
+                                "refusing to create a target in a different Chrome profile context"
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            params["browserContextId"] = Value::String(browser_context_id);
+                        }
+                    }
+                } else if method == "Target.attachToTarget" {
+                    if let Some(target_id) = params.get("targetId").and_then(Value::as_str) {
+                        ensure_target_browser_context(session, target_id, &browser_context_id)?;
+                    }
+                }
+            }
             let session_id = request.get("session_id").and_then(Value::as_str);
             let use_browser_session = session_id.is_none() && !method.starts_with("Target.");
             let current_session = session.current_session_id.clone();
@@ -5302,6 +6444,9 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                         .and_then(Value::as_str)
                         .ok_or_else(|| anyhow!("set_session requires target_id"))?
                         .to_string();
+                    if let Some(browser_context_id) = session.preferred_browser_context_id.clone() {
+                        ensure_target_browser_context(session, &target_id, &browser_context_id)?;
+                    }
                     session.current_session_id = Some(session_id.clone());
                     session.current_target_id = Some(target_id.clone());
                     session.connection_generation += 1;
@@ -6424,10 +7569,6 @@ fn inline_frames_enabled() -> bool {
 struct SessionCaptureHandle {
     stop: Arc<AtomicBool>,
 }
-static SESSION_CAPTURE: OnceLock<Mutex<HashMap<String, SessionCaptureHandle>>> = OnceLock::new();
-fn session_capture_registry() -> &'static Mutex<HashMap<String, SessionCaptureHandle>> {
-    SESSION_CAPTURE.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 fn session_capture_fps() -> f64 {
     std::env::var("LLM_BROWSER_CAPTURE_FPS")
@@ -6442,11 +7583,16 @@ fn session_capture_quality() -> i64 {
         .unwrap_or(60)
 }
 
-fn start_session_capture(session_id: &str, artifact_dir: &Path) {
+fn start_session_capture_with_registry(
+    session_id: &str,
+    artifact_dir: &Path,
+    session_registry: &BrowserSessionRegistry,
+) {
     if session_capture_fps() <= 0.0 {
         return;
     }
-    let mut reg = session_capture_registry()
+    let mut reg = session_registry
+        .captures
         .lock()
         .expect("session capture registry poisoned");
     if reg.contains_key(session_id) {
@@ -6462,11 +7608,17 @@ fn start_session_capture(session_id: &str, artifact_dir: &Path) {
         SessionCaptureHandle { stop: stop.clone() },
     );
     let sid = session_id.to_string();
-    thread::spawn(move || session_capture_loop(sid, frames_dir, stop));
+    let capture_registry = session_registry.clone();
+    thread::spawn(move || session_capture_loop(sid, frames_dir, stop, capture_registry));
 }
 
 fn stop_session_capture(session_id: &str) {
-    if let Some(handle) = session_capture_registry()
+    stop_session_capture_with_registry(session_id, browser_sessions());
+}
+
+fn stop_session_capture_with_registry(session_id: &str, session_registry: &BrowserSessionRegistry) {
+    if let Some(handle) = session_registry
+        .captures
         .lock()
         .expect("session capture registry poisoned")
         .remove(session_id)
@@ -6477,8 +7629,11 @@ fn stop_session_capture(session_id: &str) {
 
 // Brief lock to read (ws_url, current_target_id) from the shared session. No
 // round-trip under the lock — just clones two strings.
-fn session_capture_dispatcher(session_id: &str) -> Option<(Arc<CdpDispatcher>, String)> {
-    let sessions = sessions().lock().ok()?;
+fn session_capture_dispatcher(
+    session_id: &str,
+    session_registry: &BrowserSessionRegistry,
+) -> Option<(Arc<CdpDispatcher>, String)> {
+    let sessions = session_registry.sessions.lock().ok()?;
     let session = sessions.get(session_id)?;
     let dispatcher = session.connection.clone()?;
     let target = session.current_target_id.clone()?;
@@ -6496,7 +7651,12 @@ fn write_capture_manifest(path: &Path, records: &[Value]) {
     let _ = fs::write(path, text);
 }
 
-fn session_capture_loop(session_id: String, frames_dir: PathBuf, stop: Arc<AtomicBool>) {
+fn session_capture_loop(
+    session_id: String,
+    frames_dir: PathBuf,
+    stop: Arc<AtomicBool>,
+    session_registry: BrowserSessionRegistry,
+) {
     let interval = Duration::from_secs_f64(1.0 / session_capture_fps().max(0.1));
     let quality = session_capture_quality();
     let manifest = frames_dir.join("frames.ndjson");
@@ -6509,7 +7669,7 @@ fn session_capture_loop(session_id: String, frames_dir: PathBuf, stop: Arc<Atomi
 
     while !stop.load(Ordering::SeqCst) {
         let tick = Instant::now();
-        match session_capture_dispatcher(&session_id) {
+        match session_capture_dispatcher(&session_id, &session_registry) {
             None => {
                 idle_ticks += 1;
                 if idle_ticks > 20 {
@@ -6598,7 +7758,8 @@ fn session_capture_loop(session_id: String, frames_dir: PathBuf, stop: Arc<Atomi
         }
     }
     // Remove our registry entry so a later reconnect can restart capture.
-    session_capture_registry()
+    session_registry
+        .captures
         .lock()
         .expect("session capture registry poisoned")
         .remove(&session_id);
@@ -6646,15 +7807,110 @@ fn attach_inline_window_stitch(run: &mut BrowserScriptRun, output: &mut BrowserS
 }
 
 fn is_real_page_target(target: &Value) -> bool {
-    if target.get("type").and_then(Value::as_str) != Some("page") {
+    if !is_page_target(target) {
+        return false;
+    }
+    if is_profile_marker_target(target) {
         return false;
     }
     let url = target.get("url").and_then(Value::as_str).unwrap_or("");
-    !matches!(url, "" | "about:blank")
-        || target
-            .get("title")
+    if url.trim().is_empty() || is_internal_browser_url(url) {
+        return false;
+    }
+    true
+}
+
+fn is_internal_browser_url(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    url == "about:blank"
+        || url.starts_with("about:")
+        || url.starts_with("chrome:")
+        || url.starts_with("chrome-untrusted:")
+        || url.starts_with("chrome-extension:")
+        || url.starts_with("devtools:")
+        || url.starts_with("edge:")
+        || url.starts_with("brave:")
+        || url.starts_with("vivaldi:")
+}
+
+fn target_gone_debug(target_id: &str, targets: &[Value]) -> Value {
+    let page_targets: Vec<Value> = targets
+        .iter()
+        .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
+        .take(8)
+        .map(cdp_target_summary)
+        .collect();
+    json!({
+        "target_id": target_id,
+        "available_target_count": targets.len(),
+        "available_page_targets": page_targets,
+        "available_page_target_count": targets
+            .iter()
+            .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
+            .count(),
+        "note": "Full raw target list is available in `browser runtime logs`.",
+    })
+}
+
+fn cdp_target_summary(target: &Value) -> Value {
+    json!({
+        "target_id": target.get("targetId").and_then(Value::as_str),
+        "type": target.get("type").and_then(Value::as_str),
+        "title": target.get("title").and_then(Value::as_str),
+        "url": target.get("url").and_then(Value::as_str),
+    })
+}
+
+fn is_page_target(target: &Value) -> bool {
+    target.get("type").and_then(Value::as_str) == Some("page")
+}
+
+fn target_url_contains_marker(target: &Value, marker: &str) -> bool {
+    is_profile_marker_target(target)
+        && target
+            .get("url")
             .and_then(Value::as_str)
-            .is_some_and(|title| !title.trim().is_empty())
+            .is_some_and(|url| url.contains(marker))
+}
+
+fn is_profile_marker_target(target: &Value) -> bool {
+    target.get("type").and_then(Value::as_str) == Some("page")
+        && target
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.contains("browser-use-profile-target"))
+}
+
+fn is_remote_debugging_setup_target(target: &Value) -> bool {
+    target.get("type").and_then(Value::as_str) == Some("page")
+        && target
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.starts_with("chrome://inspect/#remote-debugging"))
+}
+
+fn ensure_target_browser_context(
+    session: &mut BrowserSession,
+    target_id: &str,
+    expected_browser_context_id: &str,
+) -> Result<()> {
+    let targets = session.targets()?;
+    let Some(target) = targets.iter().find(|target| {
+        target
+            .get("targetId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id == target_id)
+    }) else {
+        bail!("target {target_id} no longer exists");
+    };
+    let Some(actual_browser_context_id) = target.get("browserContextId").and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    if actual_browser_context_id != expected_browser_context_id {
+        bail!("refusing to switch to a target from a different Chrome profile context");
+    }
+    Ok(())
 }
 
 fn browser_help() -> &'static str {
@@ -7123,6 +8379,97 @@ mod tests {
     }
 
     #[test]
+    fn real_page_target_rejects_browser_internal_urls() {
+        for url in [
+            "",
+            "about:blank",
+            "chrome://newtab/",
+            "chrome-untrusted://new-tab-page/",
+            "chrome-extension://extension-id/page.html",
+            "devtools://devtools/bundled/inspector.html",
+            "edge://newtab/",
+            "brave://newtab/",
+            "vivaldi://newtab/",
+        ] {
+            assert!(
+                !is_real_page_target(&json!({
+                    "type": "page",
+                    "url": url,
+                    "title": "Has a title",
+                })),
+                "{url} should not be treated as a real page"
+            );
+        }
+
+        assert!(is_real_page_target(&json!({
+            "type": "page",
+            "url": "https://dashboard.brex.com/account-management/home",
+            "title": "Brex",
+        })));
+    }
+
+    #[test]
+    fn target_gone_debug_is_capped_and_omits_raw_targets() {
+        let targets: Vec<Value> = (0..12)
+            .map(|idx| {
+                json!({
+                    "type": "page",
+                    "targetId": format!("page-{idx}"),
+                    "title": format!("Page {idx}"),
+                    "url": format!("https://example.test/{idx}"),
+                    "large_debug_blob": "x".repeat(1024),
+                })
+            })
+            .chain((0..3).map(|idx| {
+                json!({
+                    "type": "service_worker",
+                    "targetId": format!("worker-{idx}"),
+                    "title": format!("Worker {idx}"),
+                    "url": format!("chrome-extension://example/{idx}"),
+                    "large_debug_blob": "x".repeat(1024),
+                })
+            }))
+            .collect();
+        let debug = target_gone_debug("missing-target", &targets);
+
+        assert_eq!(debug["available_target_count"], 15);
+        assert_eq!(debug["available_page_target_count"], 12);
+        assert_eq!(debug["available_page_targets"].as_array().unwrap().len(), 8);
+        assert!(debug.get("available_targets").is_none(), "{debug}");
+        assert!(!debug.to_string().contains("large_debug_blob"), "{debug}");
+    }
+
+    #[test]
+    fn clearing_local_profile_context_drops_stale_profile_lock() {
+        let mut session = BrowserSession::default();
+        session.preferred_profile_id = Some("google-chrome:Default".to_string());
+        session.active_local_profile_id = Some("google-chrome:Default".to_string());
+        session.preferred_browser_context_id = Some("context-1".to_string());
+
+        session.clear_local_profile_context();
+
+        assert_eq!(session.preferred_profile_id, None);
+        assert_eq!(session.active_local_profile_id, None);
+        assert_eq!(session.preferred_browser_context_id, None);
+    }
+
+    #[test]
+    fn remote_debugging_setup_target_matches_inspect_page_only() {
+        assert!(is_remote_debugging_setup_target(&json!({
+            "type": "page",
+            "url": "chrome://inspect/#remote-debugging",
+        })));
+        assert!(!is_remote_debugging_setup_target(&json!({
+            "type": "page",
+            "url": "chrome://inspect/#devices",
+        })));
+        assert!(!is_remote_debugging_setup_target(&json!({
+            "type": "page",
+            "url": "https://example.com",
+        })));
+    }
+
+    #[test]
     fn disconnected_external_local_chrome_requires_explicit_reconnect() {
         let mut session = BrowserSession::default();
         session.mode = BrowserMode::Local;
@@ -7169,6 +8516,55 @@ mod tests {
         assert!(!should_drop_browser_connection(classify_browser_error(
             message
         )));
+
+        let plain_timeout = "CDP Runtime.evaluate timed out";
+        assert_eq!(classify_browser_error(plain_timeout), "cdp-read-timeout");
+        assert!(!should_drop_browser_connection(classify_browser_error(
+            plain_timeout
+        )));
+    }
+
+    #[test]
+    fn connect_attach_timeouts_are_classified_for_recovery() {
+        let message = "browser connect timed out while waiting for CDP Target.attachToTarget";
+        assert_eq!(classify_browser_error(message), "browser-connect-timeout");
+        assert_eq!(
+            local_connect_next_step("browser-connect-timeout"),
+            "browser recover reconnect-websocket"
+        );
+    }
+
+    #[test]
+    fn local_permission_handshake_wait_is_not_websocket_drop() {
+        let message = "connect CDP websocket ws://127.0.0.1:9222/devtools/browser/abc: Interrupted handshake (WouldBlock)";
+        assert_eq!(classify_browser_error(message), "permission-blocked");
+        assert!(local_connect_next_step("permission-blocked").contains("Allow remote debugging"));
+    }
+
+    #[test]
+    fn local_ws_socket_addr_only_accepts_loopback_ws_urls() {
+        assert_eq!(
+            local_ws_socket_addr("ws://127.0.0.1:9222/devtools/browser/abc")
+                .unwrap()
+                .unwrap(),
+            "127.0.0.1:9222".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            local_ws_socket_addr("ws://[::1]:9223/devtools/browser/abc")
+                .unwrap()
+                .unwrap(),
+            "[::1]:9223".parse::<SocketAddr>().unwrap()
+        );
+        assert!(
+            local_ws_socket_addr("wss://example.com/devtools/browser/abc")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            local_ws_socket_addr("ws://example.com:9222/devtools/browser/abc")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -7232,6 +8628,15 @@ mod tests {
     }
 
     #[test]
+    fn runtime_evaluate_script_timeouts_keep_browser_connection() {
+        let message = "RuntimeError: CDP Runtime.evaluate timed out";
+        assert_eq!(classify_browser_script_failure(message), "cdp-read-timeout");
+        assert!(!should_drop_browser_connection(
+            classify_browser_script_failure(message)
+        ));
+    }
+
+    #[test]
     fn terminal_websocket_errors_still_drop_browser_connection() {
         assert!(should_drop_browser_connection(classify_browser_error(
             "read CDP Target.getTargets: IO error: Connection reset by peer"
@@ -7292,6 +8697,79 @@ mod tests {
             })),
             "browser.reconnected"
         );
+    }
+
+    #[test]
+    fn browser_status_uses_checked_out_session_snapshot_instead_of_defaulting() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = BrowserSessionRegistry::new();
+        let script_registry = BrowserScriptRunRegistry::new();
+        let session_id = "checked-out-status";
+        {
+            let mut session = BrowserSession {
+                session_id: Some(session_id.to_string()),
+                mode: BrowserMode::Local,
+                owner: BrowserOwner::External,
+                endpoint: Some(Endpoint {
+                    kind: "devtools-active-port".to_string(),
+                    http_url: Some("http://127.0.0.1:9222".to_string()),
+                    ws_url: "ws://127.0.0.1:9222/devtools/browser/example".to_string(),
+                    candidate_id: Some("local-1".to_string()),
+                }),
+                browser_name: Some("Google Chrome".to_string()),
+                profile: Some("/tmp/chrome-profile".to_string()),
+                current_target_id: Some("target-1".to_string()),
+                current_session_id: Some("session-1".to_string()),
+                ..Default::default()
+            };
+            session.log("browser connect local");
+            registry
+                .sessions
+                .lock()
+                .expect("browser session registry poisoned")
+                .insert(session_id.to_string(), session);
+        }
+
+        let session = registry
+            .checkout_session(session_id)
+            .expect("checkout browser session");
+        assert_eq!(registry.active_session_count(), 0);
+        assert_eq!(registry.checked_out_session_count(), 1);
+        assert!(registry.contains_session(session_id));
+
+        let status = run_browser_command_with_options_and_registries(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "browser status --json",
+            BrowserCommandOptions::default(),
+            &script_registry,
+            &registry,
+        )
+        .expect("status while checked out");
+        assert_eq!(status.content["mode"], "local");
+        assert_eq!(status.content["busy"], true);
+        assert_eq!(status.content["browser"], "Google Chrome");
+        assert_eq!(status.content["page"]["target_id"], "target-1");
+
+        let error = run_browser_command_with_options_and_registries(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "browser connect local",
+            BrowserCommandOptions::default(),
+            &script_registry,
+            &registry,
+        )
+        .expect_err("non-status commands should not create a default session while busy");
+        assert!(
+            error.to_string().contains("browser session is busy"),
+            "{error:#}"
+        );
+
+        registry.return_session(session_id, session);
+        assert_eq!(registry.checked_out_session_count(), 0);
+        assert_eq!(registry.active_session_count(), 1);
     }
 
     #[test]
@@ -7606,6 +9084,136 @@ print("navigation helpers do not auto wait")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("navigation helpers do not auto wait"));
+    }
+
+    #[test]
+    fn browser_script_new_tab_preserves_current_browser_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-new-tab-browser-context",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+
+def cdp(method, session_id=None, **params):
+    calls.append((method, params))
+    if method == "Target.getTargets":
+        return {"targetInfos": [{
+            "targetId": "current-target",
+            "type": "page",
+            "url": "data:text/html,<title>marker</title>",
+            "browserContextId": "ctx-selected-profile",
+        }]}
+    if method == "Target.createTarget":
+        assert params.get("browserContextId") == "ctx-selected-profile", calls
+        return {"targetId": "new-target"}
+    if method == "Target.activateTarget":
+        return {}
+    if method == "Target.attachToTarget":
+        return {"sessionId": "session-new"}
+    raise AssertionError((method, params))
+
+def _send_meta(meta, **params):
+    if meta == "current_tab":
+        return {"targetId": "current-target", "sessionId": "session-current", "url": "data:text/html,<title>marker</title>"}
+    assert meta == "set_session", (meta, params)
+    return {"ok": True}
+
+new_tab()
+print("new_tab preserved browser context")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("new_tab preserved browser context"));
+    }
+
+    #[test]
+    fn browser_script_list_tabs_filters_to_current_browser_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-list-tabs-browser-context",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+def cdp(method, session_id=None, **params):
+    if method == "Target.getTargets":
+        return {"targetInfos": [
+            {
+                "targetId": "selected-target",
+                "type": "page",
+                "title": "Selected",
+                "url": "https://selected.example",
+                "browserContextId": "ctx-selected-profile",
+            },
+            {
+                "targetId": "other-target",
+                "type": "page",
+                "title": "Other",
+                "url": "https://other.example",
+                "browserContextId": "ctx-other-profile",
+            },
+        ]}
+    raise AssertionError((method, params))
+
+def _send_meta(meta, **params):
+    assert meta == "current_tab", (meta, params)
+    return {"targetId": "selected-target", "sessionId": "session-current", "url": "https://selected.example"}
+
+tabs = list_tabs()
+assert [tab["targetId"] for tab in tabs] == ["selected-target"], tabs
+all_tabs = list_tabs(include_other_contexts=True)
+assert {tab["targetId"] for tab in all_tabs} == {"selected-target", "other-target"}, all_tabs
+print("list_tabs filters to current browser context")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("list_tabs filters to current browser context"));
+    }
+
+    #[test]
+    fn browser_script_current_tab_tolerates_target_list_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-current-tab-target-list-error",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+def cdp(method, session_id=None, **params):
+    if method == "Target.getTargets":
+        raise RuntimeError("target list unavailable")
+    raise AssertionError((method, params))
+
+def _send_meta(meta, **params):
+    assert meta == "current_tab", (meta, params)
+    return {
+        "targetId": "target-1",
+        "sessionId": "session-1",
+        "url": "https://example.test",
+        "title": "Example",
+    }
+
+tab = current_tab()
+assert tab["targetId"] == "target-1", tab
+assert "browserContextId" not in tab, tab
+print("current_tab tolerates target list errors")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("current_tab tolerates target list errors"));
     }
 
     #[test]
@@ -8204,6 +9812,50 @@ print("http_get parity ok")
             "internal stream file leaked as artifact: {:?}",
             finished.artifacts
         );
+    }
+
+    #[test]
+    fn browser_script_private_registry_isolates_background_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "script-private-registry";
+        let registry = BrowserScriptRunRegistry::new();
+        let started = start_browser_script_with_registry(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import time\nprint('private chunk')\ntime.sleep(1.2)\nprint('private done')",
+            5,
+            &registry,
+        )
+        .unwrap();
+
+        assert_eq!(started.status.as_deref(), Some("running"));
+        assert_eq!(registry.active_run_count_for_session(session_id), 1);
+        assert_eq!(
+            BrowserScriptRunRegistry::global().active_run_count_for_session(session_id),
+            0,
+            "private browser_script runs must not be inserted into the legacy global registry"
+        );
+        let run_id = started.run_id.as_deref().unwrap();
+        let global_err = observe_browser_script(session_id, run_id, 50)
+            .expect_err("global registry must not see private run");
+        assert!(
+            global_err
+                .to_string()
+                .contains("unknown browser_script run_id"),
+            "unexpected global observe error: {global_err}"
+        );
+
+        let mut finished =
+            observe_browser_script_with_registry(session_id, run_id, 2_500, &registry).unwrap();
+        if finished.status.as_deref() == Some("running") {
+            finished =
+                observe_browser_script_with_registry(session_id, run_id, 2_500, &registry).unwrap();
+        }
+        assert!(finished.ok);
+        assert_eq!(finished.status.as_deref(), Some("finished"));
+        assert!(finished.text.contains("private done"));
+        assert_eq!(registry.active_run_count_for_session(session_id), 0);
     }
 
     #[test]
@@ -9091,5 +10743,48 @@ info = page_info()
 
         cleanup_session(remote_session);
         cleanup_session(source_session);
+    }
+
+    #[test]
+    #[ignore = "requires an existing local Chrome with remote debugging permission accepted"]
+    fn local_chrome_smoke_connects_and_ensures_real_tab() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = temp.path().join("artifacts");
+        let session_id = "local-chrome-ensure-real-tab";
+
+        let connect =
+            run_browser_command(session_id, temp.path(), &artifacts, "browser connect local")
+                .expect("connect local Chrome");
+        assert_eq!(
+            connect.content["status"], "connected",
+            "local Chrome did not connect: {}",
+            connect.content
+        );
+
+        let script = run_browser_script(
+            session_id,
+            temp.path(),
+            &artifacts,
+            r#"
+tab = ensure_real_tab()
+if tab is None:
+    raise RuntimeError("expected at least one non-internal local Chrome tab")
+emit_output({"tab": tab, "tabs": list_tabs(include_chrome=False)}, label="smoke")
+print("done")
+"#,
+            10,
+        )
+        .expect("run local Chrome ensure_real_tab script");
+        assert!(script.ok, "{:?}\n{}", script.error, script.text);
+        assert!(!script.outputs.is_empty(), "{:?}", script.outputs);
+        let url = script.outputs[0]["value"]["tab"]["url"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !is_internal_browser_url(url),
+            "ensure_real_tab selected internal URL: {url}"
+        );
+
+        cleanup_session(session_id);
     }
 }

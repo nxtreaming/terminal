@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,15 +26,18 @@ use browser_use_agent::context::{
     append_user_shell_command_context_event, typed_user_input_payload_from_items_for_cwd,
     typed_user_input_payload_from_text_for_cwd,
 };
-use browser_use_agent::entrypoint::{
-    cleanup_unified_exec_manager_for_session_id, run_session_with_config,
-};
+use browser_use_agent::entrypoint::cleanup_unified_exec_manager_for_session_id;
+use browser_use_agent::entrypoint::RuntimeTurnDriver;
 use browser_use_agent::infra::{
     capture_async, capture_blocking, install_process_crypto_provider,
     record_browser_script_response_events, record_python_response_final_event,
     record_python_worker_event, review_prompt_base_branch, review_prompt_commit,
     review_prompt_custom, review_prompt_uncommitted_changes, start_review_session,
     UnifiedExecShutdownCleanup,
+};
+use browser_use_agent::live_executor::{
+    ensure_agent_attached as ensure_runtime_agent_attached, RuntimeAgentExecutor,
+    RuntimeAgentExecutorConfig, RuntimeAgentRunRequest,
 };
 use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_agent::rollout::fork_events_by_turn;
@@ -43,10 +49,10 @@ use browser_use_agent::session::{
 use browser_use_agent::subagents::{
     canonical_agent_path_from_task_name, canonical_agent_reference,
     cleanup_agent_runtime_state_for_agent_subtree, display_agent_path_for_session,
-    final_statuses_for_v1_wait, last_task_message_for_agent, local_agent_status_value,
-    session_was_interrupted, store_collect_agent_tree as collect_agent_tree,
+    last_task_message_for_agent, local_agent_status_value, session_was_interrupted,
+    store_collect_agent_tree as collect_agent_tree,
     store_resolve_agent_reference_in_tree as resolve_agent_reference_in_tree,
-    store_root_session_id as root_session_id,
+    store_root_session_id as root_session_id, ResolvedAgentReference,
 };
 use browser_use_agent::tools::AskForApproval;
 use browser_use_protocol::{
@@ -61,9 +67,19 @@ use browser_use_providers::{
     CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
+use browser_use_runtime::{
+    send_local_runtime_request, AgentId, BrowserConfig, BrowserId, BrowserUseRuntime,
+    CompleteAgentRequest, CreateRootAgentRequest, Durability as RuntimeDurability,
+    FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest, LocalRuntimeWaitTarget,
+    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
+    MemoryJournal, RunAgentRequest, RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState,
+    SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
+};
+#[cfg(test)]
+use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
 use browser_use_store::{now_ms, resolve_state_dir, Store};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MESSAGE_KIND_FOLLOWUP: &str = "followup";
@@ -121,6 +137,11 @@ enum ApprovalPolicyArg {
     OnFailure,
     OnRequest,
     UnlessTrusted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SdkTransportArg {
+    Stdio,
 }
 
 impl From<ApprovalPolicyArg> for AskForApproval {
@@ -287,6 +308,10 @@ enum Command {
         command: AuthCommand,
     },
     Diagnostics,
+    SdkServer {
+        #[arg(long, value_enum, default_value_t = SdkTransportArg::Stdio)]
+        transport: SdkTransportArg,
+    },
     Trace {
         task_id: String,
         output: Option<PathBuf>,
@@ -501,6 +526,13 @@ enum ConfigCommand {
     Init,
     Show,
     Set { key: String, value: String },
+    Reset { target: ConfigResetTarget },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ConfigResetTarget {
+    Onboarding,
+    Profile,
 }
 
 #[derive(Debug, Subcommand)]
@@ -652,6 +684,9 @@ fn main() -> Result<()> {
     let _unified_exec_cleanup = UnifiedExecShutdownCleanup::new();
     load_dotenv()?;
     let mut args = Args::parse();
+    if let Command::SdkServer { transport } = args.command {
+        return sdk_server(transport);
+    }
     args.state_dir = resolve_state_dir(&args.state_dir);
     let store = Store::open(&args.state_dir)?;
     capture_async(
@@ -802,6 +837,7 @@ fn main() -> Result<()> {
         ),
         Command::Auth { command } => auth(&store, command),
         Command::Diagnostics => diagnostics(&store),
+        Command::SdkServer { .. } => unreachable!("sdk-server is handled before Store bootstrap"),
         Command::Trace { task_id, output } => trace(&store, &task_id, output),
         Command::SpawnAgent {
             parent_id,
@@ -1052,6 +1088,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Config { .. } => "config",
         Command::Auth { .. } => "auth",
         Command::Diagnostics => "diagnostics",
+        Command::SdkServer { .. } => "sdk_server",
         Command::Trace { .. } => "trace",
         Command::SpawnAgent { .. } => "spawn_agent",
         Command::ListAgents { .. } => "list_agents",
@@ -1346,14 +1383,12 @@ fn maybe_append_message_history(
     }
 }
 
-/// Drive a session on the new async engine.
+/// Drive a session through the live runtime executor.
 ///
-/// The CLI is synchronous and threads `&Store`; the engine entrypoint is async
-/// and takes a [`SharedStore`] (`Arc<Mutex<Store>>`). This bridge opens a fresh
-/// store connection to the same state dir (WAL-mode SQLite supports the second
-/// connection; the caller's `&Store` performs no writes while this blocks),
-/// wraps it as a `SharedStore`, and drives `run_session_with_config` on a
-/// one-off tokio runtime. The session must already exist with its input seeded.
+/// The CLI is synchronous, while the agent engine is async. This bridge now
+/// creates a `RuntimeAgentExecutor` over the CLI runtime handle, so cancellation,
+/// child runs, mailboxes, and session resources use the same live authority as
+/// the TUI/SDK instead of a one-off engine runtime.
 ///
 /// Replaces the legacy `run_existing_session_from_config` /
 /// `run_agent_from_config` / `run_existing_session_with_provider` /
@@ -1361,17 +1396,131 @@ fn maybe_append_message_history(
 fn run_session_via_engine(
     store: &Store,
     session_id: &str,
-    mut config: ProviderRunConfig,
+    config: ProviderRunConfig,
 ) -> Result<String> {
-    attach_cli_child_agent_runner(store, &mut config);
-    let shared: SharedStore =
-        std::sync::Arc::new(std::sync::Mutex::new(Store::open(store.state_dir())?));
-    let runtime = tokio::runtime::Runtime::new().context("build tokio runtime for engine run")?;
-    let resolved = runtime.block_on(run_session_with_config(shared, session_id, config))?;
-    Ok(resolved.0)
+    let runtime_handle = cli_runtime_handle(store)?;
+    run_session_via_engine_with_runtime(store, session_id, config, runtime_handle)
 }
 
-fn attach_cli_child_agent_runner(store: &Store, config: &mut ProviderRunConfig) {
+fn run_session_via_engine_with_runtime(
+    store: &Store,
+    session_id: &str,
+    config: ProviderRunConfig,
+    runtime_handle: RuntimeHandle,
+) -> Result<String> {
+    run_session_via_engine_with_runtime_and_cancel(
+        store,
+        session_id,
+        config,
+        runtime_handle,
+        tokio_util::sync::CancellationToken::new(),
+        None,
+    )
+}
+
+fn run_session_via_engine_with_runtime_and_cancel(
+    store: &Store,
+    session_id: &str,
+    mut config: ProviderRunConfig,
+    runtime_handle: RuntimeHandle,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    browser_id: Option<BrowserId>,
+) -> Result<String> {
+    let _local_runtime_server = CliLocalRuntimeServer::ensure(store, &runtime_handle)?;
+    let executor = cli_runtime_agent_executor(store, runtime_handle)?;
+    attach_cli_child_agent_runner(store, executor.clone(), &mut config);
+    let mut request = RuntimeAgentRunRequest::new(session_id.to_string(), config)
+        .with_cancellation_token(cancellation_token);
+    let root_cancel = request
+        .cancellation_token
+        .clone()
+        .unwrap_or_else(tokio_util::sync::CancellationToken::new);
+    if let Some(browser_id) = browser_id {
+        request = request.with_browser_id(browser_id);
+    }
+    let resolved = executor.run_blocking(request)?;
+    if root_cancel.is_cancelled() {
+        let _ = executor.wait_for_background_idle(Duration::from_secs(30));
+    }
+    Ok(resolved.session_id)
+}
+
+struct CliLocalRuntimeServer {
+    owned_socket_path: Option<PathBuf>,
+}
+
+impl CliLocalRuntimeServer {
+    fn ensure(store: &Store, runtime: &RuntimeHandle) -> Result<Self> {
+        Self::ensure_for_state_dir(store.state_dir(), runtime)
+    }
+
+    #[cfg(unix)]
+    fn ensure_for_state_dir(state_dir: &Path, runtime: &RuntimeHandle) -> Result<Self> {
+        let existing_live_server = send_local_runtime_request(
+            state_dir,
+            &LocalRuntimeRequest::Ping,
+            Duration::from_millis(100),
+        )?
+        .is_some_and(|response| response.ok);
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(state_dir, runtime.clone())?;
+        Ok(Self {
+            owned_socket_path: (!existing_live_server).then_some(socket_path),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn ensure_for_state_dir(_state_dir: &Path, _runtime: &RuntimeHandle) -> Result<Self> {
+        Ok(Self {
+            owned_socket_path: None,
+        })
+    }
+}
+
+impl Drop for CliLocalRuntimeServer {
+    fn drop(&mut self) {
+        if let Some(socket_path) = self.owned_socket_path.take() {
+            let _ = fs::remove_file(socket_path);
+        }
+    }
+}
+
+fn cli_runtime_handle(store: &Store) -> Result<RuntimeHandle> {
+    let journal = std::sync::Arc::new(SqliteJournal::from_store(Store::open(store.state_dir())?));
+    let persistence: std::sync::Arc<dyn LiveThreadPersistence> = journal.clone();
+    let state_index: std::sync::Arc<dyn StateIndex> = journal;
+    Ok(BrowserUseRuntime::new(persistence, state_index).handle())
+}
+
+fn cli_runtime_agent_executor(
+    store: &Store,
+    runtime: RuntimeHandle,
+) -> Result<RuntimeAgentExecutor> {
+    RuntimeAgentExecutor::new(
+        RuntimeAgentExecutorConfig::new(store.state_dir().to_path_buf(), runtime)
+            .with_worker_threads(2),
+    )
+}
+
+fn ensure_cli_agent_attached(
+    runtime: &RuntimeHandle,
+    store: &Store,
+    session_id: &str,
+    max_concurrent_threads_per_session: usize,
+) -> Result<()> {
+    ensure_runtime_agent_attached(
+        runtime,
+        store,
+        session_id,
+        max_concurrent_threads_per_session,
+    )
+}
+
+fn attach_cli_child_agent_runner(
+    store: &Store,
+    executor: RuntimeAgentExecutor,
+    config: &mut ProviderRunConfig,
+) {
     let state_dir = store.state_dir().to_path_buf();
     let base_config_slot: std::sync::Arc<std::sync::Mutex<Option<ProviderRunConfig>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -1383,7 +1532,7 @@ fn attach_cli_child_agent_runner(store: &Store, config: &mut ProviderRunConfig) 
             .as_ref()
             .cloned()
             .context("child agent runner base config not initialized")?;
-        spawn_cli_child_agent(state_dir.clone(), base_config, request)
+        spawn_runtime_cli_child_agent(executor.clone(), state_dir.clone(), base_config, request)
     });
     config.options = config.options.clone().with_child_agent_runner(runner);
     *base_config_slot
@@ -1391,108 +1540,154 @@ fn attach_cli_child_agent_runner(store: &Store, config: &mut ProviderRunConfig) 
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(config.clone());
 }
 
-fn spawn_cli_child_agent(
+fn spawn_runtime_cli_child_agent(
+    executor: RuntimeAgentExecutor,
     state_dir: PathBuf,
-    base_config: ProviderRunConfig,
+    mut base_config: ProviderRunConfig,
     request: ChildAgentRunRequest,
 ) -> Result<()> {
+    let runtime_handle = executor.runtime_handle();
     let store = Store::open(&state_dir)?;
-    let child = create_agent_child_session_from_request(&store, &request)?;
+    ensure_cli_agent_attached(
+        &runtime_handle,
+        &store,
+        &request.parent_session_id,
+        base_config
+            .options
+            .multi_agent_v2
+            .max_concurrent_threads_per_session,
+    )?;
+    let child = create_agent_child_session_from_request(&runtime_handle, &store, &request)?;
     let child_id = child.id.clone();
     record_child_run_marker_from_request(&store, &child_id, &request)?;
-    thread::Builder::new()
-        .name(format!("browser-use-child-{child_id}"))
-        .spawn(move || {
-            if let Err(error) =
-                run_cli_child_agent_thread(state_dir, child_id, base_config, request)
-            {
-                eprintln!("child agent failed: {error:#}");
+    apply_cli_child_request_to_config(&mut base_config, &request)?;
+    let mut run_request = RuntimeAgentRunRequest::new(child_id.clone(), base_config);
+    if let Some(run_id) = request.run_id.as_ref() {
+        run_request = run_request.with_run_id(RuntimeRunId::from_string(run_id.clone())?);
+    }
+    executor.spawn_background(
+        format!("browser-use-child-{child_id}"),
+        run_request,
+        move |completion| {
+            let events = Store::open(&state_dir)
+                .and_then(|store| store.events_for_session(&child_id))
+                .ok();
+            if let Some(child_completion) = cli_child_completion_from_background(
+                completion.is_success(),
+                completion.error_message(),
+                events.as_deref(),
+            ) {
+                if let Err(error) = notify_cli_runtime_child_completion(
+                    &runtime_handle,
+                    &child_id,
+                    &child_completion,
+                ) {
+                    eprintln!("child agent completion runtime update failed: {error:#}");
+                }
             }
-        })
-        .context("spawn child agent thread")?;
+        },
+    )?;
     Ok(())
 }
 
-fn run_cli_child_agent_thread(
-    state_dir: PathBuf,
-    child_id: String,
-    mut config: ProviderRunConfig,
-    request: ChildAgentRunRequest,
+fn apply_cli_child_request_to_config(
+    config: &mut ProviderRunConfig,
+    request: &ChildAgentRunRequest,
 ) -> Result<()> {
-    let completion_handler = request.completion_handler.clone();
-    let mut completion_events = None;
-    let run_result: Result<Option<String>> = (|| {
-        if let Some(model) = request.model.as_deref().filter(|value| !value.is_empty()) {
-            config.model = model.to_string();
-            config.model_source = RunConfigValueSource::Explicit;
-        }
-        if let Some(provider_id) = child_request_provider_id(&request) {
-            if let Some(backend) = ProviderBackend::from_provider_id(&provider_id) {
-                config.backend = backend;
-            }
-            config.options.model_provider_id = Some(provider_id);
-            config.options.model_provider_id_source = RunConfigValueSource::Explicit;
-        }
-        if !request.config_overrides.is_empty() {
-            config
-                .options
-                .config_overrides
-                .extend(request.config_overrides.clone());
-            apply_child_request_runtime_config(&mut config, &request)?;
-        }
-        if let Some(reasoning) = request.reasoning_effort.clone() {
-            config.options.config_overrides.push((
-                "reasoning_effort".to_string(),
-                toml::Value::String(reasoning),
-            ));
-        }
-        if let Some(service_tier) = request.service_tier.clone() {
-            config.options.config_overrides.push((
-                "service_tier".to_string(),
-                toml::Value::String(service_tier),
-            ));
-        }
-        let store = Store::open(&state_dir)?;
-        if completion_handler.is_some() {
-            let _ = run_session_via_engine(&store, &child_id, config)?;
-        } else {
-            let _ = run_existing_session_from_config_and_notify(
-                &store,
-                &child_id,
-                config,
-                request.run_id.clone(),
-            )?;
-        }
-        let events = store.events_for_session(&child_id)?;
-        let summary = session_result_from_events(&events);
-        completion_events = Some(events);
-        Ok(summary)
-    })();
-    if let Some(handler) = completion_handler {
-        if let Some(completion) =
-            cli_child_completion_from_result(&run_result, completion_events.as_deref())
-        {
-            if let Err(error) = handler.notify(completion) {
-                eprintln!("child agent completion notification failed: {error:#}");
-            }
-        }
+    if let Some(model) = request.model.as_deref().filter(|value| !value.is_empty()) {
+        config.model = model.to_string();
+        config.model_source = RunConfigValueSource::Explicit;
     }
-    run_result.map(|_| ())
+    if let Some(provider_id) = child_request_provider_id(request) {
+        if let Some(backend) = ProviderBackend::from_provider_id(&provider_id) {
+            config.backend = backend;
+        }
+        config.options.model_provider_id = Some(provider_id);
+        config.options.model_provider_id_source = RunConfigValueSource::Explicit;
+    }
+    if !request.config_overrides.is_empty() {
+        config
+            .options
+            .config_overrides
+            .extend(request.config_overrides.clone());
+        apply_child_request_runtime_config(config, request)?;
+    }
+    if let Some(reasoning) = request.reasoning_effort.clone() {
+        config.options.config_overrides.push((
+            "reasoning_effort".to_string(),
+            toml::Value::String(reasoning),
+        ));
+    }
+    if let Some(service_tier) = request.service_tier.clone() {
+        config.options.config_overrides.push((
+            "service_tier".to_string(),
+            toml::Value::String(service_tier),
+        ));
+    }
+    Ok(())
 }
 
-fn cli_child_completion_from_result(
-    run_result: &Result<Option<String>>,
+fn notify_cli_runtime_child_completion(
+    runtime_handle: &RuntimeHandle,
+    child_id: &str,
+    completion: &ChildAgentRunCompletion,
+) -> Result<()> {
+    let child_agent_id = AgentId::from_string(child_id.to_string())?;
+    let runtime_result = if completion.success {
+        runtime_handle.complete_agent(CompleteAgentRequest {
+            child_agent_id,
+            result: completion.summary.clone().unwrap_or_default(),
+        })
+    } else {
+        runtime_handle.fail_agent(FailAgentRequest {
+            child_agent_id,
+            error: completion
+                .summary
+                .clone()
+                .unwrap_or_else(|| "child agent failed".to_string()),
+        })
+    };
+    runtime_result
+}
+
+fn cli_child_completion_from_background(
+    success: bool,
+    error: Option<String>,
     events: Option<&[browser_use_protocol::EventRecord]>,
 ) -> Option<ChildAgentRunCompletion> {
-    match run_result {
-        Ok(summary) => {
-            if events.is_some_and(child_run_was_interrupted_from_events) {
-                return None;
-            }
-            Some(ChildAgentRunCompletion::success(summary.clone()))
+    if success {
+        if events.is_some_and(child_run_should_skip_success_completion) {
+            return None;
         }
-        Err(error) => Some(ChildAgentRunCompletion::failure(format!("{error:#}"))),
+        let summary = events.and_then(session_result_from_events);
+        Some(ChildAgentRunCompletion::success(summary))
+    } else {
+        Some(ChildAgentRunCompletion::failure(
+            error.unwrap_or_else(|| "child agent failed".to_string()),
+        ))
     }
+}
+
+fn child_run_should_skip_success_completion(events: &[browser_use_protocol::EventRecord]) -> bool {
+    child_run_was_interrupted_from_events(events) || child_run_latest_terminal_is_cancelled(events)
+}
+
+fn child_run_latest_terminal_is_cancelled(events: &[browser_use_protocol::EventRecord]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.cancelled"
+                    | "session.interrupted"
+                    | "session.input"
+                    | "session.followup"
+                    | "session.done"
+                    | "session.failed"
+            )
+        })
+        .is_some_and(|event| event.event_type == "session.cancelled")
 }
 
 fn child_request_provider_id(request: &ChildAgentRunRequest) -> Option<String> {
@@ -1513,21 +1708,32 @@ fn child_request_provider_id(request: &ChildAgentRunRequest) -> Option<String> {
 }
 
 fn create_agent_child_session_from_request(
+    runtime_handle: &RuntimeHandle,
     store: &Store,
     request: &ChildAgentRunRequest,
 ) -> Result<browser_use_protocol::SessionMeta> {
     if let Some(existing) = store.load_session(&request.child_session_id)? {
         return Ok(existing);
     }
-    let parent = ensure_task_exists(store, &request.parent_session_id)?;
-    let child = store.create_child_session_with_id(
-        &request.parent_session_id,
-        Path::new(&parent.cwd),
-        request.agent_path.as_deref(),
-        request.nickname.as_deref(),
-        request.role.as_deref(),
-        request.child_session_id.clone(),
-    )?;
+    ensure_task_exists(store, &request.parent_session_id)?;
+    runtime_handle.spawn_child(SpawnChildRequest {
+        parent_agent_id: AgentId::from_string(request.parent_session_id.clone())?,
+        child_agent_id: Some(AgentId::from_string(request.child_session_id.clone())?),
+        child_session_id: Some(SessionId::from_string(request.child_session_id.clone())?),
+        task_name: task_name_from_agent_path(request.agent_path.as_deref())
+            .unwrap_or_else(|| request.child_session_id.clone()),
+        message: request.message.clone(),
+        nickname: request.nickname.clone(),
+        role: request.role.clone(),
+    })?;
+    let child = store
+        .load_session(&request.child_session_id)?
+        .with_context(|| {
+            format!(
+                "runtime did not create child session {}",
+                request.child_session_id
+            )
+        })?;
     let parent_events = store.events_for_session(&request.parent_session_id)?;
     store.append_event(
         &child.id,
@@ -1548,6 +1754,12 @@ fn create_agent_child_session_from_request(
         }),
     )?;
     Ok(child)
+}
+
+fn task_name_from_agent_path(agent_path: Option<&str>) -> Option<String> {
+    agent_path
+        .and_then(|path| path.rsplit('/').find(|segment| !segment.trim().is_empty()))
+        .map(ToOwned::to_owned)
 }
 
 fn record_child_run_marker_from_request(
@@ -2083,18 +2295,12 @@ fn notify_parent_after_cli_child_run(
     Ok(())
 }
 
-/// Store-based parent-link update run after a child agent terminates.
+/// Store-based parent-link projection run after a child agent terminates.
 ///
-/// Faithful port of the legacy `browser-use-core::update_parent_from_child_run`
-/// (lib.rs:20767) reconstructed locally on `&Store` primitives, because the
-/// agent crate only exposes a *registry*-based `update_parent_from_child_run`
-/// (`subagents::parent_link`, a pure `(registry, mailbox, …)` function), not a
-/// Store-driven one. Writes the parent's terminal `agent.{completed,failed,
-/// cancelled,updated}` event, flips the child edge status, and (when the parent
-/// can still receive mail) queues the `<subagent_notification>` into the parent's
-/// mailbox. The legacy subagent-stop hook fan-out is intentionally NOT
-/// reconstructed (hooks are a not-yet-ported engine seam; the CLI never wired
-/// runtime hooks here) — see report.
+/// Writes the parent's terminal `agent.{completed,failed,cancelled,updated}`
+/// event and flips the child edge status. It deliberately does not enqueue
+/// Store-backed `agent_messages`; live completion delivery belongs to the
+/// runtime mailbox.
 fn update_parent_from_child_run(
     store: &Store,
     parent_id: &str,
@@ -2203,14 +2409,6 @@ fn update_parent_from_child_run(
             "payload": payload,
         }),
     )?;
-    if matches!(status.as_str(), "done" | "failed" | "cancelled")
-        && parent_can_receive_subagent_completion_mail(store, parent_id)?
-    {
-        let child_path = display_agent_path_for_session(store, child_id)?;
-        let notification =
-            format_subagent_notification_message(&child_path, status.as_str(), &payload);
-        store.send_agent_message(child_id, parent_id, &notification, false)?;
-    }
     Ok(payload)
 }
 
@@ -2271,79 +2469,46 @@ fn parent_has_child_terminal_event_for_run(
     run_id: Option<&str>,
 ) -> Result<bool> {
     Ok(store.events_for_session(parent_id)?.iter().any(|event| {
-        matches!(
+        if !matches!(
             event.event_type.as_str(),
             "agent.completed" | "agent.failed" | "agent.cancelled"
-        ) && event
+        ) {
+            return false;
+        }
+        if event
             .payload
             .get("child_session_id")
+            .or_else(|| event.payload.pointer("/payload/child_session_id"))
             .and_then(Value::as_str)
-            == Some(child_id)
-            && match run_id {
-                Some(run_id) => {
-                    event
-                        .payload
-                        .get("run_id")
-                        .or_else(|| event.payload.pointer("/payload/run_id"))
-                        .and_then(Value::as_str)
-                        == Some(run_id)
-                }
-                None => true,
+            != Some(child_id)
+        {
+            return false;
+        }
+        if event
+            .payload
+            .get("runtime_owned")
+            .or_else(|| event.payload.pointer("/payload/runtime_owned"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return true;
+        }
+        match run_id {
+            Some(run_id) => {
+                event
+                    .payload
+                    .get("run_id")
+                    .or_else(|| event.payload.pointer("/payload/run_id"))
+                    .and_then(Value::as_str)
+                    == Some(run_id)
             }
+            None => true,
+        }
     }))
 }
 
 fn child_run_was_interrupted_from_events(events: &[browser_use_protocol::EventRecord]) -> bool {
     session_was_interrupted(events)
-}
-
-/// Whether `parent_id` is in a state that can still receive a child-completion
-/// mail. Port of legacy `parent_can_receive_subagent_completion_mail`
-/// (browser-use-core lib.rs:20931).
-fn parent_can_receive_subagent_completion_mail(store: &Store, parent_id: &str) -> Result<bool> {
-    let Some(parent) = store.load_session(parent_id)? else {
-        return Ok(false);
-    };
-    if !matches!(
-        parent.status,
-        browser_use_protocol::SessionStatus::Created | browser_use_protocol::SessionStatus::Running
-    ) {
-        return Ok(false);
-    }
-    if store
-        .agent_summary_for_child(parent_id)?
-        .is_some_and(|agent| agent.status == "closed")
-    {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-/// Render the `<subagent_notification>` body. Byte-for-byte port of legacy
-/// `format_subagent_notification_message` (browser-use-core lib.rs:20950): the
-/// status maps to `{completed: result}` / `{errored: failure}` / `"shutdown"` /
-/// `"not_found"` inside a `{agent_path, status}` JSON object.
-fn format_subagent_notification_message(agent_path: &str, status: &str, payload: &Value) -> String {
-    let agent_status = match status {
-        "done" => serde_json::json!({
-            "completed": payload.get("result").cloned().unwrap_or(Value::Null),
-        }),
-        "failed" => serde_json::json!({
-            "errored": payload
-                .get("failure")
-                .and_then(Value::as_str)
-                .unwrap_or("agent failed"),
-        }),
-        "cancelled" => serde_json::json!("shutdown"),
-        _ => serde_json::json!("not_found"),
-    };
-    format!(
-        "<subagent_notification>\n{}\n</subagent_notification>",
-        serde_json::json!({
-            "agent_path": agent_path,
-            "status": agent_status,
-        })
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2382,6 +2547,25 @@ fn capture_user_message(
 
 fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
     let session = ensure_task_exists(store, task_id)?;
+    if let Some(seq) = followup_via_live_runtime(store, &session, &text)? {
+        capture_user_message(
+            store,
+            "cli",
+            task_id,
+            session.parent_id.is_some(),
+            MESSAGE_KIND_FOLLOWUP,
+            seq,
+            &text,
+        );
+        maybe_append_message_history(
+            task_id,
+            &text,
+            Path::new(&session.cwd),
+            &AgentRunOptions::default(),
+        );
+        println!("followup {task_id}");
+        return Ok(());
+    }
     let followup_record = store.append_event(
         task_id,
         "session.followup",
@@ -2406,6 +2590,44 @@ fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
     Ok(())
 }
 
+fn followup_via_live_runtime(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    text: &str,
+) -> Result<Option<i64>> {
+    let payload = typed_user_input_payload_from_text_for_cwd(text, &session.cwd)?;
+    let response = match send_local_runtime_request(
+        store.state_dir(),
+        &LocalRuntimeRequest::SubmitUserInput {
+            session_id: session.id.clone(),
+            content: text.to_string(),
+            trigger_turn: true,
+            delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+            input_items: payload.get("items").cloned(),
+            payload: serde_json::json!({ "source": "cli" }),
+        },
+        Duration::from_millis(500),
+    )? {
+        Some(response) if response.ok => response,
+        _ => return Ok(None),
+    };
+    let mailbox_item = response
+        .result
+        .get("mailbox_item")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let record = store.append_event(
+        &session.id,
+        "session.followup.runtime_queued",
+        serde_json::json!({
+            "source": "cli",
+            "runtime_mailbox_id": mailbox_item.get("id").and_then(Value::as_str),
+            "runtime_mailbox_seq": mailbox_item.get("seq").and_then(Value::as_u64),
+        }),
+    )?;
+    Ok(Some(record.seq))
+}
+
 fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     store.append_event(
@@ -2420,11 +2642,46 @@ fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
 
 fn cancel(store: &Store, task_id: &str, reason: &str) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
+    let live_cancelled = cancel_via_live_runtime(store, task_id)?;
+    if live_cancelled {
+        store.append_event(
+            task_id,
+            "runtime.cancel.forwarded",
+            serde_json::json!({ "source": "cli", "reason": reason }),
+        )?;
+        println!("cancelled {task_id}");
+        return Ok(());
+    }
     store.request_cancel(task_id, reason)?;
     cleanup_agent_runtime_state_for_agent_subtree(store, task_id, |_| 0)?;
     notify_parent_agent_done(store, &task)?;
     println!("cancelled {task_id}");
     Ok(())
+}
+
+fn cancel_via_live_runtime(store: &Store, task_id: &str) -> Result<bool> {
+    let request = LocalRuntimeRequest::CancelRun {
+        session_id: task_id.to_string(),
+    };
+    let Some(response) =
+        send_local_runtime_request(store.state_dir(), &request, Duration::from_secs(5))?
+    else {
+        return Ok(false);
+    };
+    if !response.ok {
+        let error = response
+            .error
+            .unwrap_or_else(|| "local runtime cancel failed".to_string());
+        if error.contains("unknown agent") {
+            return Ok(false);
+        }
+        bail!(error);
+    }
+    Ok(response
+        .result
+        .get("cancelled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
 }
 
 fn fail(store: &Store, task_id: &str, error: String) -> Result<()> {
@@ -2840,6 +3097,20 @@ fn config(
         ConfigCommand::Set { key, value } => {
             store.set_setting(&key, &value)?;
             println!("{key}={value}");
+            Ok(())
+        }
+        ConfigCommand::Reset { target } => {
+            match target {
+                ConfigResetTarget::Onboarding => {
+                    store.set_setting("setup.complete", "0")?;
+                    println!("reset onboarding");
+                }
+                ConfigResetTarget::Profile => {
+                    store.delete_setting("browser.preference.profile")?;
+                    store.delete_setting("browser.preference.profile_label")?;
+                    println!("reset profile");
+                }
+            }
             Ok(())
         }
     }
@@ -3525,6 +3796,701 @@ fn diagnostics(store: &Store) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct JsonRpcRequest {
+    #[serde(default)]
+    jsonrpc: Option<String>,
+    #[serde(default)]
+    id: Option<Value>,
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+struct SdkServerContext {
+    journal: Arc<MemoryJournal>,
+    runtime: RuntimeHandle,
+    store: SharedStore,
+    _ephemeral_state_dir: Arc<tempfile::TempDir>,
+}
+
+impl SdkServerContext {
+    fn memory() -> Result<Self> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let ephemeral_state_dir = Arc::new(tempfile::Builder::new().prefix("but-sdk-").tempdir()?);
+        let store = Store::open_in_memory(ephemeral_state_dir.path())?;
+        Ok(Self {
+            journal,
+            runtime: runtime.handle(),
+            store: Arc::new(Mutex::new(store)),
+            _ephemeral_state_dir: ephemeral_state_dir,
+        })
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            journal: Arc::clone(&self.journal),
+            runtime: self.runtime.clone(),
+            store: Arc::clone(&self.store),
+            _ephemeral_state_dir: Arc::clone(&self._ephemeral_state_dir),
+        })
+    }
+}
+
+fn sdk_server(transport: SdkTransportArg) -> Result<()> {
+    match transport {
+        SdkTransportArg::Stdio => sdk_server_stdio(),
+    }
+}
+
+fn sdk_server_stdio() -> Result<()> {
+    let context = SdkServerContext::memory()?;
+    let (response_tx, response_rx) = mpsc::channel::<Value>();
+    let event_thread_stop = Arc::new(AtomicBool::new(false));
+    let writer = thread::Builder::new()
+        .name("browser-use-sdk-stdio-writer".to_string())
+        .spawn(move || -> Result<()> {
+            let mut stdout = io::BufWriter::new(io::stdout().lock());
+            for response in response_rx {
+                writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+                stdout.flush()?;
+            }
+            Ok(())
+        })
+        .context("spawn sdk stdio writer")?;
+
+    let event_thread = {
+        let response_tx = response_tx.clone();
+        let runtime = context.runtime.clone();
+        let stop = Arc::clone(&event_thread_stop);
+        thread::Builder::new()
+            .name("browser-use-sdk-event-forwarder".to_string())
+            .spawn(move || -> Result<()> {
+                let mut rx = runtime.events().subscribe();
+                let mut projection = RuntimeProjectionState::new(runtime.snapshot());
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .context("build sdk event runtime")?;
+                rt.block_on(async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                            Ok(Ok(event)) => {
+                                let projected = projection.apply_event(&event);
+                                let session_id =
+                                    event.session_id.as_ref().map(|id| id.as_str().to_string());
+                                let run_id = event
+                                    .run_id
+                                    .as_ref()
+                                    .map(|id| id.as_str().to_string())
+                                    .or_else(|| session_id.clone());
+                                let agent_id =
+                                    event.agent_id.as_ref().map(|id| id.as_str().to_string());
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "agent.event",
+                                    "params": {
+                                        "run_id": run_id.clone(),
+                                        "session_id": session_id.clone(),
+                                        "agent_id": agent_id.clone(),
+                                        "event": event,
+                                    },
+                                });
+                                if response_tx.send(notification).is_err() {
+                                    break;
+                                }
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "agent.projected_event",
+                                    "params": {
+                                        "run_id": run_id,
+                                        "session_id": session_id,
+                                        "agent_id": agent_id,
+                                        "event": projected,
+                                    },
+                                });
+                                if response_tx.send(notification).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                                continue;
+                            }
+                            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                            Err(_) => continue,
+                        }
+                    }
+                });
+                Ok(())
+            })
+            .context("spawn sdk event forwarder")?
+    };
+
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response_tx = response_tx.clone();
+        let context = match context.try_clone() {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = response_tx.send(json_rpc_error(
+                    None,
+                    -32000,
+                    format!("SDK context clone failed: {error:#}"),
+                ));
+                continue;
+            }
+        };
+        thread::Builder::new()
+            .name("browser-use-sdk-request".to_string())
+            .spawn(move || {
+                let response = handle_sdk_json_rpc_line(&context, &line);
+                let _ = response_tx.send(response);
+            })
+            .context("spawn sdk request handler")?;
+    }
+    event_thread_stop.store(true, Ordering::Relaxed);
+    drop(response_tx);
+    event_thread.join().unwrap_or_else(|panic| {
+        Err(anyhow::anyhow!(
+            "sdk event forwarder panicked: {}",
+            panic_payload_message(panic)
+        ))
+    })?;
+    writer.join().unwrap_or_else(|panic| {
+        Err(anyhow::anyhow!(
+            "sdk writer panicked: {}",
+            panic_payload_message(panic)
+        ))
+    })?;
+    Ok(())
+}
+
+fn handle_sdk_json_rpc_line(context: &SdkServerContext, line: &str) -> Value {
+    match serde_json::from_str::<JsonRpcRequest>(line) {
+        Ok(request) => handle_sdk_json_rpc_request(context, request),
+        Err(error) => json_rpc_error(None, -32700, format!("Parse error: {error}")),
+    }
+}
+
+fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcRequest) -> Value {
+    if request.jsonrpc.as_deref() != Some("2.0") {
+        return json_rpc_error(request.id, -32600, "Invalid Request");
+    }
+    let id = request.id;
+    let result = match request.method.as_str() {
+        "runtime.ping" => Ok(serde_json::json!({ "ok": true })),
+        "runtime.snapshot" => sdk_runtime_snapshot(&context.runtime),
+        "browser.create" => sdk_browser_create(&context.runtime, &request.params),
+        "browser.stop" | "browser.close" => sdk_browser_close(&context.runtime, &request.params),
+        "agent.create" => sdk_agent_create(context, &request.params),
+        "agent.snapshot" => sdk_agent_snapshot(context, &request.params),
+        "agent.run" => sdk_agent_run(context, &request.params),
+        "agent.stop" => sdk_agent_stop(context, &request.params),
+        "agent.close" => sdk_agent_close(context, &request.params),
+        _ => Err(anyhow::anyhow!("Method not found")),
+    };
+    match result {
+        Ok(result) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }),
+        Err(error) if error.to_string() == "Method not found" => {
+            json_rpc_error(id, -32601, "Method not found")
+        }
+        Err(error) => json_rpc_error(id, -32000, error.to_string()),
+    }
+}
+
+fn sdk_runtime_snapshot(runtime: &RuntimeHandle) -> Result<Value> {
+    Ok(serde_json::to_value(runtime.snapshot())?)
+}
+
+fn sdk_browser_create(runtime: &RuntimeHandle, params: &Value) -> Result<Value> {
+    let config = BrowserConfig {
+        keep_alive: params
+            .get("keep_alive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        headless: params.get("headless").and_then(Value::as_bool),
+        profile_id: params
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    };
+    let browser_id = runtime.create_browser(config);
+    Ok(serde_json::json!({ "browser_id": browser_id.as_str() }))
+}
+
+fn sdk_browser_close(runtime: &RuntimeHandle, params: &Value) -> Result<Value> {
+    let browser_id = BrowserId::from_string(
+        params
+            .get("browser_id")
+            .and_then(Value::as_str)
+            .context("browser.close requires string param `browser_id`")?
+            .to_string(),
+    )?;
+    runtime.close_browser(&browser_id)?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+fn sdk_agent_create(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    let task = params
+        .get("task")
+        .and_then(Value::as_str)
+        .context("agent.create requires string param `task`")?
+        .to_string();
+    let cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    let max_concurrent_threads_per_session = params
+        .get("max_concurrent_threads_per_session")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(
+        browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        );
+    let agent = context.runtime.create_root_agent(CreateRootAgentRequest {
+        cwd: cwd.clone(),
+        task: task.clone(),
+        max_concurrent_threads_per_session,
+    })?;
+    let runtime_session = context
+        .runtime
+        .load_session(agent.session_id())?
+        .with_context(|| format!("runtime did not create session {}", agent.session_id()))?;
+    let input_payload = typed_user_input_payload_from_text_for_cwd(&task, &cwd)?;
+    {
+        let store = context.store.lock().expect("sdk store mutex poisoned");
+        if store.load_session(agent.session_id().as_str())?.is_none() {
+            store.create_session_with_id_and_artifact_root(
+                None,
+                Path::new(&runtime_session.cwd),
+                Path::new(&runtime_session.artifact_root),
+                agent.session_id().as_str().to_string(),
+            )?;
+        }
+        store.append_event(
+            agent.session_id().as_str(),
+            "session.input",
+            input_payload.clone(),
+        )?;
+    }
+    context.runtime.append_observed_session_event(
+        agent.session_id().clone(),
+        "session.input",
+        input_payload,
+        RuntimeDurability::Barrier,
+    )?;
+    Ok(serde_json::json!({
+        "agent_id": agent.agent_id().as_str(),
+        "session_id": agent.session_id().as_str(),
+    }))
+}
+
+fn sdk_agent_snapshot(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    if let Some(agent_id) = params.get("agent_id").and_then(Value::as_str) {
+        let agent_id = AgentId::from_string(agent_id.to_string())?;
+        return Ok(serde_json::to_value(
+            context.runtime.snapshot_agent(&agent_id)?,
+        )?);
+    }
+    let session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("agent.snapshot requires string param `agent_id` or `session_id`")?;
+    let agent_id = context
+        .runtime
+        .agent_id_for_session(&SessionId::from_string(session_id.to_string())?)?;
+    Ok(serde_json::to_value(
+        context.runtime.snapshot_agent(&agent_id)?,
+    )?)
+}
+
+fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    let agent_id = AgentId::from_string(
+        params
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .context("agent.run requires string param `agent_id`")?
+            .to_string(),
+    )?;
+    let thread = context.runtime.agents().thread(&agent_id)?;
+    let session_id = thread.session_id().clone();
+    let session = context
+        .runtime
+        .load_session(&session_id)?
+        .with_context(|| format!("unknown session id: {session_id}"))?;
+
+    for followup in params
+        .get("followups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        let payload = typed_user_input_payload_from_text_for_cwd(followup, &session.cwd)?;
+        let submitted = context.runtime.submit_followup(SubmitInputRequest {
+            target_agent_id: agent_id.clone(),
+            content: followup.to_string(),
+            trigger_turn: true,
+            delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+            input_items: payload.get("items").cloned(),
+            payload: serde_json::json!({ "source": "sdk" }),
+        })?;
+        let append = context.runtime.append_observed_session_event(
+            session_id.clone(),
+            "session.followup.runtime_queued",
+            serde_json::json!({
+                "source": "sdk",
+                "runtime_mailbox_id": submitted.mailbox_item.id,
+                "runtime_mailbox_seq": submitted.mailbox_item.seq,
+            }),
+            RuntimeDurability::Barrier,
+        )?;
+        let _ = append;
+    }
+
+    let browser_id = params
+        .get("browser_id")
+        .and_then(Value::as_str)
+        .map(|browser_id| BrowserId::from_string(browser_id.to_string()))
+        .transpose()?;
+
+    let events_before_run = context.runtime.events_for_session(&session_id)?;
+    let task = task_from_events(&events_before_run).unwrap_or_else(|| "task".to_string());
+    let config = sdk_provider_run_config(params, Some(&task))?;
+    sdk_run_agent_with_runtime(context, &agent_id, &session_id, browser_id, config)?;
+
+    let events = context.runtime.events_for_session(&session_id)?;
+    let output = session_result_from_events(&events);
+    let error = failure_from_events(&events);
+    let final_projected_event = sdk_final_projected_event(
+        context,
+        &agent_id,
+        &session_id,
+        &events,
+        output.as_deref(),
+        error.as_deref(),
+    )?;
+    let event_values = events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "seq": event.seq,
+                "id": event.id,
+                "event_type": event.event_type,
+                "payload": event.payload,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "history": {
+            "output": output,
+            "success": error.is_none(),
+            "done": true,
+            "errors": error.into_iter().collect::<Vec<_>>(),
+            "events": event_values,
+        },
+        "final_projected_event": final_projected_event,
+    }))
+}
+
+fn sdk_run_agent_with_runtime(
+    context: &SdkServerContext,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+    browser_id: Option<BrowserId>,
+    config: ProviderRunConfig,
+) -> Result<()> {
+    let runtime = context.runtime.clone();
+    let driver_runtime = runtime.clone();
+    let store = Arc::clone(&context.store);
+    let session_id_for_driver = session_id.as_str().to_string();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_for_driver = cancel.clone();
+    let run_cwd = {
+        let store = context.store.lock().expect("sdk store mutex poisoned");
+        store
+            .load_session(session_id.as_str())?
+            .map(|session| PathBuf::from(session.cwd))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
+    };
+    let provider_config = serde_json::json!({
+        "backend": format!("{:?}", config.backend),
+        "model": config.model.clone(),
+        "source": "sdk-memory",
+    });
+    let mut request = RunAgentRequest::new(session_id.clone())
+        .with_agent_id(agent_id.clone())
+        .with_provider_config(provider_config)
+        .with_cwd(run_cwd)
+        .with_input_source("sdk-memory")
+        .with_cancellation_token(cancel);
+    if let Some(browser_id) = browser_id {
+        request = request.with_browser_id(browser_id);
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .context("build sdk run runtime")?;
+    rt.block_on(async move {
+        runtime
+            .run_agent(request, async move {
+                RuntimeTurnDriver::new(
+                    store,
+                    session_id_for_driver,
+                    config,
+                    cancel_for_driver,
+                    driver_runtime,
+                )
+                .run()
+                .await
+                .map(|resolved| resolved.as_str().to_string())
+            })
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    })
+}
+
+fn sdk_final_projected_event(
+    context: &SdkServerContext,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+    events: &[browser_use_protocol::EventRecord],
+    output: Option<&str>,
+    error: Option<&str>,
+) -> Result<Value> {
+    let mut snapshot = context.runtime.snapshot();
+    if let Some(agent) = snapshot
+        .agents
+        .iter_mut()
+        .find(|agent| &agent.agent_id == agent_id || &agent.session_id == session_id)
+    {
+        for event in events {
+            match event.event_type.as_str() {
+                "model.stream_delta" => {
+                    if let Some(text) = event
+                        .payload
+                        .get("text")
+                        .or_else(|| event.payload.get("delta"))
+                        .and_then(Value::as_str)
+                    {
+                        agent.live.last_model_delta = Some(text.to_string());
+                    }
+                }
+                "model.thinking_delta" => {
+                    if let Some(text) = event
+                        .payload
+                        .get("text")
+                        .or_else(|| event.payload.get("delta"))
+                        .and_then(Value::as_str)
+                    {
+                        agent.live.last_model_thinking_delta = Some(text.to_string());
+                    }
+                }
+                "token_count" => {
+                    if let Some(info) = event.payload.get("info") {
+                        agent.live.last_token_usage = info.get("last_token_usage").cloned();
+                        agent.live.total_token_usage = info.get("total_token_usage").cloned();
+                        agent.live.model_context_window =
+                            info.get("model_context_window").and_then(Value::as_i64);
+                    }
+                }
+                "session.done" => {
+                    agent.live.final_result = event
+                        .payload
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    agent.live.failure = None;
+                    agent.live.active_items.clear();
+                }
+                "session.failed" | "stream_error" | "model.turn.error" => {
+                    agent.live.failure = event
+                        .payload
+                        .get("error")
+                        .or_else(|| event.payload.get("message"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    agent.live.active_items.clear();
+                }
+                _ => {}
+            }
+        }
+        if agent.live.final_result.is_none() {
+            agent.live.final_result = output.map(str::to_string);
+        }
+        if agent.live.failure.is_none() {
+            agent.live.failure = error.map(str::to_string);
+        }
+    }
+    let source_event_id = events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "agent.turn.completed"
+                    | "agent.turn.aborted"
+                    | "session.done"
+                    | "session.failed"
+                    | "session.cancelled"
+            )
+        })
+        .and_then(|event| {
+            event
+                .payload
+                .get("runtime_event_id")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            events.iter().rev().find_map(|event| {
+                event
+                    .payload
+                    .get("runtime_event_id")
+                    .and_then(Value::as_str)
+            })
+        })
+        .unwrap_or_else(|| session_id.as_str());
+    Ok(serde_json::json!({
+        "source_event_id": source_event_id,
+        "kind": if error.is_some() { "thread_status_changed" } else { "turn_completed" },
+        "session_id": session_id.as_str(),
+        "payload": {
+            "runtime_owned": true,
+            "source": "agent.run.final_projection",
+            "success": error.is_none(),
+            "result": output,
+            "error": error,
+        },
+        "snapshot": snapshot,
+    }))
+}
+
+fn sdk_agent_stop(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    let session_id = params
+        .get("session_id")
+        .or_else(|| params.get("agent_id"))
+        .or_else(|| params.get("run_id"))
+        .and_then(Value::as_str)
+        .context("agent.stop requires `session_id`, `agent_id`, or `run_id`")?;
+    let cancelled = context
+        .runtime
+        .cancel_run(&SessionId::from_string(session_id.to_string())?);
+    Ok(serde_json::json!({ "cancelled": cancelled }))
+}
+
+fn sdk_agent_close(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    let agent_id = AgentId::from_string(
+        params
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .context("agent.close requires string param `agent_id`")?
+            .to_string(),
+    )?;
+    context
+        .runtime
+        .close_agent(browser_use_runtime::CloseAgentRequest {
+            agent_id,
+            reason: "sdk close".to_string(),
+        })?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+fn sdk_provider_run_config(params: &Value, task: Option<&str>) -> Result<ProviderRunConfig> {
+    let llm = params.get("llm").unwrap_or(&Value::Null);
+    let provider = llm
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("openai");
+    let model = llm
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("gpt-5.5");
+    let backend = sdk_provider_backend(provider, model)?;
+    let provider_id = sdk_provider_id(provider, backend);
+    let mut options = AgentRunOptions::default()
+        .with_browser_mode(
+            params
+                .get("browser_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("local"),
+        )
+        .with_model_compaction(true)
+        .with_analytics_source("sdk")
+        .with_model_provider_id(provider_id.clone());
+    options.analytics_provider_kind = Some(provider_id);
+    options.analytics_model = Some(model.to_string());
+    if let Some(max_steps) = params
+        .get("max_steps")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+    {
+        options.max_turns = max_steps;
+    }
+    if let Some(schema) = params.get("output_schema").filter(|value| !value.is_null()) {
+        options = options.with_final_output_json_schema(schema.clone(), true);
+    }
+    if let Some(timeout) = llm.get("timeout").and_then(Value::as_u64) {
+        options.python_tool_timeout_seconds = timeout;
+    }
+
+    let mut config = ProviderRunConfig::new(backend, model).with_options(options);
+    if backend == ProviderBackend::Fake {
+        config = config.with_fake_result(fake_agent_result_text(task.unwrap_or("task"), None));
+    }
+    Ok(config)
+}
+
+fn sdk_provider_backend(provider: &str, model: &str) -> Result<ProviderBackend> {
+    if model.eq_ignore_ascii_case("fake") {
+        return Ok(ProviderBackend::Fake);
+    }
+    let normalized = provider.trim().to_ascii_lowercase();
+    if normalized == "browser-use" || normalized == "browser_use" {
+        return Ok(ProviderBackend::Openai);
+    }
+    ProviderBackend::from_provider_id(&normalized)
+        .filter(|backend| *backend != ProviderBackend::None)
+        .with_context(|| format!("unsupported SDK provider: {provider}"))
+}
+
+fn sdk_provider_id(provider: &str, backend: ProviderBackend) -> String {
+    let normalized = provider.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "openai" | "anthropic" | "openrouter" | "deepseek" | "codex" | "fake"
+    ) {
+        return normalized;
+    }
+    default_provider_id_for_backend(backend).to_string()
+}
+
+fn json_rpc_error(id: Option<Value>, code: i64, message: impl Into<String>) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into(),
+        },
+    })
+}
+
 fn trace(store: &Store, task_id: &str, output: Option<PathBuf>) -> Result<()> {
     let session = ensure_task_exists(store, task_id)?;
     let events = store.events_for_session(task_id)?;
@@ -3625,11 +4591,11 @@ fn spawn_agent(
     nickname: Option<String>,
     role: Option<String>,
 ) -> Result<()> {
-    let parent = ensure_task_exists(store, parent_id)?;
+    ensure_task_exists(store, parent_id)?;
     if task_name.is_some() && path.is_some() {
         bail!("spawn-agent accepts either --task-name or --path, not both");
     }
-    let agent_path = match (task_name.as_deref(), path.as_deref()) {
+    let requested_agent_path = match (task_name.as_deref(), path.as_deref()) {
         (Some(task_name), None) => {
             let parent_agent_path = display_agent_path_for_session(store, parent_id)?;
             Some(
@@ -3643,13 +4609,30 @@ fn spawn_agent(
     };
     let parent_events = store.events_for_session(parent_id)?;
     let inherited_context = sanitized_agent_context_from_events(&parent_events);
-    let child = store.create_child_session(
+    let Some(runtime_child) = spawn_agent_via_live_runtime(
+        store,
         parent_id,
-        Path::new(&parent.cwd),
-        agent_path.as_deref(),
+        &message,
+        task_name.as_deref(),
+        requested_agent_path.as_deref(),
         nickname.as_deref(),
         role.as_deref(),
-    )?;
+    )?
+    else {
+        bail!("spawn-agent requires a live runtime socket; Store-backed spawn is replay-only");
+    };
+    let child_session_id = runtime_child
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("local runtime spawn_child response missing session_id")?;
+    let agent_path = runtime_child
+        .get("agent_path")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or(requested_agent_path);
+    let child = store
+        .load_session(child_session_id)?
+        .with_context(|| format!("runtime did not create child session {child_session_id}"))?;
     store.append_event(
         &child.id,
         "agent.context",
@@ -3681,6 +4664,54 @@ fn spawn_agent(
     )?;
     println!("{}", child.id);
     Ok(())
+}
+
+fn spawn_agent_via_live_runtime(
+    store: &Store,
+    parent_id: &str,
+    message: &str,
+    task_name: Option<&str>,
+    requested_agent_path: Option<&str>,
+    nickname: Option<&str>,
+    role: Option<&str>,
+) -> Result<Option<Value>> {
+    let child_id = browser_use_store::new_thread_id();
+    let runtime_task_name = task_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            requested_agent_path
+                .and_then(|path| path.rsplit('/').find(|segment| !segment.trim().is_empty()))
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "agent".to_string());
+    let request = LocalRuntimeRequest::SpawnChild {
+        parent_agent_id: parent_id.to_string(),
+        child_agent_id: Some(child_id.clone()),
+        child_session_id: Some(child_id),
+        task_name: runtime_task_name,
+        message: message.to_string(),
+        nickname: nickname.map(ToOwned::to_owned),
+        role: role.map(ToOwned::to_owned),
+    };
+    let Some(response) =
+        send_local_runtime_request(store.state_dir(), &request, Duration::from_secs(5))?
+    else {
+        return Ok(None);
+    };
+    if !response.ok {
+        let error = response
+            .error
+            .unwrap_or_else(|| "local runtime spawn_child failed".to_string());
+        bail!(error);
+    }
+    let agent = response
+        .result
+        .get("agent")
+        .cloned()
+        .context("local runtime spawn_child response missing agent")?;
+    Ok(Some(agent))
 }
 
 fn list_agents(
@@ -3773,6 +4804,15 @@ fn close_agent(store: &Store, current_id: Option<&str>, target: &str, reason: &s
         .agent_summary_for_child(&child_id)?
         .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
     let previous_status = local_agent_status_value(store, &child, Some(&summary))?;
+    if close_agent_via_live_runtime(store, &child_id, reason)? {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "previous_status": previous_status,
+            }))?
+        );
+        return Ok(());
+    }
     cleanup_agent_runtime_state_for_agent_subtree(store, &child_id, |session_id| {
         cleanup_unified_exec_manager_for_session_id(session_id)
     })?;
@@ -3793,6 +4833,28 @@ fn close_agent(store: &Store, current_id: Option<&str>, target: &str, reason: &s
         }))?
     );
     Ok(())
+}
+
+fn close_agent_via_live_runtime(store: &Store, child_id: &str, reason: &str) -> Result<bool> {
+    let request = LocalRuntimeRequest::CloseAgent {
+        agent_id: child_id.to_string(),
+        reason: reason.to_string(),
+    };
+    let Some(response) =
+        send_local_runtime_request(store.state_dir(), &request, Duration::from_secs(5))?
+    else {
+        return Ok(false);
+    };
+    if response.ok {
+        return Ok(true);
+    }
+    let error = response
+        .error
+        .unwrap_or_else(|| "local runtime close_agent failed".to_string());
+    if error.contains("unknown agent") {
+        return Ok(false);
+    }
+    bail!(error);
 }
 
 fn resolve_close_agent_target(
@@ -3874,127 +4936,143 @@ fn send_agent_message(
     if trigger_turn && target.is_root {
         bail!("Tasks can't be assigned to the root agent");
     }
-    let msg = store.send_agent_message(author_id, &target.session_id, message, trigger_turn)?;
+    if let Some(message_id) =
+        send_agent_message_via_live_runtime(store, author_id, &target, message, trigger_turn)?
+    {
+        println!("{message_id}");
+        return Ok(());
+    }
+    bail!("send_agent_message requires a live runtime mailbox; Store-backed send is replay-only")
+}
+
+fn send_agent_message_via_live_runtime(
+    store: &Store,
+    author_id: &str,
+    target: &ResolvedAgentReference,
+    message: &str,
+    trigger_turn: bool,
+) -> Result<Option<String>> {
     let author_path = display_agent_path_for_session(store, author_id)?;
-    store.append_event(
-        author_id,
-        "agent.message",
-        serde_json::json!({
-            "id": msg.id,
-            "author_session_id": msg.author_session_id,
-            "target_session_id": msg.target_session_id,
+    let request = LocalRuntimeRequest::SendAgentMessage {
+        author_agent_id: author_id.to_string(),
+        target_agent_id: target.session_id.clone(),
+        content: message.to_string(),
+        trigger_turn,
+        kind: if trigger_turn {
+            RuntimeMailboxItemKind::Followup
+        } else {
+            RuntimeMailboxItemKind::Input
+        },
+        delivery_phase: RuntimeMailboxDeliveryPhase::NextTurn,
+        payload: serde_json::json!({
+            "source": "cli",
+            "author_session_id": author_id,
+            "target_session_id": target.session_id,
             "author_path": author_path,
-            "recipient_path": target.agent_path,
-            "child_session_id": target.session_id,
-            "content": msg.content,
-            "trigger_turn": msg.trigger_turn,
+            "target_path": target.agent_path,
         }),
-    )?;
-    println!("{}", msg.id);
-    Ok(())
+    };
+    let Some(response) =
+        send_local_runtime_request(store.state_dir(), &request, Duration::from_secs(5))?
+    else {
+        return Ok(None);
+    };
+    if !response.ok {
+        let error = response
+            .error
+            .unwrap_or_else(|| "local runtime send_agent_message failed".to_string());
+        if error.contains("unknown agent") {
+            return Ok(None);
+        }
+        bail!(error);
+    }
+    let message_id = response
+        .result
+        .get("mailbox_item")
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .context("local runtime send_agent_message response missing mailbox item id")?;
+    Ok(Some(message_id))
 }
 
 fn wait_agent(store: &Store, target_id: &str, targets: Vec<String>, timeout_ms: u64) -> Result<()> {
     let session = ensure_task_exists(store, target_id)?;
     if !targets.is_empty() {
-        return wait_agent_targets(store, &session.id, &targets, timeout_ms);
+        if let Some(invalid) = targets.iter().find(|target| !is_local_agent_id(target)) {
+            bail!("invalid agent id `{invalid}`");
+        }
+        if targets.len() > 1 {
+            bail!("runtime-backed wait-agent accepts at most one target; omit targets to wait for any child");
+        }
+        if wait_agent_via_live_runtime(
+            store,
+            &session.id,
+            Some(LocalRuntimeWaitTarget::AgentId(targets[0].clone())),
+            timeout_ms,
+        )? {
+            return Ok(());
+        }
+        bail!("wait-agent requires a live runtime socket; Store-backed wait is replay-only");
     }
-    store.append_event(
+    if wait_agent_via_live_runtime(
+        store,
         &session.id,
-        "agent.wait.started",
-        serde_json::json!({
-            "timeout_ms": timeout_ms,
-        }),
-    )?;
-    let started = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    let timed_out = loop {
-        if !store.messages_for_agent(target_id)?.is_empty() {
-            break false;
-        }
-        if started.elapsed() >= timeout {
-            break true;
-        }
-        std::thread::sleep(
-            Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())),
-        );
-    };
-    let waited_ms = started.elapsed().as_millis() as u64;
-    store.append_event(
-        &session.id,
-        "agent.wait.finished",
-        serde_json::json!({
-            "timed_out": timed_out,
-            "waited_ms": waited_ms,
-        }),
-    )?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "message": if timed_out { "Wait timed out." } else { "Wait completed." },
-            "timed_out": timed_out,
-        }))?
-    );
-    Ok(())
+        Some(LocalRuntimeWaitTarget::Any),
+        timeout_ms,
+    )? {
+        return Ok(());
+    }
+    bail!("wait-agent requires a live runtime socket; Store-backed wait is replay-only")
 }
 
-fn wait_agent_targets(
+fn wait_agent_via_live_runtime(
     store: &Store,
-    waiter_id: &str,
-    targets: &[String],
+    session_id: &str,
+    target: Option<LocalRuntimeWaitTarget>,
     timeout_ms: u64,
-) -> Result<()> {
-    if let Some(invalid) = targets.iter().find(|target| !is_local_agent_id(target)) {
-        bail!("invalid agent id `{invalid}`");
+) -> Result<bool> {
+    let request = LocalRuntimeRequest::WaitAgent {
+        parent_agent_id: session_id.to_string(),
+        target,
+        timeout_ms,
+    };
+    let Some(response) = send_local_runtime_request(
+        store.state_dir(),
+        &request,
+        Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(5)),
+    )?
+    else {
+        return Ok(false);
+    };
+    if !response.ok {
+        let error = response
+            .error
+            .unwrap_or_else(|| "local runtime wait_agent failed".to_string());
+        if error.contains("unknown agent") {
+            return Ok(false);
+        }
+        bail!(error);
     }
-    let target_refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
-    let timeout_ms = if timeout_ms == 0 {
-        0
+    let timed_out = response
+        .result
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let message = if timed_out {
+        "Wait timed out."
     } else {
-        timeout_ms.clamp(10_000, 3_600_000)
+        "Wait completed."
     };
-    store.append_event(
-        waiter_id,
-        "agent.wait.started",
-        serde_json::json!({
-            "targets": targets,
-            "timeout_ms": timeout_ms,
-        }),
-    )?;
-    let started = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    let statuses = loop {
-        let statuses = final_statuses_for_v1_wait(store, &target_refs)?;
-        if !statuses.is_empty() {
-            break statuses;
-        }
-        if started.elapsed() >= timeout {
-            break serde_json::Map::new();
-        }
-        std::thread::sleep(
-            Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())),
-        );
-    };
-    let timed_out = statuses.is_empty();
-    let waited_ms = started.elapsed().as_millis() as u64;
-    store.append_event(
-        waiter_id,
-        "agent.wait.finished",
-        serde_json::json!({
-            "targets": targets,
-            "timed_out": timed_out,
-            "waited_ms": waited_ms,
-            "status": statuses,
-        }),
-    )?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "status": statuses,
+            "message": message,
             "timed_out": timed_out,
+            "mailbox_item": response.result.get("mailbox_item").cloned().unwrap_or(Value::Null),
         }))?
     );
-    Ok(())
+    Ok(true)
 }
 
 fn dataset_list() -> Result<()> {
@@ -4505,6 +5583,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
     Ok(result)
 }
 
+#[cfg(test)]
 fn cleanup_dataset_browser_session(store: &Store, session_id: &str) -> Result<usize> {
     let removed_sessions = browser_use_browser::cleanup_session(session_id);
     store.append_event(
@@ -5646,9 +6725,22 @@ command = "test-mcp"
             event_type: "session.cancelled".to_string(),
             payload: serde_json::json!({"reason": "interrupt requested"}),
         }];
-        let ok_result: Result<Option<String>> = Ok(Some("partial".to_string()));
+        assert!(
+            cli_child_completion_from_background(true, None, Some(&interrupted_events)).is_none()
+        );
 
-        assert!(cli_child_completion_from_result(&ok_result, Some(&interrupted_events)).is_none());
+        let cancelled_events = vec![browser_use_protocol::EventRecord {
+            seq: 1,
+            id: "cancelled".to_string(),
+            session_id: "child".to_string(),
+            ts_ms: 0,
+            event_type: "session.cancelled".to_string(),
+            payload: serde_json::json!({"reason": "cancelled by user", "runtime_owned": true}),
+        }];
+        assert!(
+            cli_child_completion_from_background(true, None, Some(&cancelled_events)).is_none(),
+            "clean cancellation unwind must not notify the parent as child success"
+        );
 
         let done_events = vec![browser_use_protocol::EventRecord {
             seq: 1,
@@ -5658,10 +6750,10 @@ command = "test-mcp"
             event_type: "session.done".to_string(),
             payload: serde_json::json!({"result": "finished"}),
         }];
-        let completion = cli_child_completion_from_result(&ok_result, Some(&done_events))
+        let completion = cli_child_completion_from_background(true, None, Some(&done_events))
             .expect("non-interrupted run should notify");
         assert!(completion.success);
-        assert_eq!(completion.summary.as_deref(), Some("partial"));
+        assert_eq!(completion.summary.as_deref(), Some("finished"));
 
         let resumed_done_events = vec![
             browser_use_protocol::EventRecord {
@@ -5689,26 +6781,37 @@ command = "test-mcp"
                 payload: serde_json::json!({"result": "finished after resume"}),
             },
         ];
-        let completion = cli_child_completion_from_result(&ok_result, Some(&resumed_done_events))
-            .expect("resumed completion should clear earlier interruption");
+        let completion =
+            cli_child_completion_from_background(true, None, Some(&resumed_done_events))
+                .expect("resumed completion should clear earlier interruption");
         assert!(completion.success);
-        assert_eq!(completion.summary.as_deref(), Some("partial"));
+        assert_eq!(completion.summary.as_deref(), Some("finished after resume"));
 
-        let error_result: Result<Option<String>> = Err(anyhow::anyhow!("boom"));
-        let completion = cli_child_completion_from_result(&error_result, Some(&interrupted_events))
-            .expect("run errors should still notify failure");
+        let completion = cli_child_completion_from_background(
+            false,
+            Some("boom".to_string()),
+            Some(&interrupted_events),
+        )
+        .expect("run errors should still notify failure");
         assert!(!completion.success);
         assert!(completion.summary.unwrap_or_default().contains("boom"));
     }
 
     #[test]
-    fn cli_child_runner_request_creates_store_child_session() -> Result<()> {
+    fn cli_child_runner_request_creates_runtime_backed_store_child_session() -> Result<()> {
         let temp = unique_cli_test_dir("child-runner-session")?;
         let state_dir = temp.join("state");
         let cwd = temp.join("cwd");
         std::fs::create_dir_all(&cwd)?;
         let store = Store::open(&state_dir)?;
         let parent = store.create_session(None, &cwd)?;
+        let runtime = cli_runtime_handle(&store)?;
+        ensure_cli_agent_attached(
+            &runtime,
+            &store,
+            &parent.id,
+            browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        )?;
         let request = ChildAgentRunRequest {
             parent_session_id: parent.id.clone(),
             child_session_id: "00000000abcd".to_string(),
@@ -5730,11 +6833,15 @@ command = "test-mcp"
             completion_handler: None,
         };
 
-        let child = create_agent_child_session_from_request(&store, &request)?;
+        let child = create_agent_child_session_from_request(&runtime, &store, &request)?;
         record_child_run_marker_from_request(&store, &child.id, &request)?;
 
         assert_eq!(child.id, "00000000abcd");
         assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+        assert!(runtime
+            .agents()
+            .thread(&AgentId::from_string(child.id.clone())?)
+            .is_ok());
         let child_events = store.events_for_session(&child.id)?;
         assert!(child_events
             .iter()
@@ -5763,6 +6870,198 @@ command = "test-mcp"
             .iter()
             .any(|event| event.event_type == "agent.spawned"
                 && event.payload["child_session_id"] == child.id));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_ping_and_create_methods_use_runtime() -> Result<()> {
+        let temp = unique_cli_test_dir("sdk-json-rpc")?;
+        let context = SdkServerContext::memory()?;
+
+        let ping = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":1,"method":"runtime.ping","params":{}}"#,
+        );
+        assert_eq!(ping["result"]["ok"], true);
+        let snapshot = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":10,"method":"runtime.snapshot","params":{}}"#,
+        );
+        assert_eq!(
+            snapshot["result"]["agents"].as_array().map(Vec::len),
+            Some(0)
+        );
+
+        let browser = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":2,"method":"browser.create","params":{"headless":true,"keep_alive":true}}"#,
+        );
+        let browser_id = browser["result"]["browser_id"]
+            .as_str()
+            .context("browser id")?;
+        assert_eq!(context.runtime.browsers().snapshots().len(), 1);
+
+        let close = handle_sdk_json_rpc_line(
+            &context,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "browser.close",
+                "params": { "browser_id": browser_id }
+            })
+            .to_string(),
+        );
+        assert_eq!(close["result"]["ok"], true);
+        assert!(context.runtime.browsers().snapshots().is_empty());
+
+        let agent = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
+        );
+        assert!(agent["result"]["agent_id"].as_str().is_some());
+        assert_eq!(context.runtime.snapshot().agents.len(), 1);
+        let agent_id = agent["result"]["agent_id"].as_str().context("agent id")?;
+        let session_id = agent["result"]["session_id"]
+            .as_str()
+            .context("session id")?;
+        let agent_snapshot = handle_sdk_json_rpc_line(
+            &context,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "agent.snapshot",
+                "params": { "agent_id": agent_id }
+            })
+            .to_string(),
+        );
+        assert_eq!(agent_snapshot["result"]["agent_id"], agent_id);
+        let session_snapshot = handle_sdk_json_rpc_line(
+            &context,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "agent.snapshot",
+                "params": { "session_id": session_id }
+            })
+            .to_string(),
+        );
+        assert_eq!(session_snapshot["result"]["session_id"], session_id);
+        let events = context
+            .runtime
+            .events_for_session(&SessionId::from_string(session_id.to_string())?)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.input"));
+        assert!(
+            !temp.join("state.db").exists(),
+            "SDK memory context must not create a SQLite database"
+        );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_reports_protocol_errors() -> Result<()> {
+        let temp = unique_cli_test_dir("sdk-json-rpc-errors")?;
+        let context = SdkServerContext::memory()?;
+
+        let parse = handle_sdk_json_rpc_line(&context, "{not-json");
+        assert_eq!(parse["error"]["code"], -32700);
+
+        let missing = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":4,"method":"missing.method","params":{}}"#,
+        );
+        assert_eq!(missing["error"]["code"], -32601);
+        assert!(
+            !temp.join("state.db").exists(),
+            "SDK memory context must not create a SQLite database"
+        );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_agent_run_executes_fake_backend() -> Result<()> {
+        let temp = unique_cli_test_dir("sdk-json-rpc-run-fake")?;
+        let context = SdkServerContext::memory()?;
+        let agent = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
+        );
+        let browser = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":20,"method":"browser.create","params":{"headless":true}}"#,
+        );
+        let browser_id = browser["result"]["browser_id"]
+            .as_str()
+            .context("browser id")?;
+        let agent_id = agent["result"]["agent_id"].as_str().context("agent id")?;
+        let session_id = agent["result"]
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("session id")?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "agent.run",
+            "params": {
+                "agent_id": agent_id,
+                "browser_id": browser_id,
+                "max_steps": 2,
+                "llm": {"provider": "fake", "model": "fake"},
+                "followups": ["extract title next"]
+            }
+        });
+
+        let result = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        assert_eq!(result["result"]["history"]["success"], true);
+        assert_eq!(
+            result["result"]["history"]["output"],
+            serde_json::Value::String("Fake result for: inspect".to_string())
+        );
+        assert_eq!(
+            result["result"]["final_projected_event"]["kind"],
+            serde_json::Value::String("turn_completed".to_string())
+        );
+        assert_eq!(
+            result["result"]["final_projected_event"]["snapshot"]["agents"][0]["live"]
+                ["final_result"],
+            serde_json::Value::String("Fake result for: inspect".to_string())
+        );
+        let events = context
+            .runtime
+            .events_for_session(&SessionId::from_string(session_id.to_string())?)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "mailbox.enqueued"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "mailbox.delivered"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "mailbox.consumed"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.followup.runtime_queued"));
+        assert!(
+            !temp.join("state.db").exists(),
+            "SDK memory runs must not create Store-backed agent_messages or SQLite state"
+        );
+        let browser_snapshot = context
+            .runtime
+            .browsers()
+            .snapshot(&BrowserId::from_string(browser_id.to_string())?)?;
+        assert_eq!(browser_snapshot.active_agent_id, None);
+        assert_eq!(
+            browser_snapshot.status,
+            browser_use_runtime::BrowserStatus::Released
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -5916,6 +7215,8 @@ command = "test-mcp"
         std::fs::create_dir_all(&parent_cwd)?;
         let store = Store::open(&state_dir)?;
         let parent = store.create_session(None, &parent_cwd)?;
+        let (_runtime, socket_path) =
+            start_runtime_socket_for_parent(&state_dir, &parent, &parent_cwd, 3)?;
 
         spawn_agent(
             &store,
@@ -5962,6 +7263,36 @@ command = "test-mcp"
         assert!(err
             .to_string()
             .contains("either --task-name or --path, not both"));
+
+        let _ = std::fs::remove_file(socket_path);
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_spawn_agent_requires_live_runtime_socket() -> Result<()> {
+        let temp = unique_cli_test_dir("spawn-agent-no-runtime")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+
+        let err = spawn_agent(
+            &store,
+            &parent.id,
+            "inspect from cli".to_string(),
+            Some("cli_child".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect_err("Store-backed CLI spawn must not be a live path");
+        assert!(
+            err.to_string().contains("requires a live runtime socket"),
+            "{err}"
+        );
+        assert!(store.list_child_agents(&parent.id)?.is_empty());
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -6032,6 +7363,8 @@ command = "test-mcp"
         std::fs::create_dir_all(&parent_cwd)?;
         let store = Store::open(&state_dir)?;
         let parent = store.create_session(None, &parent_cwd)?;
+        let (_runtime, socket_path) =
+            start_runtime_socket_for_parent(&state_dir, &parent, &parent_cwd, 3)?;
 
         spawn_agent(
             &store,
@@ -6063,6 +7396,7 @@ command = "test-mcp"
             .iter()
             .any(|part| part["text"].as_str().unwrap_or_default().contains("app://")));
 
+        let _ = std::fs::remove_file(socket_path);
         std::fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -6088,19 +7422,20 @@ command = "test-mcp"
         assert!(err
             .to_string()
             .contains("Empty message can't be sent to an agent"));
-        send_agent_message(&store, &parent.id, "cli_child", "inspect this", false)?;
-
+        let err = send_agent_message(&store, &parent.id, "cli_child", "inspect this", false)
+            .expect_err("Store-backed CLI send should fail without live runtime");
+        assert!(err
+            .to_string()
+            .contains("send_agent_message requires a live runtime mailbox"));
         let mail = store.messages_for_agent(&child.id)?;
-        assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].content, "inspect this");
+        assert!(
+            mail.is_empty(),
+            "offline CLI send must not enqueue Store-backed agent_messages rows"
+        );
         let parent_events = store.events_for_session(&parent.id)?;
-        let message_event = parent_events
+        assert!(parent_events
             .iter()
-            .find(|event| event.event_type == "agent.message")
-            .context("agent.message")?;
-        assert_eq!(message_event.payload["author_path"], "/root");
-        assert_eq!(message_event.payload["recipient_path"], "/root/cli_child");
-        assert_eq!(message_event.payload["child_session_id"], child.id);
+            .all(|event| event.event_type != "agent.message"));
 
         let err = send_agent_message(&store, &child.id, "root", "new task", true)
             .expect_err("root trigger turns should fail");
@@ -6113,7 +7448,113 @@ command = "test-mcp"
     }
 
     #[test]
-    fn cli_wait_agent_records_wait_events_without_dumping_mail() -> Result<()> {
+    fn cli_agent_message_uses_live_runtime_socket_when_available() -> Result<()> {
+        let temp = unique_cli_test_dir("agent-message-live-runtime")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/live_child"),
+            Some("LiveChild"),
+            Some("worker"),
+        )?;
+
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(&state_dir)?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime.attach_root_agent(AttachRootAgentRequest {
+            session_id: SessionId::from_string(parent.id.clone())?,
+            cwd: parent_cwd.clone(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        runtime.attach_child_agent(AttachChildAgentRequest {
+            parent_agent_id: AgentId::from_string(parent.id.clone())?,
+            child_agent_id: AgentId::from_string(child.id.clone())?,
+            child_session_id: SessionId::from_string(child.id.clone())?,
+            cwd: parent_cwd.clone(),
+            agent_path: "/root/live_child".to_string(),
+            nickname: Some("LiveChild".to_string()),
+            role: Some("worker".to_string()),
+        })?;
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(&state_dir, runtime.clone())?;
+
+        send_agent_message(&store, &parent.id, "live_child", "inspect live", false)?;
+
+        assert!(
+            store.messages_for_agent(&child.id)?.is_empty(),
+            "live runtime socket path must not enqueue store-backed agent_messages rows"
+        );
+        let pending =
+            runtime.pending_agent_mail_for_session(&SessionId::from_string(child.id.clone())?)?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content, "inspect live");
+        let child_events = store.events_for_session(&child.id)?;
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "mailbox.enqueued"));
+
+        let _ = std::fs::remove_file(socket_path);
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_followup_uses_live_runtime_socket_when_available() -> Result<()> {
+        let temp = unique_cli_test_dir("followup-live-runtime")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(&state_dir)?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime.attach_root_agent(AttachRootAgentRequest {
+            session_id: SessionId::from_string(parent.id.clone())?,
+            cwd: parent_cwd.clone(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(&state_dir, runtime.clone())?;
+
+        followup(&store, &parent.id, "live followup".to_string())?;
+
+        let pending =
+            runtime.pending_agent_mail_for_session(&SessionId::from_string(parent.id.clone())?)?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, RuntimeMailboxItemKind::Followup);
+        assert_eq!(pending[0].content, "live followup");
+        let events = store.events_for_session(&parent.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "mailbox.enqueued"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.followup.runtime_queued"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == "session.followup"),
+            "live followup should be journaled only when runtime consumes the mailbox item"
+        );
+
+        let _ = std::fs::remove_file(socket_path);
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_wait_agent_requires_live_runtime_socket() -> Result<()> {
         let temp = unique_cli_test_dir("wait-agent-events")?;
         let state_dir = temp.join("state");
         let parent_cwd = temp.join("parent");
@@ -6121,15 +7562,57 @@ command = "test-mcp"
         let store = Store::open(&state_dir)?;
         let parent = store.create_session(None, &parent_cwd)?;
 
-        wait_agent(&store, &parent.id, Vec::new(), 0)?;
+        let err = wait_agent(&store, &parent.id, Vec::new(), 0)
+            .expect_err("Store-backed wait must not be a live CLI wait path");
+        assert!(
+            err.to_string().contains("requires a live runtime socket"),
+            "{err}"
+        );
+        let events = store.events_for_session(&parent.id)?;
+        assert!(events.iter().all(|event| {
+            event.event_type != "agent.wait.started"
+                && event.event_type != "agent.wait.finished"
+                && event.event_type != "wait_agent.started"
+                && event.event_type != "wait_agent.timed_out"
+        }));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_child_completion_queues_mail_for_done_parent() -> Result<()> {
+        let temp = unique_cli_test_dir("done-parent-completion-mail")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+        store.set_status(&parent.id, browser_use_protocol::SessionStatus::Done)?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "cli late result"}),
+        )?;
+        store.set_status(&child.id, browser_use_protocol::SessionStatus::Done)?;
+
+        update_parent_from_child_run(&store, &parent.id, &child.id, None, None)?;
+
         let events = store.events_for_session(&parent.id)?;
         assert!(events
             .iter()
-            .any(|event| event.event_type == "agent.wait.started"));
-        assert!(events.iter().any(|event| {
-            event.event_type == "agent.wait.finished"
-                && event.payload["timed_out"].as_bool() == Some(true)
-        }));
+            .any(|event| event.event_type == "agent.completed"));
+        assert!(
+            store.messages_for_agent(&parent.id)?.is_empty(),
+            "CLI parent projection must not enqueue Store-backed mailbox rows"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -6216,6 +7699,78 @@ command = "test-mcp"
     }
 
     #[test]
+    fn cli_close_agent_uses_live_runtime_socket_when_available() -> Result<()> {
+        let temp = unique_cli_test_dir("close-agent-live-runtime")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/live_child"),
+            Some("LiveChild"),
+            Some("worker"),
+        )?;
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(&state_dir)?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime.attach_root_agent(AttachRootAgentRequest {
+            session_id: SessionId::from_string(parent.id.clone())?,
+            cwd: parent_cwd.clone(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        runtime.attach_child_agent(AttachChildAgentRequest {
+            parent_agent_id: AgentId::from_string(parent.id.clone())?,
+            child_agent_id: AgentId::from_string(child.id.clone())?,
+            child_session_id: SessionId::from_string(child.id.clone())?,
+            cwd: parent_cwd.clone(),
+            agent_path: "/root/live_child".to_string(),
+            nickname: Some("LiveChild".to_string()),
+            role: Some("worker".to_string()),
+        })?;
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(&state_dir, runtime.clone())?;
+
+        close_agent(
+            &store,
+            Some(&parent.id),
+            "live_child",
+            "done with live child",
+        )?;
+
+        assert_eq!(
+            store.agent_summary_for_child(&child.id)?.unwrap().status,
+            "closed"
+        );
+        assert_eq!(
+            store.load_session(&child.id)?.unwrap().status,
+            browser_use_protocol::SessionStatus::Cancelled
+        );
+        let child_events = store.events_for_session(&child.id)?;
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "agent.closed"));
+        let parent_events = store.events_for_session(&parent.id)?;
+        let cancelled = parent_events
+            .iter()
+            .find(|event| event.event_type == "agent.cancelled")
+            .context("agent.cancelled")?;
+        assert_eq!(cancelled.payload["child_session_id"], child.id);
+        assert_eq!(
+            cancelled.payload["payload"]["reason"].as_str(),
+            Some("done with live child")
+        );
+
+        let _ = std::fs::remove_file(socket_path);
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn cli_resume_agent_reopens_closed_subtree_like_v1() -> Result<()> {
         let temp = unique_cli_test_dir("resume-agent")?;
         let state_dir = temp.join("state");
@@ -6288,7 +7843,149 @@ command = "test-mcp"
     }
 
     #[test]
-    fn cli_wait_agent_targets_returns_final_statuses_like_v1() -> Result<()> {
+    fn cli_wait_agent_uses_live_runtime_socket_when_available() -> Result<()> {
+        let temp = unique_cli_test_dir("wait-agent-live-runtime")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/live_child"),
+            Some("LiveChild"),
+            Some("worker"),
+        )?;
+
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(&state_dir)?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime.attach_root_agent(AttachRootAgentRequest {
+            session_id: SessionId::from_string(parent.id.clone())?,
+            cwd: parent_cwd.clone(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        runtime.attach_child_agent(AttachChildAgentRequest {
+            parent_agent_id: AgentId::from_string(parent.id.clone())?,
+            child_agent_id: AgentId::from_string(child.id.clone())?,
+            child_session_id: SessionId::from_string(child.id.clone())?,
+            cwd: parent_cwd.clone(),
+            agent_path: "/root/live_child".to_string(),
+            nickname: Some("LiveChild".to_string()),
+            role: Some("worker".to_string()),
+        })?;
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(&state_dir, runtime.clone())?;
+        runtime.send_agent_message(browser_use_runtime::SendAgentMessageRequest {
+            author_agent_id: AgentId::from_string(child.id.clone())?,
+            target_agent_id: AgentId::from_string(parent.id.clone())?,
+            content: "child finished".to_string(),
+            trigger_turn: false,
+            kind: RuntimeMailboxItemKind::Completion,
+            delivery_phase: RuntimeMailboxDeliveryPhase::NextTurn,
+            payload: serde_json::json!({"source": "test"}),
+        })?;
+
+        wait_agent(&store, &parent.id, Vec::new(), 50)?;
+
+        assert!(
+            store.messages_for_agent(&parent.id)?.is_empty(),
+            "live runtime wait path must not depend on store-backed agent_messages rows"
+        );
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events
+            .iter()
+            .any(|event| event.event_type == "wait_agent.completed"));
+        assert!(!parent_events
+            .iter()
+            .any(|event| event.event_type == "agent.wait.finished"));
+
+        let _ = std::fs::remove_file(socket_path);
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_runtime_server_guard_exposes_runtime_socket_for_run_process() -> Result<()> {
+        let temp = unique_cli_test_dir("run-runtime-socket")?;
+        let state_dir = temp.join("state");
+        let cwd = temp.join("work");
+        std::fs::create_dir_all(&cwd)?;
+        let store = Store::open(&state_dir)?;
+        let _session = store.create_session(None, &cwd)?;
+        let runtime = cli_runtime_handle(&store)?;
+        let socket_path = browser_use_runtime::local_runtime_socket_path(&state_dir);
+        assert!(!socket_path.exists());
+
+        let guard = CliLocalRuntimeServer::ensure(&store, &runtime)?;
+        let response = send_local_runtime_request(
+            &state_dir,
+            &LocalRuntimeRequest::Ping,
+            Duration::from_millis(500),
+        )?;
+        assert!(response.is_some_and(|response| response.ok));
+        assert!(socket_path.exists());
+
+        drop(guard);
+        assert!(
+            !socket_path.exists(),
+            "run-owned local runtime socket should be removed when the run bridge drops"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_cancel_uses_live_runtime_socket_when_available() -> Result<()> {
+        let temp = unique_cli_test_dir("cancel-live-runtime")?;
+        let state_dir = temp.join("state");
+        let cwd = temp.join("work");
+        std::fs::create_dir_all(&cwd)?;
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, &cwd)?;
+
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(&state_dir)?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime.attach_root_agent(AttachRootAgentRequest {
+            session_id: SessionId::from_string(session.id.clone())?,
+            cwd: cwd.clone(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let token = runtime.register_run(SessionId::from_string(session.id.clone())?);
+        let socket_path = browser_use_runtime::spawn_local_runtime_server(&state_dir, runtime)?;
+
+        cancel(&store, &session.id, "test cancel")?;
+
+        assert!(
+            token.is_cancelled(),
+            "CLI cancel must cancel the live runtime token"
+        );
+        let events = store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent.cancel_requested"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "runtime.cancel.forwarded"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "session.cancel_requested"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "session.cancelled"));
+
+        let _ = std::fs::remove_file(socket_path);
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_wait_agent_target_uses_live_runtime_socket() -> Result<()> {
         let temp = unique_cli_test_dir("wait-agent-targets")?;
         let state_dir = temp.join("state");
         let parent_cwd = temp.join("parent");
@@ -6302,35 +7999,60 @@ command = "test-mcp"
             Some("CliNick"),
             Some("worker"),
         )?;
-        store.append_event(
-            &child.id,
-            "session.done",
-            serde_json::json!({"result": "complete"}),
-        )?;
+
+        let err = wait_agent(&store, &parent.id, vec!["not_an_id".to_string()], 0)
+            .expect_err("invalid target id should fail before runtime lookup");
+        assert!(err.to_string().contains("invalid agent id `not_an_id`"));
+
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(&state_dir)?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime.attach_root_agent(AttachRootAgentRequest {
+            session_id: SessionId::from_string(parent.id.clone())?,
+            cwd: parent_cwd.clone(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        runtime.attach_child_agent(AttachChildAgentRequest {
+            parent_agent_id: AgentId::from_string(parent.id.clone())?,
+            child_agent_id: AgentId::from_string(child.id.clone())?,
+            child_session_id: SessionId::from_string(child.id.clone())?,
+            cwd: parent_cwd.clone(),
+            agent_path: "/root/cli_child".to_string(),
+            nickname: Some("CliNick".to_string()),
+            role: Some("worker".to_string()),
+        })?;
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(&state_dir, runtime.clone())?;
+        runtime.send_agent_message(browser_use_runtime::SendAgentMessageRequest {
+            author_agent_id: AgentId::from_string(child.id.clone())?,
+            target_agent_id: AgentId::from_string(parent.id.clone())?,
+            content: "child finished".to_string(),
+            trigger_turn: false,
+            kind: RuntimeMailboxItemKind::Completion,
+            delivery_phase: RuntimeMailboxDeliveryPhase::NextTurn,
+            payload: serde_json::json!({"source": "test", "result": "complete", "success": true, "agent_path": "/root/cli_child"}),
+        })?;
 
         wait_agent(&store, &parent.id, vec![child.id.clone()], 0)?;
 
         let events = store.events_for_session(&parent.id)?;
-        let finished = events
+        assert!(events
             .iter()
-            .rev()
-            .find(|event| event.event_type == "agent.wait.finished")
-            .context("agent.wait.finished")?;
-        assert_eq!(finished.payload["timed_out"], false);
-        assert_eq!(
-            finished.payload["status"]["/root/cli_child"]["completed"],
-            "complete"
-        );
-        let err = wait_agent(&store, &parent.id, vec!["not_an_id".to_string()], 0)
-            .expect_err("invalid target id should fail");
-        assert!(err.to_string().contains("invalid agent id `not_an_id`"));
+            .any(|event| event.event_type == "wait_agent.completed"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "agent.wait.finished"));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
 
+        let _ = std::fs::remove_file(socket_path);
         std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[test]
-    fn cli_child_terminal_status_queues_parent_subagent_notification_like_core() -> Result<()> {
+    fn cli_child_terminal_status_projects_parent_without_store_mail() -> Result<()> {
         let temp = unique_cli_test_dir("child-notification")?;
         let state_dir = temp.join("state");
         let parent_cwd = temp.join("parent");
@@ -6365,16 +8087,10 @@ command = "test-mcp"
         assert_eq!(completed.payload["payload"]["child_session_id"], child.id);
         assert_eq!(completed.payload["payload"]["status"], "done");
         assert_eq!(completed.payload["payload"]["result"], "done");
-        let mail = store.messages_for_agent(&parent.id)?;
-        assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].author_session_id, child.id);
-        assert_eq!(mail[0].target_session_id, parent.id);
-        assert!(!mail[0].trigger_turn);
-        assert!(mail[0].content.contains("<subagent_notification>"));
-        assert!(mail[0]
-            .content
-            .contains("\"agent_path\":\"/root/cli_child\""));
-        assert!(mail[0].content.contains("\"completed\":\"done\""));
+        assert!(
+            store.messages_for_agent(&parent.id)?.is_empty(),
+            "CLI parent projection must not enqueue Store-backed mailbox rows"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -6425,7 +8141,7 @@ command = "test-mcp"
     }
 
     #[test]
-    fn cli_child_terminal_status_queues_parent_notification_once() -> Result<()> {
+    fn cli_child_terminal_status_projects_parent_once_without_store_mail() -> Result<()> {
         let temp = unique_cli_test_dir("child-notification-once")?;
         let state_dir = temp.join("state");
         let parent_cwd = temp.join("parent");
@@ -6462,9 +8178,10 @@ command = "test-mcp"
                 .count(),
             1
         );
-        let mail = store.messages_for_agent(&parent.id)?;
-        assert_eq!(mail.len(), 1);
-        assert!(mail[0].content.contains("done once"));
+        assert!(
+            store.messages_for_agent(&parent.id)?.is_empty(),
+            "CLI parent projection must not enqueue Store-backed mailbox rows"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -6529,9 +8246,10 @@ command = "test-mcp"
                 .count(),
             1
         );
-        assert!(store.messages_for_agent(&parent.id)?[0]
-            .content
-            .contains("new completion"));
+        assert!(
+            store.messages_for_agent(&parent.id)?.is_empty(),
+            "CLI parent projection must not enqueue Store-backed mailbox rows"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -6706,5 +8424,26 @@ command = "test-mcp"
         ));
         std::fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    fn start_runtime_socket_for_parent(
+        state_dir: &std::path::Path,
+        parent: &browser_use_protocol::SessionMeta,
+        parent_cwd: &std::path::Path,
+        max_concurrent_threads_per_session: usize,
+    ) -> Result<(RuntimeHandle, std::path::PathBuf)> {
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(state_dir)?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime.attach_root_agent(AttachRootAgentRequest {
+            session_id: SessionId::from_string(parent.id.clone())?,
+            cwd: parent_cwd.to_path_buf(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session,
+        })?;
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(state_dir, runtime.clone())?;
+        Ok((runtime, socket_path))
     }
 }
