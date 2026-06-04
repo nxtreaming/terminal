@@ -299,6 +299,7 @@ struct BrowserScriptDelta {
 #[derive(Clone, Default)]
 pub struct BrowserSessionRegistry {
     sessions: Arc<Mutex<HashMap<String, BrowserSession>>>,
+    checked_out_statuses: Arc<Mutex<HashMap<String, Value>>>,
     captures: Arc<Mutex<HashMap<String, SessionCaptureHandle>>>,
 }
 
@@ -306,6 +307,10 @@ impl std::fmt::Debug for BrowserSessionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrowserSessionRegistry")
             .field("active_session_count", &self.active_session_count())
+            .field(
+                "checked_out_session_count",
+                &self.checked_out_session_count(),
+            )
             .field("active_capture_count", &self.active_capture_count())
             .finish()
     }
@@ -327,6 +332,13 @@ impl BrowserSessionRegistry {
             .len()
     }
 
+    pub fn checked_out_session_count(&self) -> usize {
+        self.checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .len()
+    }
+
     pub fn active_capture_count(&self) -> usize {
         self.captures
             .lock()
@@ -335,10 +347,59 @@ impl BrowserSessionRegistry {
     }
 
     pub fn contains_session(&self, session_id: &str) -> bool {
-        self.sessions
+        if self
+            .sessions
             .lock()
             .expect("browser session registry poisoned")
             .contains_key(session_id)
+        {
+            return true;
+        }
+        self.checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .contains_key(session_id)
+    }
+
+    fn checked_out_status_json(&self, session_id: &str) -> Option<Value> {
+        let mut status = self
+            .checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .get(session_id)
+            .cloned()?;
+        if let Some(object) = status.as_object_mut() {
+            object.insert("busy".to_string(), Value::Bool(true));
+        }
+        Some(status)
+    }
+
+    fn checkout_session(&self, session_id: &str) -> Result<BrowserSession> {
+        let session = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("browser session registry poisoned");
+            sessions.remove(session_id).ok_or_else(|| {
+                anyhow!("browser is not connected or is busy; run `browser status --json`")
+            })?
+        };
+        self.checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .insert(session_id.to_string(), session.status_json());
+        Ok(session)
+    }
+
+    fn return_session(&self, session_id: &str, session: BrowserSession) {
+        self.sessions
+            .lock()
+            .expect("browser session registry poisoned")
+            .insert(session_id.to_string(), session);
+        self.checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .remove(session_id);
     }
 }
 
@@ -479,6 +540,9 @@ pub fn run_browser_command_with_options_and_registries(
     }
 
     if argv.first().map(String::as_str) == Some("script") {
+        if session_registry
+            .checked_out_status_json(session_id)
+            .is_none()
         {
             let mut sessions = session_registry
                 .sessions
@@ -498,6 +562,19 @@ pub fn run_browser_command_with_options_and_registries(
             .map(BrowserSession::browser_events)
             .unwrap_or_default();
         return Ok(BrowserCommandOutput { events, content });
+    }
+
+    if let Some(content) = session_registry.checked_out_status_json(session_id) {
+        if argv.first().map(String::as_str) == Some("status") {
+            return Ok(BrowserCommandOutput {
+                events: Vec::new(),
+                content,
+            });
+        }
+        bail!(
+            "browser session is busy with an active browser_script; observe or cancel that script before running browser {}",
+            argv.join(" ")
+        );
     }
 
     let mut sessions = session_registry
@@ -1559,6 +1636,11 @@ pub fn cleanup_session_with_registries(
 ) -> usize {
     cancel_browser_script_runs_for_session(session_id, script_registry);
     stop_session_capture_with_registry(session_id, session_registry);
+    session_registry
+        .checked_out_statuses
+        .lock()
+        .expect("browser checked-out session registry poisoned")
+        .remove(session_id);
     let session = {
         let mut sessions = session_registry
             .sessions
@@ -5294,22 +5376,10 @@ fn bridge_request(
         }
     }
 
-    let mut session = {
-        let mut sessions = session_registry
-            .sessions
-            .lock()
-            .expect("browser session registry poisoned");
-        sessions.remove(session_id).ok_or_else(|| {
-            anyhow!("browser is not connected or is busy; run `browser status --json`")
-        })?
-    };
+    let mut session = session_registry.checkout_session(session_id)?;
     session.session_id = Some(session_id.to_string());
     let result = bridge_request_with_session(&mut session, request);
-    session_registry
-        .sessions
-        .lock()
-        .expect("browser session registry poisoned")
-        .insert(session_id.to_string(), session);
+    session_registry.return_session(session_id, session);
     result
 }
 
@@ -7658,6 +7728,79 @@ mod tests {
             })),
             "browser.reconnected"
         );
+    }
+
+    #[test]
+    fn browser_status_uses_checked_out_session_snapshot_instead_of_defaulting() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = BrowserSessionRegistry::new();
+        let script_registry = BrowserScriptRunRegistry::new();
+        let session_id = "checked-out-status";
+        {
+            let mut session = BrowserSession {
+                session_id: Some(session_id.to_string()),
+                mode: BrowserMode::Local,
+                owner: BrowserOwner::External,
+                endpoint: Some(Endpoint {
+                    kind: "devtools-active-port".to_string(),
+                    http_url: Some("http://127.0.0.1:9222".to_string()),
+                    ws_url: "ws://127.0.0.1:9222/devtools/browser/example".to_string(),
+                    candidate_id: Some("local-1".to_string()),
+                }),
+                browser_name: Some("Google Chrome".to_string()),
+                profile: Some("/tmp/chrome-profile".to_string()),
+                current_target_id: Some("target-1".to_string()),
+                current_session_id: Some("session-1".to_string()),
+                ..Default::default()
+            };
+            session.log("browser connect local");
+            registry
+                .sessions
+                .lock()
+                .expect("browser session registry poisoned")
+                .insert(session_id.to_string(), session);
+        }
+
+        let session = registry
+            .checkout_session(session_id)
+            .expect("checkout browser session");
+        assert_eq!(registry.active_session_count(), 0);
+        assert_eq!(registry.checked_out_session_count(), 1);
+        assert!(registry.contains_session(session_id));
+
+        let status = run_browser_command_with_options_and_registries(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "browser status --json",
+            BrowserCommandOptions::default(),
+            &script_registry,
+            &registry,
+        )
+        .expect("status while checked out");
+        assert_eq!(status.content["mode"], "local");
+        assert_eq!(status.content["busy"], true);
+        assert_eq!(status.content["browser"], "Google Chrome");
+        assert_eq!(status.content["page"]["target_id"], "target-1");
+
+        let error = run_browser_command_with_options_and_registries(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "browser connect local",
+            BrowserCommandOptions::default(),
+            &script_registry,
+            &registry,
+        )
+        .expect_err("non-status commands should not create a default session while busy");
+        assert!(
+            error.to_string().contains("browser session is busy"),
+            "{error:#}"
+        );
+
+        registry.return_session(session_id, session);
+        assert_eq!(registry.checked_out_session_count(), 0);
+        assert_eq!(registry.active_session_count(), 1);
     }
 
     #[test]
