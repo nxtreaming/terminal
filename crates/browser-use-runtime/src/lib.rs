@@ -1605,6 +1605,18 @@ pub enum AgentThreadStatus {
     Closed,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RuntimeActivitySnapshot {
+    pub key: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<ToolCallId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delta: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct AgentLiveStateSnapshot {
     pub accepted_input_count: usize,
@@ -1620,6 +1632,22 @@ pub struct AgentLiveStateSnapshot {
     pub last_consumed_mailbox_seq: u64,
     pub current_run_id: Option<RunId>,
     pub cancellation_requested: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_items: Vec<RuntimeActivitySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_model_delta: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_model_thinking_delta: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_token_usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_token_usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -2474,6 +2502,7 @@ impl RuntimeProjectionState {
 
     fn reduce(&mut self, event: &RuntimeEvent) {
         self.reduce_agent(event);
+        self.reduce_live_activity(event);
         self.reduce_browser(event);
     }
 
@@ -2729,6 +2758,127 @@ impl RuntimeProjectionState {
         })
     }
 
+    fn reduce_live_activity(&mut self, event: &RuntimeEvent) {
+        let Some(agent) = self.agent_snapshot_mut(event) else {
+            return;
+        };
+
+        match event.kind {
+            RuntimeEventKind::ExecCommandBegin => {
+                start_activity(
+                    agent,
+                    event,
+                    "exec_command",
+                    Some("exec_command".to_string()),
+                );
+            }
+            RuntimeEventKind::BrowserScriptStarted => {
+                start_activity(
+                    agent,
+                    event,
+                    "browser_script",
+                    Some("browser_script".to_string()),
+                );
+            }
+            RuntimeEventKind::PythonStarted => {
+                start_activity(agent, event, "python", Some("python".to_string()));
+            }
+            RuntimeEventKind::McpToolStarted => {
+                start_activity(
+                    agent,
+                    event,
+                    "mcp_tool",
+                    activity_name(event_payload(event)),
+                );
+            }
+            RuntimeEventKind::ExecCommandOutputDelta
+            | RuntimeEventKind::BrowserScriptOutputDelta
+            | RuntimeEventKind::PythonOutputDelta
+            | RuntimeEventKind::ToolOutputDelta => {
+                update_activity_delta(agent, event, output_delta_text(event_payload(event)));
+            }
+            RuntimeEventKind::ExecCommandEnd
+            | RuntimeEventKind::BrowserScriptCompleted
+            | RuntimeEventKind::BrowserScriptCancelled
+            | RuntimeEventKind::PythonCompleted
+            | RuntimeEventKind::McpToolCompleted
+            | RuntimeEventKind::ToolCompleted
+            | RuntimeEventKind::ToolFailed => {
+                finish_activity(agent, event);
+            }
+            RuntimeEventKind::AgentTurnCompleted | RuntimeEventKind::AgentCompleted => {
+                if let Some(result) = terminal_result(event_payload(event)) {
+                    agent.live.final_result = Some(result);
+                    agent.live.failure = None;
+                }
+                agent.live.active_items.clear();
+            }
+            RuntimeEventKind::AgentTurnAborted
+            | RuntimeEventKind::AgentFailed
+            | RuntimeEventKind::AgentCancelled => {
+                if let Some(failure) = terminal_failure(event_payload(event)) {
+                    agent.live.failure = Some(failure);
+                }
+                agent.live.active_items.clear();
+            }
+            _ => {}
+        }
+
+        let Some(event_type) = observed_event_type(event) else {
+            return;
+        };
+        let payload = event_payload(event);
+        match event_type {
+            "model.stream_delta" => {
+                if let Some(text) = output_delta_text(payload) {
+                    agent.live.last_model_delta = Some(text);
+                }
+            }
+            "model.thinking_delta" => {
+                if let Some(text) = output_delta_text(payload) {
+                    agent.live.last_model_thinking_delta = Some(text);
+                }
+            }
+            "tool.started" => {
+                start_activity(agent, event, "tool", activity_name(payload));
+            }
+            "tool.output_delta" => {
+                update_activity_delta(agent, event, output_delta_text(payload));
+            }
+            "tool.output" => {
+                finish_activity(agent, event);
+            }
+            "tool.failed" | "tool.aborted" => {
+                if let Some(failure) = terminal_failure(payload) {
+                    agent.live.failure = Some(failure);
+                }
+                finish_activity(agent, event);
+            }
+            "token_count" => {
+                if let Some(info) = payload.get("info") {
+                    agent.live.last_token_usage = info.get("last_token_usage").cloned();
+                    agent.live.total_token_usage = info.get("total_token_usage").cloned();
+                    agent.live.model_context_window =
+                        info.get("model_context_window").and_then(Value::as_i64);
+                }
+            }
+            "session.done" => {
+                if let Some(result) = terminal_result(payload) {
+                    agent.live.final_result = Some(result);
+                    agent.live.failure = None;
+                }
+                agent.live.active_items.clear();
+            }
+            "session.failed" | "stream_error" | "model.turn.error" => {
+                if let Some(failure) = terminal_failure(payload) {
+                    agent.live.failure = Some(failure);
+                }
+                agent.live.active_items.clear();
+            }
+            _ => {}
+        }
+    }
+
     fn reduce_browser(&mut self, event: &RuntimeEvent) {
         let Some(browser_id) = event.browser_id.clone() else {
             return;
@@ -2883,6 +3033,142 @@ fn projected_thread_status_for_event(event: &RuntimeEvent) -> Option<AgentThread
         RuntimeEventKind::AgentClosed => Some(AgentThreadStatus::Closed),
         _ => None,
     }
+}
+
+fn observed_event_type(event: &RuntimeEvent) -> Option<&str> {
+    event.payload.get("event_type").and_then(Value::as_str)
+}
+
+fn event_payload(event: &RuntimeEvent) -> &Value {
+    event.payload.get("payload").unwrap_or(&event.payload)
+}
+
+fn activity_tool_call_id(event: &RuntimeEvent) -> Option<ToolCallId> {
+    event.tool_call_id.clone().or_else(|| {
+        event_payload(event)
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .and_then(|id| ToolCallId::from_string(id).ok())
+    })
+}
+
+fn activity_key(event: &RuntimeEvent, kind: &str) -> String {
+    activity_tool_call_id(event)
+        .map(|id| format!("{kind}:{}", id.as_str()))
+        .unwrap_or_else(|| format!("{kind}:{}", event.id.as_str()))
+}
+
+fn activity_name(payload: &Value) -> Option<String> {
+    payload
+        .get("name")
+        .or_else(|| payload.get("tool_name"))
+        .or_else(|| payload.get("command"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn start_activity(
+    agent: &mut AgentThreadSnapshot,
+    event: &RuntimeEvent,
+    kind: &str,
+    name: Option<String>,
+) {
+    let key = activity_key(event, kind);
+    let item = RuntimeActivitySnapshot {
+        key: key.clone(),
+        kind: kind.to_string(),
+        name,
+        tool_call_id: activity_tool_call_id(event),
+        last_delta: None,
+    };
+    if let Some(existing) = agent
+        .live
+        .active_items
+        .iter_mut()
+        .find(|active| active.key == key)
+    {
+        *existing = item;
+        return;
+    }
+    agent.live.active_items.push(item);
+}
+
+fn update_activity_delta(
+    agent: &mut AgentThreadSnapshot,
+    event: &RuntimeEvent,
+    delta: Option<String>,
+) {
+    let Some(delta) = delta else {
+        return;
+    };
+    let keys = activity_keys_for_event(event);
+    if let Some(existing) = agent
+        .live
+        .active_items
+        .iter_mut()
+        .find(|active| keys.iter().any(|key| key == &active.key))
+    {
+        existing.last_delta = Some(delta);
+    }
+}
+
+fn finish_activity(agent: &mut AgentThreadSnapshot, event: &RuntimeEvent) {
+    let keys = activity_keys_for_event(event);
+    agent
+        .live
+        .active_items
+        .retain(|active| !keys.iter().any(|key| key == &active.key));
+}
+
+fn activity_keys_for_event(event: &RuntimeEvent) -> Vec<String> {
+    let Some(tool_call_id) = activity_tool_call_id(event) else {
+        return vec![
+            activity_key(event, "exec_command"),
+            activity_key(event, "browser_script"),
+            activity_key(event, "python"),
+            activity_key(event, "mcp_tool"),
+            activity_key(event, "tool"),
+        ];
+    };
+    [
+        "exec_command",
+        "browser_script",
+        "python",
+        "mcp_tool",
+        "tool",
+    ]
+    .into_iter()
+    .map(|kind| format!("{kind}:{}", tool_call_id.as_str()))
+    .collect()
+}
+
+fn output_delta_text(payload: &Value) -> Option<String> {
+    payload
+        .get("text")
+        .or_else(|| payload.get("delta"))
+        .or_else(|| payload.get("stdout"))
+        .or_else(|| payload.get("stderr"))
+        .or_else(|| payload.get("output"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn terminal_result(payload: &Value) -> Option<String> {
+    payload
+        .get("result")
+        .or_else(|| payload.get("completed"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn terminal_failure(payload: &Value) -> Option<String> {
+    payload
+        .get("error")
+        .or_else(|| payload.get("failure"))
+        .or_else(|| payload.get("reason"))
+        .or_else(|| payload.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn mailbox_item_from_payload(payload: &Value) -> Option<MailboxItem> {
@@ -7691,5 +7977,127 @@ mod tests {
         assert_eq!(browser.status, BrowserStatus::Closed);
         assert_eq!(browser.active_agent_id, None);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn projected_subscription_reduces_observed_tool_and_terminal_state() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let mut subscription = handle.subscribe_projected();
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "tool.started",
+            json!({
+                "name": "exec_command",
+                "tool_call_id": "call_1",
+                "arguments": { "cmd": "echo hi" },
+            }),
+            Durability::Barrier,
+        )?;
+        let started = subscription.recv().await?;
+        let root_live = projected_agent_live(&started, root.agent_id());
+        assert_eq!(root_live.active_items.len(), 1);
+        assert_eq!(root_live.active_items[0].kind, "tool");
+        assert_eq!(
+            root_live.active_items[0].name.as_deref(),
+            Some("exec_command")
+        );
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "tool.output_delta",
+            json!({
+                "tool_call_id": "call_1",
+                "text": "partial",
+            }),
+            Durability::BestEffort,
+        )?;
+        let delta = subscription.recv().await?;
+        let root_live = projected_agent_live(&delta, root.agent_id());
+        assert_eq!(
+            root_live.active_items[0].last_delta.as_deref(),
+            Some("partial")
+        );
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "tool.output",
+            json!({
+                "name": "exec_command",
+                "tool_call_id": "call_1",
+                "text": "done",
+            }),
+            Durability::Barrier,
+        )?;
+        let output = subscription.recv().await?;
+        let root_live = projected_agent_live(&output, root.agent_id());
+        assert!(root_live.active_items.is_empty());
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "model.stream_delta",
+            json!({ "text": "answer" }),
+            Durability::BestEffort,
+        )?;
+        let model_delta = subscription.recv().await?;
+        let root_live = projected_agent_live(&model_delta, root.agent_id());
+        assert_eq!(root_live.last_model_delta.as_deref(), Some("answer"));
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "token_count",
+            json!({
+                "info": {
+                    "last_token_usage": { "total_tokens": 7 },
+                    "total_token_usage": { "total_tokens": 11 },
+                    "model_context_window": 100,
+                }
+            }),
+            Durability::Barrier,
+        )?;
+        let token_count = subscription.recv().await?;
+        let root_live = projected_agent_live(&token_count, root.agent_id());
+        assert_eq!(
+            root_live.last_token_usage.as_ref().unwrap()["total_tokens"],
+            7
+        );
+        assert_eq!(
+            root_live.total_token_usage.as_ref().unwrap()["total_tokens"],
+            11
+        );
+        assert_eq!(root_live.model_context_window, Some(100));
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "session.done",
+            json!({ "result": "final answer" }),
+            Durability::Barrier,
+        )?;
+        let done = subscription.recv().await?;
+        let root_live = projected_agent_live(&done, root.agent_id());
+        assert_eq!(root_live.final_result.as_deref(), Some("final answer"));
+        assert_eq!(root_live.failure, None);
+        Ok(())
+    }
+
+    fn projected_agent_live<'a>(
+        event: &'a ProjectedEvent,
+        agent_id: &AgentId,
+    ) -> &'a AgentLiveStateSnapshot {
+        &event
+            .snapshot
+            .as_ref()
+            .expect("projected snapshot")
+            .agents
+            .iter()
+            .find(|agent| &agent.agent_id == agent_id)
+            .expect("projected agent")
+            .live
     }
 }

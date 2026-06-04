@@ -78,8 +78,9 @@ BrowserUseRuntime
 - Projected runtime subscriptions now carry a reducer-backed
   `RuntimeSnapshot`. The reducer materializes child spawn events from their
   payload, keeps parent threads open for child-terminal transcript events,
-  updates mailbox counters/cursors, and tracks browser create/claim/release/
-  close state without re-querying SQLite.
+  updates mailbox counters/cursors, tracks observed tool activity and model
+  deltas, projects token usage and final result/failure fields, and tracks
+  browser create/claim/release/close state without re-querying SQLite.
 - Python SDK tests cover `Agent.add_new_task()` follow-up delivery, asyncio
   cancellation to `agent.stop`, same-browser fail-fast behavior, and concurrent
   different-browser runs.
@@ -130,8 +131,8 @@ BrowserUseRuntime
   overlays live session status from runtime snapshots, but active rendering is
   still substantially Store/history-cache based. The SDK consumes projected
   events for `Agent.stream()`, and runtime projection now has a state reducer,
-  but the reducer does not yet cover the full model/tool activity stack, token
-  usage, terminal result/failure fields, or serve as the TUI authority.
+  but the reducer does not yet cover the full model request/retry/error
+  lifecycle or serve as the TUI authority.
 - Replay materialization restores important mailbox/live counters and marks
   common stale tool resources lost, but full crash recovery still does not
   hydrate every durable graph field or make browser leases/script registries

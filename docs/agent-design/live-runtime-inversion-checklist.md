@@ -285,11 +285,14 @@ BrowserUseRuntime
 - [ ] Projection includes:
       - [x] active agent status
       - [ ] live model/tool activity
+        - [x] observed tool start/delta/completion state
+        - [x] latest model stream/thinking deltas
+        - [ ] active model request/retry/error lifecycle
       - [x] child agent statuses
       - [x] mailbox continuation state
       - [x] browser status
-      - [ ] token usage
-      - [ ] final result/failure
+      - [x] token usage
+      - [x] final result/failure
 - [ ] Projection guarantees snapshot-before-live-event ordering.
 - [ ] Projection sends final status before `run_agent` resolves.
 - [ ] TUI consumes projection for active sessions.
