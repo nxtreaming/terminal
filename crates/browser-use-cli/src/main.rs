@@ -35,8 +35,8 @@ use browser_use_agent::infra::{
     UnifiedExecShutdownCleanup,
 };
 use browser_use_agent::live_executor::{
-    ensure_agent_attached as ensure_runtime_agent_attached, LiveAgentExecutor,
-    LiveAgentExecutorConfig, LiveAgentRunRequest,
+    ensure_agent_attached as ensure_runtime_agent_attached, RuntimeAgentExecutor,
+    RuntimeAgentExecutorConfig, RuntimeAgentRunRequest,
 };
 use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_agent::rollout::fork_events_by_turn;
@@ -1374,7 +1374,7 @@ fn maybe_append_message_history(
 /// Drive a session through the live runtime executor.
 ///
 /// The CLI is synchronous, while the agent engine is async. This bridge now
-/// creates a `LiveAgentExecutor` over the CLI runtime handle, so cancellation,
+/// creates a `RuntimeAgentExecutor` over the CLI runtime handle, so cancellation,
 /// child runs, mailboxes, and session resources use the same live authority as
 /// the TUI/SDK instead of a one-off engine runtime.
 ///
@@ -1412,10 +1412,10 @@ fn run_session_via_engine_with_runtime_and_cancel(
     runtime_handle: RuntimeHandle,
     cancellation_token: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
-    let executor = cli_live_agent_executor(store, runtime_handle)?;
+    let executor = cli_runtime_agent_executor(store, runtime_handle)?;
     attach_cli_child_agent_runner(store, executor.clone(), &mut config);
     let resolved = executor.run_blocking(
-        LiveAgentRunRequest::new(session_id.to_string(), config)
+        RuntimeAgentRunRequest::new(session_id.to_string(), config)
             .with_cancellation_token(cancellation_token),
     )?;
     Ok(resolved.session_id)
@@ -1428,9 +1428,12 @@ fn cli_runtime_handle(store: &Store) -> Result<RuntimeHandle> {
     Ok(BrowserUseRuntime::new(persistence, state_index).handle())
 }
 
-fn cli_live_agent_executor(store: &Store, runtime: RuntimeHandle) -> Result<LiveAgentExecutor> {
-    LiveAgentExecutor::new(
-        LiveAgentExecutorConfig::new(store.state_dir().to_path_buf(), runtime)
+fn cli_runtime_agent_executor(
+    store: &Store,
+    runtime: RuntimeHandle,
+) -> Result<RuntimeAgentExecutor> {
+    RuntimeAgentExecutor::new(
+        RuntimeAgentExecutorConfig::new(store.state_dir().to_path_buf(), runtime)
             .with_worker_threads(2),
     )
 }
@@ -1451,7 +1454,7 @@ fn ensure_cli_agent_attached(
 
 fn attach_cli_child_agent_runner(
     store: &Store,
-    executor: LiveAgentExecutor,
+    executor: RuntimeAgentExecutor,
     config: &mut ProviderRunConfig,
 ) {
     let state_dir = store.state_dir().to_path_buf();
@@ -1474,7 +1477,7 @@ fn attach_cli_child_agent_runner(
 }
 
 fn spawn_cli_child_agent(
-    executor: LiveAgentExecutor,
+    executor: RuntimeAgentExecutor,
     state_dir: PathBuf,
     mut base_config: ProviderRunConfig,
     request: ChildAgentRunRequest,
@@ -1497,7 +1500,7 @@ fn spawn_cli_child_agent(
     let completion_handler = request.completion_handler.clone();
     executor.spawn_background(
         format!("browser-use-child-{child_id}"),
-        LiveAgentRunRequest::new(child_id.clone(), base_config),
+        RuntimeAgentRunRequest::new(child_id.clone(), base_config),
         move |completion| {
             let events = Store::open(&state_dir)
                 .and_then(|store| store.events_for_session(&child_id))

@@ -17,11 +17,11 @@ use crate::entrypoint::run_session_with_config_with_cancel_and_runtime;
 use crate::session::SharedStore;
 
 #[derive(Clone)]
-pub struct LiveAgentExecutor {
-    inner: Arc<LiveAgentExecutorInner>,
+pub struct RuntimeAgentExecutor {
+    inner: Arc<RuntimeAgentExecutorInner>,
 }
 
-struct LiveAgentExecutorInner {
+struct RuntimeAgentExecutorInner {
     state_dir: PathBuf,
     runtime: RuntimeHandle,
     notifier: Option<StoreNotifier>,
@@ -29,14 +29,14 @@ struct LiveAgentExecutorInner {
 }
 
 #[derive(Clone)]
-pub struct LiveAgentExecutorConfig {
+pub struct RuntimeAgentExecutorConfig {
     pub state_dir: PathBuf,
     pub runtime: RuntimeHandle,
     pub notifier: Option<StoreNotifier>,
     pub worker_threads: usize,
 }
 
-impl LiveAgentExecutorConfig {
+impl RuntimeAgentExecutorConfig {
     pub fn new(state_dir: impl Into<PathBuf>, runtime: RuntimeHandle) -> Self {
         Self {
             state_dir: state_dir.into(),
@@ -58,13 +58,13 @@ impl LiveAgentExecutorConfig {
 }
 
 #[derive(Clone)]
-pub struct LiveAgentRunRequest {
+pub struct RuntimeAgentRunRequest {
     pub session_id: String,
     pub config: ProviderRunConfig,
     pub cancellation_token: Option<CancellationToken>,
 }
 
-impl LiveAgentRunRequest {
+impl RuntimeAgentRunRequest {
     pub fn new(session_id: impl Into<String>, config: ProviderRunConfig) -> Self {
         Self {
             session_id: session_id.into(),
@@ -80,16 +80,16 @@ impl LiveAgentRunRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LiveAgentRunResult {
+pub struct RuntimeAgentRunResult {
     pub session_id: String,
 }
 
-pub struct LiveAgentBackgroundCompletion {
+pub struct RuntimeAgentBackgroundCompletion {
     pub session_id: String,
-    pub result: Result<LiveAgentRunResult>,
+    pub result: Result<RuntimeAgentRunResult>,
 }
 
-impl LiveAgentBackgroundCompletion {
+impl RuntimeAgentBackgroundCompletion {
     pub fn is_success(&self) -> bool {
         self.result.is_ok()
     }
@@ -99,8 +99,8 @@ impl LiveAgentBackgroundCompletion {
     }
 }
 
-impl LiveAgentExecutor {
-    pub fn new(config: LiveAgentExecutorConfig) -> Result<Self> {
+impl RuntimeAgentExecutor {
+    pub fn new(config: RuntimeAgentExecutorConfig) -> Result<Self> {
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("browser-use-live-agent-runtime")
@@ -108,7 +108,7 @@ impl LiveAgentExecutor {
             .build()
             .context("build live agent tokio runtime")?;
         Ok(Self {
-            inner: Arc::new(LiveAgentExecutorInner {
+            inner: Arc::new(RuntimeAgentExecutorInner {
                 state_dir: config.state_dir,
                 runtime: config.runtime,
                 notifier: config.notifier,
@@ -139,7 +139,7 @@ impl LiveAgentExecutor {
         )
     }
 
-    pub fn run_blocking(&self, request: LiveAgentRunRequest) -> Result<LiveAgentRunResult> {
+    pub fn run_blocking(&self, request: RuntimeAgentRunRequest) -> Result<RuntimeAgentRunResult> {
         let runtime_session_id = RuntimeSessionId::from_string(request.session_id.clone())?;
         let store =
             Store::open_with_optional_notifier(&self.inner.state_dir, self.inner.notifier.clone())?;
@@ -180,7 +180,7 @@ impl LiveAgentExecutor {
                 .await
         });
         match result {
-            Ok(response) => Ok(LiveAgentRunResult {
+            Ok(response) => Ok(RuntimeAgentRunResult {
                 session_id: response.output.0,
             }),
             Err(error) => {
@@ -197,8 +197,8 @@ impl LiveAgentExecutor {
     pub fn spawn_background(
         &self,
         thread_name: impl Into<String>,
-        request: LiveAgentRunRequest,
-        on_completion: impl FnOnce(LiveAgentBackgroundCompletion) + Send + 'static,
+        request: RuntimeAgentRunRequest,
+        on_completion: impl FnOnce(RuntimeAgentBackgroundCompletion) + Send + 'static,
     ) -> Result<()> {
         let executor = self.clone();
         let session_id = request.session_id.clone();
@@ -220,12 +220,27 @@ impl LiveAgentExecutor {
                         Err(anyhow!(message))
                     }
                 };
-                on_completion(LiveAgentBackgroundCompletion { session_id, result });
+                on_completion(RuntimeAgentBackgroundCompletion { session_id, result });
             })
             .context("spawn live agent executor thread")?;
         Ok(())
     }
 }
+
+#[deprecated(note = "use RuntimeAgentExecutor; LiveAgentExecutor is a compatibility alias")]
+pub type LiveAgentExecutor = RuntimeAgentExecutor;
+
+#[deprecated(note = "use RuntimeAgentExecutorConfig")]
+pub type LiveAgentExecutorConfig = RuntimeAgentExecutorConfig;
+
+#[deprecated(note = "use RuntimeAgentRunRequest")]
+pub type LiveAgentRunRequest = RuntimeAgentRunRequest;
+
+#[deprecated(note = "use RuntimeAgentRunResult")]
+pub type LiveAgentRunResult = RuntimeAgentRunResult;
+
+#[deprecated(note = "use RuntimeAgentBackgroundCompletion")]
+pub type LiveAgentBackgroundCompletion = RuntimeAgentBackgroundCompletion;
 
 pub fn ensure_agent_attached(
     runtime: &RuntimeHandle,

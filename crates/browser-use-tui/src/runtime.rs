@@ -13,8 +13,8 @@ use browser_use_agent::context::{
     typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
 };
 use browser_use_agent::live_executor::{
-    ensure_agent_attached as ensure_runtime_agent_attached, LiveAgentExecutor,
-    LiveAgentExecutorConfig, LiveAgentRunRequest,
+    ensure_agent_attached as ensure_runtime_agent_attached, RuntimeAgentExecutor,
+    RuntimeAgentExecutorConfig, RuntimeAgentRunRequest,
 };
 use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_agent::rollout::fork_events_by_turn;
@@ -37,14 +37,15 @@ use crate::settings::{
 };
 
 static TUI_LIVE_RUNTIMES: OnceLock<Mutex<HashMap<PathBuf, RuntimeHandle>>> = OnceLock::new();
-static TUI_LIVE_EXECUTORS: OnceLock<Mutex<HashMap<PathBuf, LiveAgentExecutor>>> = OnceLock::new();
+static TUI_RUNTIME_AGENT_EXECUTORS: OnceLock<Mutex<HashMap<PathBuf, RuntimeAgentExecutor>>> =
+    OnceLock::new();
 
 fn tui_live_runtimes() -> &'static Mutex<HashMap<PathBuf, RuntimeHandle>> {
     TUI_LIVE_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn tui_live_executors() -> &'static Mutex<HashMap<PathBuf, LiveAgentExecutor>> {
-    TUI_LIVE_EXECUTORS.get_or_init(|| Mutex::new(HashMap::new()))
+fn tui_runtime_agent_executors() -> &'static Mutex<HashMap<PathBuf, RuntimeAgentExecutor>> {
+    TUI_RUNTIME_AGENT_EXECUTORS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub(crate) fn cancel_agent_run(state_dir: &Path, session_id: &str) -> bool {
@@ -167,12 +168,12 @@ fn tui_runtime_handle_with_notifier(
     Ok(runtimes.entry(state_dir).or_insert_with(|| handle).clone())
 }
 
-fn tui_live_executor_with_notifier(
+fn tui_runtime_agent_executor_with_notifier(
     state_dir: &Path,
     notifier: Option<StoreNotifier>,
-) -> Result<LiveAgentExecutor> {
+) -> Result<RuntimeAgentExecutor> {
     let state_dir = state_dir.to_path_buf();
-    if let Some(executor) = tui_live_executors()
+    if let Some(executor) = tui_runtime_agent_executors()
         .lock()
         .ok()
         .and_then(|executors| executors.get(&state_dir).cloned())
@@ -180,12 +181,12 @@ fn tui_live_executor_with_notifier(
         return Ok(executor);
     }
     let runtime = tui_runtime_handle_with_notifier(&state_dir, notifier.clone())?;
-    let executor = LiveAgentExecutor::new(
-        LiveAgentExecutorConfig::new(state_dir.clone(), runtime)
+    let executor = RuntimeAgentExecutor::new(
+        RuntimeAgentExecutorConfig::new(state_dir.clone(), runtime)
             .with_notifier(notifier)
             .with_worker_threads(2),
     )?;
-    let mut executors = tui_live_executors()
+    let mut executors = tui_runtime_agent_executors()
         .lock()
         .map_err(|_| anyhow::anyhow!("TUI live executor registry lock poisoned"))?;
     Ok(executors
@@ -234,7 +235,7 @@ pub(crate) fn spawn_tui_agent_run(
     )?;
     executor.spawn_background(
         format!("browser-use-agent-{session_id}"),
-        LiveAgentRunRequest::new(session_id.clone(), config),
+        RuntimeAgentRunRequest::new(session_id.clone(), config),
         move |completion| {
             if let Some(error) = completion.error_message() {
                 eprintln!("tui agent failed: {error}");
@@ -255,7 +256,7 @@ fn prepare_tui_agent_run(
     config_profile: Option<String>,
     config_overrides: ConfigOverrides,
     notifier: Option<StoreNotifier>,
-) -> Result<(LiveAgentExecutor, ProviderRunConfig)> {
+) -> Result<(RuntimeAgentExecutor, ProviderRunConfig)> {
     let store = Store::open_with_optional_notifier(&state_dir, notifier.clone())?;
     let browser_use_cloud_api_key = if browser == BROWSER_USE_CLOUD {
         browser_use_cloud_api_key(&store)?
@@ -290,7 +291,7 @@ fn prepare_tui_agent_run(
             config_overrides.clone(),
         )?)
         .with_fake_result("Fake result from the Rust TUI agent loop.");
-    let executor = tui_live_executor_with_notifier(&state_dir, notifier)?;
+    let executor = tui_runtime_agent_executor_with_notifier(&state_dir, notifier)?;
     let runtime_handle = executor.runtime_handle();
     ensure_tui_agent_attached(
         &runtime_handle,
@@ -425,7 +426,7 @@ fn spawn_tui_child_agent(
     )?;
     executor.spawn_background(
         format!("browser-use-tui-child-{child_id}"),
-        LiveAgentRunRequest::new(child_id.clone(), child_config),
+        RuntimeAgentRunRequest::new(child_id.clone(), child_config),
         move |completion| {
             let error = completion.error_message();
             notify_tui_child_completion(

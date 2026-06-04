@@ -94,8 +94,14 @@ pub use entrypoint::{
     run_session_with_config_with_cancel_and_runtime,
 };
 pub use live_executor::{
-    ensure_agent_attached as ensure_live_agent_attached, LiveAgentBackgroundCompletion,
-    LiveAgentExecutor, LiveAgentExecutorConfig, LiveAgentRunRequest, LiveAgentRunResult,
+    ensure_agent_attached as ensure_live_agent_attached, RuntimeAgentBackgroundCompletion,
+    RuntimeAgentExecutor, RuntimeAgentExecutorConfig, RuntimeAgentRunRequest,
+    RuntimeAgentRunResult,
+};
+#[allow(deprecated)]
+pub use live_executor::{
+    LiveAgentBackgroundCompletion, LiveAgentExecutor, LiveAgentExecutorConfig, LiveAgentRunRequest,
+    LiveAgentRunResult,
 };
 
 #[cfg(test)]
