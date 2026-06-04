@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use tungstenite::{client, connect, Message, WebSocket};
 
 const BU_API: &str = "https://api.browser-use.com/api/v3";
 const LOG_LIMIT: usize = 250;
@@ -31,6 +31,8 @@ const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
 const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
+const BROWSER_CONNECT_ATTACH_DEADLINE: Duration = Duration::from_secs(8);
+const BROWSER_CONNECT_CDP_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct BrowserCommandOutput {
@@ -2265,11 +2267,15 @@ impl BrowserSession {
             ws_url: candidate.ws_url.clone(),
             candidate_id: Some(candidate.id.clone()),
         };
-        if let Err(error) =
-            self.connect_endpoint(endpoint, BrowserMode::Local, BrowserOwner::External)
-        {
+        if let Err(error) = self.connect_endpoint_with_attach_deadline(
+            endpoint,
+            BrowserMode::Local,
+            BrowserOwner::External,
+            Instant::now() + BROWSER_CONNECT_ATTACH_DEADLINE,
+        ) {
             let message = format!("{error:#}");
             let kind = classify_browser_error(&message);
+            self.clear_failed_connection_state();
             self.last_error = Some(message.clone());
             self.last_error_kind = Some(kind.to_string());
             return Ok(json!({
@@ -2495,6 +2501,43 @@ impl BrowserSession {
         self.last_session_id = None;
         self.attach_first_page()?;
         Ok(())
+    }
+
+    fn connect_endpoint_with_attach_deadline(
+        &mut self,
+        endpoint: Endpoint,
+        mode: BrowserMode,
+        owner: BrowserOwner,
+        attach_deadline: Instant,
+    ) -> Result<()> {
+        let ws_url = endpoint.ws_url.clone();
+        let connection = CdpDispatcher::connect_with_timeout(
+            &ws_url,
+            connect_attach_call_timeout(attach_deadline)?,
+        )?;
+        self.endpoint = Some(endpoint);
+        self.connection = Some(connection);
+        self.mode = mode;
+        self.owner = owner;
+        self.connection_generation += 1;
+        self.last_error = None;
+        self.last_error_kind = None;
+        self.last_target_id = None;
+        self.last_session_id = None;
+        if let Err(error) = self.attach_first_page_with_deadline(attach_deadline) {
+            self.clear_failed_connection_state();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn clear_failed_connection_state(&mut self) {
+        self.connection = None;
+        self.current_session_id = None;
+        self.current_target_id = None;
+        self.last_target_id = None;
+        self.last_session_id = None;
+        self.connection_generation += 1;
     }
 
     fn reconnect_websocket(&mut self) -> Result<Value> {
@@ -2835,6 +2878,35 @@ impl BrowserSession {
         Ok(())
     }
 
+    fn attach_first_page_with_deadline(&mut self, deadline: Instant) -> Result<()> {
+        let targets = self.targets_with_deadline(deadline)?;
+        let target_id = targets
+            .iter()
+            .find(|target| is_real_page_target(target))
+            .and_then(|target| target.get("targetId").and_then(Value::as_str))
+            .map(ToOwned::to_owned);
+        let target_id = match target_id {
+            Some(target_id) => target_id,
+            None => self
+                .cdp_with_attach_deadline(
+                    "Target.createTarget",
+                    None,
+                    json!({ "url": "about:blank" }),
+                    deadline,
+                )?
+                .get("targetId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("Target.createTarget response missing targetId"))?
+                .to_string(),
+        };
+        let session_id = self.attach_target_with_deadline(&target_id, deadline)?;
+        self.current_target_id = Some(target_id);
+        self.current_session_id = Some(session_id);
+        let _ = self.cdp_current_with_deadline("Runtime.enable", json!({}), deadline);
+        let _ = self.cdp_current_with_deadline("Page.enable", json!({}), deadline);
+        Ok(())
+    }
+
     fn cdp_current(&mut self, method: &str, params: Value) -> Result<Value> {
         let session_id = self.current_session_id.clone().ok_or_else(|| {
             anyhow!("no current browser session; run `browser recover reattach-same-target`")
@@ -2842,8 +2914,46 @@ impl BrowserSession {
         self.cdp(method, Some(&session_id), params)
     }
 
+    fn cdp_with_attach_deadline(
+        &mut self,
+        method: &str,
+        session_id: Option<&str>,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value> {
+        let timeout = connect_attach_call_timeout(deadline)?;
+        let Some(connection) = self.connection.as_mut() else {
+            bail!(
+                "browser is not connected. Run `browser status --json` or `browser connect ...`."
+            );
+        };
+        connection.call_with_timeout(method, session_id, params, timeout)
+    }
+
+    fn cdp_current_with_deadline(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value> {
+        let session_id = self.current_session_id.clone().ok_or_else(|| {
+            anyhow!("no current browser session; run `browser recover reattach-same-target`")
+        })?;
+        self.cdp_with_attach_deadline(method, Some(&session_id), params, deadline)
+    }
+
     fn targets(&mut self) -> Result<Vec<Value>> {
         let result = self.cdp("Target.getTargets", None, json!({}))?;
+        Ok(result
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn targets_with_deadline(&mut self, deadline: Instant) -> Result<Vec<Value>> {
+        let result =
+            self.cdp_with_attach_deadline("Target.getTargets", None, json!({}), deadline)?;
         Ok(result
             .get("targetInfos")
             .and_then(Value::as_array)
@@ -2856,6 +2966,24 @@ impl BrowserSession {
             "Target.attachToTarget",
             None,
             json!({ "targetId": target_id, "flatten": true }),
+        )?;
+        result
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow!("Target.attachToTarget response missing sessionId"))
+    }
+
+    fn attach_target_with_deadline(
+        &mut self,
+        target_id: &str,
+        deadline: Instant,
+    ) -> Result<String> {
+        let result = self.cdp_with_attach_deadline(
+            "Target.attachToTarget",
+            None,
+            json!({ "targetId": target_id, "flatten": true }),
+            deadline,
         )?;
         result
             .get("sessionId")
@@ -3022,6 +3150,24 @@ impl CdpDispatcher {
         let (mut socket, _) =
             connect(ws_url).with_context(|| format!("connect CDP websocket {ws_url}"))?;
         set_cdp_dispatcher_socket_timeouts(&mut socket);
+        Self::from_socket(socket)
+    }
+
+    fn connect_with_timeout(ws_url: &str, timeout: Duration) -> Result<Arc<Self>> {
+        let Some(addr) = local_ws_socket_addr(ws_url)? else {
+            return Self::connect(ws_url);
+        };
+        let stream = TcpStream::connect_timeout(&addr, timeout)
+            .with_context(|| format!("connect CDP websocket {ws_url}"))?;
+        stream.set_read_timeout(Some(timeout)).ok();
+        stream.set_write_timeout(Some(timeout)).ok();
+        let (mut socket, _) = client(ws_url, MaybeTlsStream::Plain(stream))
+            .with_context(|| format!("connect CDP websocket {ws_url}"))?;
+        set_cdp_dispatcher_socket_timeouts(&mut socket);
+        Self::from_socket(socket)
+    }
+
+    fn from_socket(socket: WebSocket<MaybeTlsStream<TcpStream>>) -> Result<Arc<Self>> {
         let (tx, rx) = std::sync::mpsc::channel::<CdpDispatchCmd>();
         let reader = thread::spawn(move || cdp_dispatcher_loop(socket, rx));
         Ok(Arc::new(Self {
@@ -3032,6 +3178,16 @@ impl CdpDispatcher {
     }
 
     fn call(&self, method: &str, session_id: Option<&str>, params: Value) -> Result<Value> {
+        self.call_with_timeout(method, session_id, params, Duration::from_secs(30))
+    }
+
+    fn call_with_timeout(
+        &self,
+        method: &str,
+        session_id: Option<&str>,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut msg = json!({ "id": id, "method": method, "params": params });
         if let Some(session_id) = session_id {
@@ -3047,7 +3203,7 @@ impl CdpDispatcher {
                 resp: rtx,
             })
             .map_err(|_| anyhow!("CDP dispatcher is shut down"))?;
-        match rrx.recv_timeout(Duration::from_secs(30)) {
+        match rrx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let _ = self
@@ -3055,6 +3211,9 @@ impl CdpDispatcher {
                     .lock()
                     .expect("cdp tx lock poisoned")
                     .send(CdpDispatchCmd::Cancel { id });
+                if timeout < Duration::from_secs(30) {
+                    bail!("browser connect timed out while waiting for CDP {method}")
+                }
                 bail!("CDP {method} timed out")
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -3173,6 +3332,52 @@ fn set_cdp_socket_timeouts_for(
     }
 }
 
+fn connect_attach_call_timeout(deadline: Instant) -> Result<Duration> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| anyhow!("browser connect timed out while attaching to a page"))?;
+    Ok(remaining.min(BROWSER_CONNECT_CDP_CALL_TIMEOUT))
+}
+
+fn local_ws_socket_addr(ws_url: &str) -> Result<Option<SocketAddr>> {
+    let Some(rest) = ws_url.strip_prefix("ws://") else {
+        return Ok(None);
+    };
+    let authority = rest
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some((host, after_host)) = after_bracket.split_once(']') else {
+            return Ok(None);
+        };
+        let Some(port) = after_host.strip_prefix(':') else {
+            return Ok(None);
+        };
+        (host, port)
+    } else {
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return Ok(None);
+        };
+        (host, port)
+    };
+    let ip = if host.eq_ignore_ascii_case("localhost") {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        match host.parse::<IpAddr>() {
+            Ok(ip) if ip.is_loopback() => ip,
+            _ => return Ok(None),
+        }
+    };
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("parse local CDP websocket port from {ws_url}"))?;
+    Ok(Some(SocketAddr::new(ip, port)))
+}
+
 fn classify_browser_error(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("403 forbidden") || lower.contains("http error: 403") {
@@ -3185,6 +3390,8 @@ fn classify_browser_error(message: &str) -> &'static str {
         "target-gone"
     } else if is_stale_session_error(message) {
         "session-gone"
+    } else if lower.contains("browser connect timed out") {
+        "browser-connect-timeout"
     } else if (lower.contains("resource temporarily unavailable")
         || lower.contains("would block")
         || lower.contains("timed out"))
@@ -3369,6 +3576,13 @@ fn browser_issue_diagnosis(
             false,
             false,
         ),
+        "browser-connect-timeout" => (
+            "Browser connection did not become usable before the attach deadline.",
+            "Chrome exposed a local DevTools endpoint, but the runtime could not attach to a page quickly enough.",
+            "browser recover reconnect-websocket".to_string(),
+            false,
+            false,
+        ),
         _ => (
             if page_usable {
                 "The browser page may still be reusable, but the failure needs checking."
@@ -3416,6 +3630,9 @@ fn local_connect_error_reason(kind: &str, raw_error: &str) -> String {
         "browser-closed" => {
             "Chrome is not currently exposing the selected local CDP endpoint. It may have been closed, restarted, or stopped its debug server.".to_string()
         }
+        "browser-connect-timeout" => {
+            "Chrome exposed a local CDP endpoint, but attaching to a page timed out before browser control was usable.".to_string()
+        }
         "target-gone" => "The previous browser tab target is gone.".to_string(),
         _ => format!("Local browser CDP connection failed: {raw_error}"),
     }
@@ -3425,6 +3642,7 @@ fn local_connect_next_step(kind: &str) -> &'static str {
     match kind {
         "permission-blocked" | "cdp-disabled" => "browser local setup",
         "browser-closed" => "Open Chrome with the selected profile, then run browser connect local",
+        "browser-connect-timeout" => "browser recover reconnect-websocket",
         "target-gone" => "Use browser_script list_tabs()/switch_tab(...) or open a new tab",
         _ => "browser doctor --json",
     }
@@ -7279,6 +7497,42 @@ mod tests {
         assert!(!should_drop_browser_connection(classify_browser_error(
             message
         )));
+    }
+
+    #[test]
+    fn connect_attach_timeouts_are_classified_for_recovery() {
+        let message = "browser connect timed out while waiting for CDP Target.attachToTarget";
+        assert_eq!(classify_browser_error(message), "browser-connect-timeout");
+        assert_eq!(
+            local_connect_next_step("browser-connect-timeout"),
+            "browser recover reconnect-websocket"
+        );
+    }
+
+    #[test]
+    fn local_ws_socket_addr_only_accepts_loopback_ws_urls() {
+        assert_eq!(
+            local_ws_socket_addr("ws://127.0.0.1:9222/devtools/browser/abc")
+                .unwrap()
+                .unwrap(),
+            "127.0.0.1:9222".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            local_ws_socket_addr("ws://[::1]:9223/devtools/browser/abc")
+                .unwrap()
+                .unwrap(),
+            "[::1]:9223".parse::<SocketAddr>().unwrap()
+        );
+        assert!(
+            local_ws_socket_addr("wss://example.com/devtools/browser/abc")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            local_ws_socket_addr("ws://example.com:9222/devtools/browser/abc")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
