@@ -3207,14 +3207,24 @@ impl BrowserUseRuntime {
     pub fn close_agent(&self, request: CloseAgentRequest) -> Result<()> {
         let thread = self.agents.thread(&request.agent_id)?;
         let reason = request.reason.clone();
-        let mut threads = vec![thread.clone()];
+        let descendant_edges = self.state_index.list_descendants(&thread.session_id)?;
+        let mut edge_session_ids_to_close: HashSet<SessionId> = descendant_edges
+            .iter()
+            .map(|edge| edge.child_session_id.clone())
+            .collect();
         if thread.parent_agent_id.is_some() {
-            for edge in self.state_index.list_descendants(&thread.session_id)? {
-                if let Ok(descendant) = self.agents.thread_for_session(&edge.child_session_id) {
+            edge_session_ids_to_close.insert(thread.session_id.clone());
+        }
+        let mut threads = vec![thread.clone()];
+        let mut seen_sessions = HashSet::from([thread.session_id.clone()]);
+        for edge in descendant_edges {
+            if let Ok(descendant) = self.agents.thread_for_session(&edge.child_session_id) {
+                if seen_sessions.insert(descendant.session_id.clone()) {
                     threads.push(descendant);
                 }
             }
         }
+        let mut closed_live_edge_sessions = HashSet::new();
         for closing in threads.iter().rev() {
             let mut requested =
                 RuntimeEvent::new(RuntimeEventKind::AgentCloseRequested, Durability::Barrier)
@@ -3243,14 +3253,20 @@ impl BrowserUseRuntime {
                 }));
             event.root_id = Some(closing.root_id.clone());
             self.append_runtime_event(&event)?;
-            closing.set_status(AgentThreadStatus::Closed);
-            closing.live_state.close();
             if closing.parent_agent_id.is_some() {
                 let control = self.agents.control_for_thread(closing)?;
                 control.scheduler.close_spawned_agent(&closing.agent_id);
                 self.state_index.close_spawn_edge(&closing.session_id)?;
+                closed_live_edge_sessions.insert(closing.session_id.clone());
             }
+            closing.set_status(AgentThreadStatus::Closed);
+            closing.live_state.close();
             self.events.publish(event);
+        }
+        for child_session_id in edge_session_ids_to_close {
+            if !closed_live_edge_sessions.contains(&child_session_id) {
+                self.state_index.close_spawn_edge(&child_session_id)?;
+            }
         }
         if let Some(parent_agent_id) = thread.parent_agent_id.as_ref() {
             let parent = self.agents.thread(parent_agent_id)?;
@@ -4553,6 +4569,48 @@ mod tests {
         assert!(*cleaned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner));
+        Ok(())
+    }
+
+    #[test]
+    fn close_agent_closes_durable_only_descendant_edges() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: Some("Curie".to_string()),
+            role: Some("explorer".to_string()),
+        })?;
+        let durable_grandchild = SessionId::from_string("durable-grandchild")?;
+        journal.create_thread(CreateThreadRequest {
+            session_id: Some(durable_grandchild.clone()),
+            parent_session_id: Some(child.session_id().clone()),
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: Some("/root/research/grandchild".to_string()),
+            nickname: Some("Durable".to_string()),
+            role: Some("explorer".to_string()),
+        })?;
+
+        handle.close_agent(CloseAgentRequest {
+            agent_id: child.agent_id().clone(),
+            reason: "done inspecting".to_string(),
+        })?;
+
+        let root_children = journal.list_children(root.session_id())?;
+        assert_eq!(root_children[0].status, SpawnEdgeStatus::Closed);
+        let child_children = journal.list_children(child.session_id())?;
+        assert_eq!(child_children[0].child_session_id, durable_grandchild);
+        assert_eq!(child_children[0].status, SpawnEdgeStatus::Closed);
         Ok(())
     }
 
