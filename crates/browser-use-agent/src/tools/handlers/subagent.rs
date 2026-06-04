@@ -404,7 +404,6 @@ struct StoreDelivery {
     nickname: Option<String>,
     role: Option<String>,
     message_id: String,
-    runtime_backed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -550,52 +549,6 @@ fn target_from_store_delivery(delivery: &StoreDelivery) -> AgentEventTarget {
         nickname: delivery.nickname.clone(),
         role: delivery.role.clone(),
         status: None,
-    }
-}
-
-fn mirror_store_delivery_to_runtime_mailbox(
-    deps: &SubagentToolDeps,
-    delivery: &StoreDelivery,
-    message: &str,
-    trigger_turn: bool,
-    tool_name: &str,
-) {
-    let Some(runtime) = deps.runtime_handle.as_ref() else {
-        return;
-    };
-    let Ok(author_agent_id) = RuntimeAgentId::from_string(deps.session_id.clone()) else {
-        return;
-    };
-    let Ok(target_agent_id) = RuntimeAgentId::from_string(delivery.agent_id.clone()) else {
-        return;
-    };
-    let kind = if trigger_turn {
-        RuntimeMailboxItemKind::Followup
-    } else {
-        RuntimeMailboxItemKind::Input
-    };
-    if let Err(error) = runtime.send_agent_message(RuntimeSendAgentMessageRequest {
-        author_agent_id,
-        target_agent_id,
-        content: message.to_string(),
-        trigger_turn,
-        kind,
-        delivery_phase: RuntimeMailboxDeliveryPhase::NextTurn,
-        payload: json!({
-            "message_id": delivery.message_id,
-            "agent_path": delivery.agent_path,
-            "tool": tool_name,
-        }),
-    }) {
-        deps.emit(
-            "mailbox.runtime_mirror_failed",
-            json!({
-                "agent_id": delivery.agent_id,
-                "agent_path": delivery.agent_path,
-                "message_id": delivery.message_id,
-                "error": error.to_string(),
-            }),
-        );
     }
 }
 
@@ -794,47 +747,6 @@ fn runtime_agent_is_active(runtime: &RuntimeHandle, agent_id: &RuntimeAgentId) -
         .unwrap_or(false)
 }
 
-fn parent_can_receive_completion_mail(
-    store: &browser_use_store::Store,
-    parent_session_id: &str,
-) -> anyhow::Result<bool> {
-    let Some(_parent) = store.load_session(parent_session_id)? else {
-        return Ok(false);
-    };
-    // A child can finish after the parent has already ended its current turn.
-    // Keep that completion durable so the next parent turn or wait_agent can drain it.
-    if store
-        .agent_summary_for_child(parent_session_id)?
-        .is_some_and(|agent| agent.status == "closed")
-    {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-fn format_completion_notification(agent_path: &str, status: &str, payload: &Value) -> String {
-    let agent_status = match status {
-        "done" => json!({
-            "completed": payload.get("result").cloned().unwrap_or(Value::Null),
-        }),
-        "failed" => json!({
-            "errored": payload
-                .get("failure")
-                .and_then(Value::as_str)
-                .unwrap_or("agent failed"),
-        }),
-        "cancelled" => json!("shutdown"),
-        _ => json!("not_found"),
-    };
-    format!(
-        "<subagent_notification>\n{}\n</subagent_notification>",
-        json!({
-            "agent_path": agent_path,
-            "status": agent_status,
-        })
-    )
-}
-
 pub(crate) fn store_completion_handler(
     shared_store: SharedStore,
     parent_session_id: String,
@@ -908,16 +820,6 @@ pub(crate) fn store_completion_handler(
                 "payload": payload.clone(),
             }),
         )?;
-        if parent_can_receive_completion_mail(&store, &parent_session_id)? {
-            let child_path = display_agent_path_for_session(&store, &child_session_id)?;
-            let notification = format_completion_notification(&child_path, status, &payload);
-            store.send_agent_message(
-                &child_session_id,
-                &parent_session_id,
-                &notification,
-                false,
-            )?;
-        }
         Ok(())
     })
 }
@@ -1203,7 +1105,6 @@ fn runtime_message_tool(
                 .as_ref()
                 .and_then(|summary| summary.agent_role.clone()),
             message_id: String::new(),
-            runtime_backed: true,
         };
         (delivery, wake_request, author_path)
     };
@@ -1424,7 +1325,6 @@ fn runtime_message_tool_v1(
                 .as_ref()
                 .and_then(|summary| summary.agent_role.clone()),
             message_id: String::new(),
-            runtime_backed: true,
         };
         (delivery, wake_request, author_path, recipient_path)
     };
@@ -2771,15 +2671,6 @@ async fn run_agent_message_tool(
     tool_name: &str,
 ) -> Result<ExecOutput, ToolError> {
     if let Some(delivery) = store_message_tool(deps, target, message, trigger_turn, false)? {
-        if !delivery.runtime_backed {
-            mirror_store_delivery_to_runtime_mailbox(
-                deps,
-                &delivery,
-                message,
-                trigger_turn,
-                tool_name,
-            );
-        }
         let target = target_from_store_delivery(&delivery);
         emit_collab_interaction_begin(deps, ctx, &target.thread_id, message);
         let status = target_from_store_agent(deps, &target.thread_id)

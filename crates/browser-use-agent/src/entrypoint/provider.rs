@@ -3610,8 +3610,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_backed_child_runner_completion_writes_durable_parent_mail_once_but_wait_requires_runtime(
-    ) {
+    async fn store_backed_child_runner_completion_writes_projection_once_but_wait_requires_runtime()
+    {
         use crate::config_overrides::{AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunner};
         use crate::tools::orchestrator::ToolOrchestrator;
         use crate::tools::registry::ToolRegistry;
@@ -3749,12 +3749,10 @@ mod tests {
             "completion should be recorded once"
         );
         let parent_mail = store.messages_for_agent(&root_id).unwrap();
-        assert_eq!(
-            parent_mail.len(),
-            1,
-            "completion mail should be queued once"
+        assert!(
+            parent_mail.is_empty(),
+            "Store completion projection must not enqueue live mailbox rows"
         );
-        assert!(parent_mail[0].content.contains("<subagent_notification>"));
     }
 
     /// The production dispatcher advertises the three goal tools

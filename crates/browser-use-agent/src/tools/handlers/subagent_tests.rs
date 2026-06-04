@@ -460,14 +460,14 @@ async fn store_backed_v2_wait_requires_live_runtime_mailbox() {
 }
 
 #[tokio::test]
-async fn store_backed_v2_wait_does_not_consume_durable_completion_mail() {
+async fn store_backed_v2_wait_does_not_consume_durable_completion_projection() {
     let (_dir, store, root_id, child_id, _sink, mut deps) = deps_with_store_tree();
     let handler = store_completion_handler(store.clone(), root_id.clone(), child_id, None);
     handler
         .notify(ChildAgentRunCompletion::success(Some(
             "queued result".to_string(),
         )))
-        .expect("completion should queue parent mail");
+        .expect("completion should project parent terminal event");
 
     deps.wait_timeouts = WaitAgentTimeoutOptions {
         default_timeout_ms: 1,
@@ -483,7 +483,7 @@ async fn store_backed_v2_wait_does_not_consume_durable_completion_mail() {
         },
     )
     .await
-    .expect_err("durable completion mail must not wake Store-backed wait");
+    .expect_err("durable completion projection must not wake Store-backed wait");
     assert!(
         format!("{err:?}").contains("requires a live runtime mailbox"),
         "{err:?}"
@@ -491,8 +491,10 @@ async fn store_backed_v2_wait_does_not_consume_durable_completion_mail() {
 
     let store = store.lock().unwrap();
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
-    assert_eq!(parent_mail.len(), 1);
-    assert!(parent_mail[0].content.contains("queued result"));
+    assert!(
+        parent_mail.is_empty(),
+        "Store-backed completion projection must not enqueue live mailbox rows"
+    );
 }
 
 #[tokio::test]
@@ -1157,7 +1159,7 @@ async fn followup_task_requires_runtime_mailbox_for_store_child() {
 }
 
 #[tokio::test]
-async fn store_completion_handler_queues_mail_for_done_parent() {
+async fn store_completion_handler_projects_done_parent_without_store_mail() {
     let (_dir, store, root_id, child_id, _sink, _deps) = deps_with_store_tree();
     let run_id = "late-run".to_string();
     let handler = store_completion_handler(
@@ -1197,10 +1199,10 @@ async fn store_completion_handler_queues_mail_for_done_parent() {
         1
     );
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
-    assert_eq!(parent_mail.len(), 1);
-    assert!(parent_mail[0].content.contains("<subagent_notification>"));
-    assert!(parent_mail[0].content.contains("late result"));
-    assert!(!parent_mail[0].trigger_turn);
+    assert!(
+        parent_mail.is_empty(),
+        "Store completion projection must not enqueue live mailbox rows"
+    );
 }
 
 #[tokio::test]
@@ -1278,8 +1280,10 @@ async fn store_completion_handler_ignores_stale_run_marker_after_restart() {
         1
     );
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
-    assert_eq!(parent_mail.len(), 1);
-    assert!(parent_mail[0].content.contains("fresh result"));
+    assert!(
+        parent_mail.is_empty(),
+        "Store completion projection must not enqueue live mailbox rows"
+    );
 }
 
 #[tokio::test]
@@ -1374,8 +1378,10 @@ async fn store_completion_handler_writes_current_run_completion_once() {
         "duplicate failure must not overwrite first completion: {parent_events:?}"
     );
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
-    assert_eq!(parent_mail.len(), 1);
-    assert!(parent_mail[0].content.contains("first result"));
+    assert!(
+        parent_mail.is_empty(),
+        "Store completion projection must not enqueue live mailbox rows"
+    );
 }
 
 #[tokio::test]
