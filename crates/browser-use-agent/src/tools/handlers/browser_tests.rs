@@ -387,6 +387,9 @@ async fn dynamic_browser_mode_uses_latest_store_browser_setting_mid_run() {
     {
         let store = store.lock().unwrap();
         store.set_setting("browser", "Local Chrome").unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Default")
+            .unwrap();
     }
     let tool = tool_with(Arc::clone(&backend))
         .with_selected_browser_mode(Some("cloud".to_string()))

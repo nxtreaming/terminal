@@ -87,9 +87,9 @@ fn browser_mode_instruction_matches_main_local_connection_guidance() {
     assert!(prompt.contains("Selected browser mode: Local Chrome"));
     assert!(prompt.contains("Use `browser connect local` before page work"));
     assert!(prompt.contains("browser local setup"));
-    assert!(prompt.contains("open that chosen profile's Chrome window before retrying"));
-    assert!(prompt.contains("Do not launch generic Chrome first for this path"));
-    assert!(prompt.contains("https://<domain>"));
+    assert!(prompt.contains("no default profile is set"));
+    assert!(prompt.contains("browser profile use <profile-id>"));
+    assert!(prompt.contains("/profile"));
 }
 
 /// Plan mode was removed. The compatibility enum value now renders the Default

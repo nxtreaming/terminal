@@ -3085,7 +3085,9 @@ fn browser_issue_diagnosis(
         "permission-blocked" => (
             "Chrome rejected browser control.",
             "The browser endpoint returned a permission or 403 error for CDP control.",
-            status_next_step.unwrap_or("Run browser local setup, then reconnect.").to_string(),
+            status_next_step
+                .unwrap_or("Ask the user to click Allow in Chrome's 'Allow remote debugging?' popup, then reconnect.")
+                .to_string(),
             false,
             false,
         ),
@@ -3182,7 +3184,10 @@ fn local_connect_error_reason(kind: &str, raw_error: &str) -> String {
 
 fn local_connect_next_step(kind: &str) -> &'static str {
     match kind {
-        "permission-blocked" | "cdp-disabled" => "browser local setup",
+        "permission-blocked" => {
+            "Ask the user to click Allow in Chrome's 'Allow remote debugging?' popup, then run browser connect local"
+        }
+        "cdp-disabled" => "browser local setup",
         "browser-closed" => "Open Chrome with the selected profile, then run browser connect local",
         "target-gone" => "Use browser_script list_tabs()/switch_tab(...) or open a new tab",
         _ => "browser doctor --json",
