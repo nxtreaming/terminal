@@ -72,6 +72,23 @@ pub(crate) fn pending_runtime_agent_mailbox_count(
     }
 }
 
+pub(crate) fn pending_runtime_trigger_turn_agent_mailbox_count(
+    state_dir: &Path,
+    session_id: &str,
+) -> Result<Option<usize>> {
+    let handle = existing_tui_runtime_handle(state_dir)?;
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    let session_id = SessionId::from_string(session_id.to_string())?;
+    match handle.pending_agent_mail_for_session(&session_id) {
+        Ok(items) => Ok(Some(
+            items.into_iter().filter(|item| item.trigger_turn).count(),
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
 pub(crate) fn has_live_runtime_agent(state_dir: &Path, session_id: &str) -> bool {
     let Ok(Some(handle)) = existing_tui_runtime_handle(state_dir) else {
         return false;

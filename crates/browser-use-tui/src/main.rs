@@ -110,7 +110,7 @@ use render::{
     APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
 use runtime::{
-    cancel_agent_run, has_live_runtime_agent, pending_runtime_agent_mailbox_count,
+    cancel_agent_run, has_live_runtime_agent, pending_runtime_trigger_turn_agent_mailbox_count,
     spawn_tui_agent_run, submit_runtime_user_input,
 };
 use settings::{
@@ -2633,7 +2633,8 @@ impl App {
             return Ok(false);
         }
         let mailbox_count =
-            pending_runtime_agent_mailbox_count(&self.args.state_dir, &session_id)?.unwrap_or(0);
+            pending_runtime_trigger_turn_agent_mailbox_count(&self.args.state_dir, &session_id)?
+                .unwrap_or(0);
         if mailbox_count == 0 {
             return Ok(false);
         }
@@ -12551,11 +12552,26 @@ wire_api = "responses"
             Some(1)
         );
         assert_eq!(
+            runtime::pending_runtime_trigger_turn_agent_mailbox_count(
+                &app.args.state_dir,
+                &parent.id
+            )?,
+            Some(0)
+        );
+        assert!(
+            !app.flush_ready_agent_mailbox_continuation()?,
+            "non-triggering child completion mail must not auto-resume an idle parent"
+        );
+        assert_eq!(
             app.store
                 .load_session(&parent.id)?
                 .map(|session| session.status),
             Some(SessionStatus::Done)
         );
+        let parent_events = app.store.events_for_session(&parent.id)?;
+        assert!(parent_events
+            .iter()
+            .all(|event| event.event_type != SESSION_MAILBOX_CONTINUATION_STARTED_EVENT));
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
         let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
