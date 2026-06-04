@@ -11279,6 +11279,51 @@ mod redesign_tests {
         Ok(())
     }
 
+    #[test]
+    fn context_surface_respects_latest_zero_input_tokens() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect context usage"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 50000, "total_tokens": 50500 },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 0
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 0, "total_tokens": 0 },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 1
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("0/128k"));
+        assert!(screen.contains("No context yet."));
+        assert!(!screen.contains("50k/128k"));
+        assert!(!screen.contains("User messages"));
+        Ok(())
+    }
+
     // Without a recorded composition (older sessions), the rest of the window is
     // shown as a single "System prompt + tools" row so the breakdown still
     // covers the whole window — nothing hidden behind a disclaimer.

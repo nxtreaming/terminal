@@ -3016,7 +3016,9 @@ fn context_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'s
 
     // Reconcile the heuristic estimate to the real window so the rows sum to it.
     let attributed: i64 = components.iter().map(|component| component.tokens).sum();
-    if attributed > 0 && window_used > 0 {
+    if window_used == 0 {
+        components.clear();
+    } else if attributed > 0 {
         for component in &mut components {
             component.tokens =
                 ((component.tokens as i128 * window_used as i128) / attributed as i128) as i64;
@@ -3079,9 +3081,8 @@ fn context_usage_from_events(events: &[EventRecord]) -> ContextUsageSummary {
             .get("last_token_usage")
             .and_then(|usage| usage.get("input_tokens"))
             .and_then(Value::as_i64)
-            .filter(|tokens| *tokens > 0)
         {
-            summary.latest_input_tokens = Some(input);
+            summary.latest_input_tokens = Some(input.max(0));
         }
         if let Some(context_window) = info
             .get("model_context_window")
