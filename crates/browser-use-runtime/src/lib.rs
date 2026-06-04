@@ -1617,6 +1617,22 @@ pub struct RuntimeActivitySnapshot {
     pub last_delta: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RuntimeModelRequestSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_idx: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u64>,
+    pub status: String,
+    pub retry_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct AgentLiveStateSnapshot {
     pub accepted_input_count: usize,
@@ -1638,6 +1654,8 @@ pub struct AgentLiveStateSnapshot {
     pub last_model_delta: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model_thinking_delta: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model_request: Option<RuntimeModelRequestSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_token_usage: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2812,6 +2830,7 @@ impl RuntimeProjectionState {
                     agent.live.failure = None;
                 }
                 agent.live.active_items.clear();
+                agent.live.active_model_request = None;
             }
             RuntimeEventKind::AgentTurnAborted
             | RuntimeEventKind::AgentFailed
@@ -2820,6 +2839,7 @@ impl RuntimeProjectionState {
                     agent.live.failure = Some(failure);
                 }
                 agent.live.active_items.clear();
+                agent.live.active_model_request = None;
             }
             _ => {}
         }
@@ -2829,6 +2849,34 @@ impl RuntimeProjectionState {
         };
         let payload = event_payload(event);
         match event_type {
+            "model.turn.request" => {
+                agent.live.active_model_request =
+                    Some(RuntimeModelRequestSnapshot::from_request_payload(payload));
+                agent.live.last_model_delta = None;
+                agent.live.last_model_thinking_delta = None;
+            }
+            "model.turn.retry" => {
+                let retry = RuntimeModelRequestSnapshot::from_retry_payload(
+                    agent.live.active_model_request.take(),
+                    payload,
+                );
+                agent.live.active_model_request = Some(retry);
+                agent.live.last_model_delta = None;
+                agent.live.last_model_thinking_delta = None;
+            }
+            "model.turn.error" => {
+                let error = RuntimeModelRequestSnapshot::from_error_payload(
+                    agent.live.active_model_request.take(),
+                    payload,
+                );
+                agent.live.failure = error.last_error.clone();
+                agent.live.active_model_request = Some(error);
+                agent.live.last_model_delta = None;
+                agent.live.last_model_thinking_delta = None;
+            }
+            "model.turn.response" => {
+                agent.live.active_model_request = None;
+            }
             "model.stream_delta" => {
                 if let Some(text) = output_delta_text(payload) {
                     agent.live.last_model_delta = Some(text);
@@ -2868,12 +2916,22 @@ impl RuntimeProjectionState {
                     agent.live.failure = None;
                 }
                 agent.live.active_items.clear();
+                agent.live.active_model_request = None;
             }
-            "session.failed" | "stream_error" | "model.turn.error" => {
+            "session.failed" | "stream_error" => {
                 if let Some(failure) = terminal_failure(payload) {
                     agent.live.failure = Some(failure);
                 }
                 agent.live.active_items.clear();
+                if event_type == "stream_error" {
+                    let error = RuntimeModelRequestSnapshot::from_error_payload(
+                        agent.live.active_model_request.take(),
+                        payload,
+                    );
+                    agent.live.active_model_request = Some(error);
+                } else {
+                    agent.live.active_model_request = None;
+                }
             }
             _ => {}
         }
@@ -2952,6 +3010,71 @@ impl RuntimeProjectionState {
             .browsers
             .iter_mut()
             .find(|browser| browser.id == *browser_id)
+    }
+}
+
+impl RuntimeModelRequestSnapshot {
+    fn from_request_payload(payload: &Value) -> Self {
+        Self {
+            model: payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            provider: payload
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            turn_idx: payload.get("turn_idx").and_then(Value::as_i64),
+            attempt: payload.get("attempt").and_then(value_to_u64),
+            status: "requesting".to_string(),
+            retry_count: 0,
+            last_error: None,
+        }
+    }
+
+    fn from_retry_payload(previous: Option<Self>, payload: &Value) -> Self {
+        let mut next = previous.unwrap_or_else(|| Self {
+            model: None,
+            provider: None,
+            turn_idx: None,
+            attempt: None,
+            status: "requesting".to_string(),
+            retry_count: 0,
+            last_error: None,
+        });
+        next.status = "retrying".to_string();
+        next.retry_count = next.retry_count.saturating_add(1);
+        if let Some(attempt) = payload.get("attempt").and_then(value_to_u64) {
+            next.attempt = Some(attempt);
+        }
+        if let Some(error) = terminal_failure(payload) {
+            next.last_error = Some(error);
+        }
+        next
+    }
+
+    fn from_error_payload(previous: Option<Self>, payload: &Value) -> Self {
+        let mut next = previous.unwrap_or_else(|| Self {
+            model: payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            provider: payload
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            turn_idx: payload.get("turn_idx").and_then(Value::as_i64),
+            attempt: payload.get("attempt").and_then(value_to_u64),
+            status: "requesting".to_string(),
+            retry_count: 0,
+            last_error: None,
+        });
+        next.status = "error".to_string();
+        if let Some(attempt) = payload.get("attempt").and_then(value_to_u64) {
+            next.attempt = Some(attempt);
+        }
+        next.last_error = terminal_failure(payload);
+        next
     }
 }
 
@@ -3169,6 +3292,12 @@ fn terminal_failure(payload: &Value) -> Option<String> {
         .or_else(|| payload.get("message"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn value_to_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
 }
 
 fn mailbox_item_from_payload(payload: &Value) -> Option<MailboxItem> {
@@ -8083,6 +8212,109 @@ mod tests {
         let root_live = projected_agent_live(&done, root.agent_id());
         assert_eq!(root_live.final_result.as_deref(), Some("final answer"));
         assert_eq!(root_live.failure, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projected_subscription_reduces_observed_model_lifecycle_state() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let mut subscription = handle.subscribe_projected();
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "model.turn.request",
+            json!({
+                "model": "gpt-5.5",
+                "provider": "openai",
+                "turn_idx": 4,
+                "attempt": 0,
+            }),
+            Durability::Barrier,
+        )?;
+        let request = subscription.recv().await?;
+        let root_live = projected_agent_live(&request, root.agent_id());
+        let model = root_live
+            .active_model_request
+            .as_ref()
+            .expect("active model request");
+        assert_eq!(model.status, "requesting");
+        assert_eq!(model.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(model.provider.as_deref(), Some("openai"));
+        assert_eq!(model.turn_idx, Some(4));
+        assert_eq!(model.attempt, Some(0));
+        assert_eq!(model.retry_count, 0);
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "model.stream_delta",
+            json!({ "text": "partial before retry" }),
+            Durability::BestEffort,
+        )?;
+        let delta = subscription.recv().await?;
+        let root_live = projected_agent_live(&delta, root.agent_id());
+        assert_eq!(
+            root_live.last_model_delta.as_deref(),
+            Some("partial before retry")
+        );
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "model.turn.retry",
+            json!({
+                "attempt": 1,
+                "message": "transport retry",
+            }),
+            Durability::Barrier,
+        )?;
+        let retry = subscription.recv().await?;
+        let root_live = projected_agent_live(&retry, root.agent_id());
+        let model = root_live
+            .active_model_request
+            .as_ref()
+            .expect("retrying model request");
+        assert_eq!(model.status, "retrying");
+        assert_eq!(model.retry_count, 1);
+        assert_eq!(model.attempt, Some(1));
+        assert_eq!(model.last_error.as_deref(), Some("transport retry"));
+        assert_eq!(root_live.last_model_delta, None);
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "stream_error",
+            json!({ "message": "temporary stream failure" }),
+            Durability::BestEffort,
+        )?;
+        let stream_error = subscription.recv().await?;
+        let root_live = projected_agent_live(&stream_error, root.agent_id());
+        let model = root_live
+            .active_model_request
+            .as_ref()
+            .expect("stream error model request");
+        assert_eq!(model.status, "error");
+        assert_eq!(
+            model.last_error.as_deref(),
+            Some("temporary stream failure")
+        );
+        assert_eq!(
+            root_live.failure.as_deref(),
+            Some("temporary stream failure")
+        );
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "model.turn.response",
+            json!({ "turn_idx": 4 }),
+            Durability::Barrier,
+        )?;
+        let response = subscription.recv().await?;
+        let root_live = projected_agent_live(&response, root.agent_id());
+        assert_eq!(root_live.active_model_request, None);
         Ok(())
     }
 

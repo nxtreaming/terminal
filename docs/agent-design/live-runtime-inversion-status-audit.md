@@ -135,8 +135,10 @@ BrowserUseRuntime
   projects active sessions from cached runtime snapshots at render time without
   mutating Store-derived history. Durable history/sidebar/event text still come
   from SQLite. The SDK consumes projected events for `Agent.stream()`, and
-  runtime projection now has a state reducer, but the reducer does not yet cover
-  the full model request/retry/error lifecycle.
+  runtime projection now has a state reducer covering agent status, child state,
+  mailbox continuation state, browser state, observed tool activity, model
+  stream/thinking deltas, active model request/retry/error lifecycle, token
+  usage, and terminal result/failure state.
 - Replay materialization restores important mailbox/live counters and marks
   common stale tool resources lost, but full crash recovery still does not
   hydrate every durable graph field or make browser leases/script registries

@@ -287,7 +287,7 @@ BrowserUseRuntime
       - [ ] live model/tool activity
         - [x] observed tool start/delta/completion state
         - [x] latest model stream/thinking deltas
-        - [ ] active model request/retry/error lifecycle
+        - [x] active model request/retry/error lifecycle
       - [x] child agent statuses
       - [x] mailbox continuation state
       - [x] browser status
