@@ -2749,9 +2749,7 @@ pub async fn run_session_with_config_with_cancel_and_runtime(
     let response = runtime_handle
         .run_agent(
             request,
-            RuntimeTurnDriver::new(store, session_id, config, cancel)
-                .with_runtime_handle(Some(runtime_handle.clone()))
-                .run(),
+            RuntimeTurnDriver::new(store, session_id, config, cancel, runtime_handle.clone()).run(),
         )
         .await?;
     Ok(response.output)
@@ -2833,7 +2831,7 @@ pub struct RuntimeTurnDriver {
     session_id: SessionId,
     config: ProviderRunConfig,
     cancel: CancellationToken,
-    runtime_handle: Option<RuntimeHandle>,
+    runtime_handle: RuntimeHandle,
 }
 
 impl RuntimeTurnDriver {
@@ -2842,35 +2840,26 @@ impl RuntimeTurnDriver {
         session_id: impl Into<String>,
         config: ProviderRunConfig,
         cancel: CancellationToken,
+        runtime_handle: RuntimeHandle,
     ) -> Self {
         Self {
             store,
             session_id: SessionId(session_id.into()),
             config,
             cancel,
-            runtime_handle: None,
+            runtime_handle,
         }
-    }
-
-    pub fn with_runtime_handle(mut self, runtime_handle: Option<RuntimeHandle>) -> Self {
-        self.runtime_handle = runtime_handle;
-        self
     }
 
     pub async fn run(self) -> anyhow::Result<SessionId> {
         loop {
             self.run_once().await?;
 
-            let has_pending_trigger_turn_mail = self
-                .runtime_handle
-                .as_ref()
-                .map(|runtime_handle| {
-                    has_pending_runtime_trigger_turn_agent_mail_any_phase(
-                        runtime_handle,
-                        self.session_id.as_str(),
-                    )
-                })
-                .unwrap_or(false);
+            let has_pending_trigger_turn_mail =
+                has_pending_runtime_trigger_turn_agent_mail_any_phase(
+                    &self.runtime_handle,
+                    self.session_id.as_str(),
+                );
             if self.cancel.is_cancelled() || !has_pending_trigger_turn_mail {
                 return Ok(self.session_id);
             }
@@ -2883,7 +2872,7 @@ impl RuntimeTurnDriver {
             self.session_id.clone(),
             self.config.clone(),
             self.cancel.clone(),
-            self.runtime_handle.clone(),
+            Some(self.runtime_handle.clone()),
         )
         .await
     }

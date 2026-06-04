@@ -240,8 +240,8 @@ impl RuntimeAgentExecutor {
                             request_session_id_for_run,
                             config_for_run,
                             cancel_for_run,
+                            runner_runtime,
                         )
-                        .with_runtime_handle(Some(runner_runtime))
                         .run()
                         .await
                     })
