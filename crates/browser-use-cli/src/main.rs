@@ -1497,7 +1497,6 @@ fn spawn_cli_child_agent(
     let child_id = child.id.clone();
     record_child_run_marker_from_request(&store, &child_id, &request)?;
     apply_cli_child_request_to_config(&mut base_config, &request)?;
-    let completion_handler = request.completion_handler.clone();
     executor.spawn_background(
         format!("browser-use-child-{child_id}"),
         RuntimeAgentRunRequest::new(child_id.clone(), base_config),
@@ -1510,17 +1509,12 @@ fn spawn_cli_child_agent(
                 completion.error_message(),
                 events.as_deref(),
             ) {
-                let runtime_notified = notify_cli_runtime_child_completion(
+                if let Err(error) = notify_cli_runtime_child_completion(
                     &runtime_handle,
                     &child_id,
                     &child_completion,
-                );
-                if !runtime_notified {
-                    if let Some(handler) = completion_handler {
-                        if let Err(error) = handler.notify(child_completion) {
-                            eprintln!("child agent completion notification failed: {error:#}");
-                        }
-                    }
+                ) {
+                    eprintln!("child agent completion runtime update failed: {error:#}");
                 }
             }
         },
@@ -1569,14 +1563,8 @@ fn notify_cli_runtime_child_completion(
     runtime_handle: &RuntimeHandle,
     child_id: &str,
     completion: &ChildAgentRunCompletion,
-) -> bool {
-    let child_agent_id = match AgentId::from_string(child_id.to_string()) {
-        Ok(child_agent_id) => child_agent_id,
-        Err(error) => {
-            eprintln!("child agent completion runtime id failed: {error:#}");
-            return false;
-        }
-    };
+) -> Result<()> {
+    let child_agent_id = AgentId::from_string(child_id.to_string())?;
     let runtime_result = if completion.success {
         runtime_handle.complete_agent(CompleteAgentRequest {
             child_agent_id,
@@ -1591,11 +1579,7 @@ fn notify_cli_runtime_child_completion(
                 .unwrap_or_else(|| "child agent failed".to_string()),
         })
     };
-    if let Err(error) = runtime_result {
-        eprintln!("child agent completion runtime update failed: {error:#}");
-        return false;
-    }
-    true
+    runtime_result
 }
 
 fn cli_child_completion_from_background(
