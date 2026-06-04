@@ -2872,7 +2872,7 @@ impl RuntimeTurnDriver {
             self.session_id.clone(),
             self.config.clone(),
             self.cancel.clone(),
-            Some(self.runtime_handle.clone()),
+            self.runtime_handle.clone(),
         )
         .await
     }
@@ -2883,7 +2883,7 @@ async fn run_session_once_with_config_with_cancel(
     session_id: SessionId,
     config: ProviderRunConfig,
     cancel: CancellationToken,
-    runtime_handle: Option<RuntimeHandle>,
+    runtime_handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
     let ctx = turn_ctx(&session_id, &config);
 
@@ -2900,14 +2900,11 @@ async fn run_session_once_with_config_with_cancel(
     //     recorder writing into `recorded`, so model tool-calls EXECUTE and their
     //     outputs re-enter the prompt.
     let model_context_window = effective_context_window_for_config(&config);
-    let driver_sink: Arc<dyn EventSink> = match runtime_handle.clone() {
-        Some(runtime) => Arc::new(RuntimeStoreSink {
-            runtime,
-            store: Arc::clone(&store),
-            model_context_window,
-        }),
-        None => make_ui_sink_with_context_window(Arc::clone(&store), model_context_window),
-    };
+    let driver_sink: Arc<dyn EventSink> = Arc::new(RuntimeStoreSink {
+        runtime: runtime_handle.clone(),
+        store: Arc::clone(&store),
+        model_context_window,
+    });
     let fusion_recorder: Arc<dyn FusionRecorder> = Arc::new(BufferRecorder {
         buffer: Arc::clone(&recorded),
     });
@@ -2942,7 +2939,7 @@ async fn run_session_once_with_config_with_cancel(
         user_input_ctx,
         tool_cwd,
         tool_artifact_root,
-        runtime_handle.clone(),
+        Some(runtime_handle.clone()),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -2965,13 +2962,8 @@ async fn run_session_once_with_config_with_cancel(
     // The run drives over the session's existing durable history (the prompt the
     // caller already seeded). Runtime-backed callers own the live "fresh input"
     // fact explicitly (`agent.input.accepted` -> `agent.input.consumed`), while
-    // SQLite remains the transcript/replay source. Legacy no-runtime callers keep
-    // the old store-derived gate.
-    let turn_has_fresh_input = if let Some(runtime) = runtime_handle.as_ref() {
-        consume_runtime_prompt_input(runtime, session_id.as_str())?
-    } else {
-        log_has_user_input(&store, session_id.as_str())
-    };
+    // SQLite remains the transcript/replay source.
+    let turn_has_fresh_input = consume_runtime_prompt_input(&runtime_handle, session_id.as_str())?;
 
     // (3) drive the loop to quiescence with the resolved driver. The SAME
     //     `recorded` buffer the recorder writes is handed to the state, so the
@@ -2993,7 +2985,7 @@ async fn run_session_once_with_config_with_cancel(
             let previous_model_compaction = previous_model_compaction_for_config(
                 &store,
                 &session_id,
-                runtime_handle.as_ref(),
+                Some(&runtime_handle),
                 &config,
             );
             let compaction_sampler = {
@@ -3021,7 +3013,7 @@ async fn run_session_once_with_config_with_cancel(
                 Some(base_instructions_for_config(&config)),
                 config.options.developer_instructions.clone(),
                 previous_model_compaction,
-                runtime_handle.clone(),
+                Some(runtime_handle.clone()),
                 cancel.clone(),
             )
             .await?;
@@ -3046,7 +3038,7 @@ async fn run_session_once_with_config_with_cancel(
                 None,
                 None,
                 None,
-                runtime_handle.clone(),
+                Some(runtime_handle.clone()),
                 cancel.clone(),
             )
             .await?;
@@ -3054,23 +3046,6 @@ async fn run_session_once_with_config_with_cancel(
     }
 
     Ok(())
-}
-
-/// True iff the session's durable log already contains a real user turn
-/// (`session.input`), used to seed the loop's initial drain gate.
-fn log_has_user_input(store: &SharedStore, session_id: &str) -> bool {
-    let store = store.lock().expect("store mutex poisoned");
-    store
-        .events_for_session(session_id)
-        .map(|events| {
-            events.iter().any(|e| {
-                matches!(
-                    e.event_type.as_str(),
-                    "session.input" | "agent.mailbox_input"
-                )
-            })
-        })
-        .unwrap_or(false)
 }
 
 /// The retry budget for the sampling driver (see [`DEFAULT_STREAM_MAX_RETRIES`]).
