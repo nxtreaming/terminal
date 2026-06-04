@@ -1156,127 +1156,20 @@ fn store_message_tool(
     trigger_turn: bool,
     interrupt: bool,
 ) -> Result<Option<StoreDelivery>, ToolError> {
-    if let Some(delivery) = runtime_message_tool(deps, target, message, trigger_turn, interrupt)? {
-        return Ok(Some(delivery));
-    }
-    let Some(shared_store) = deps.store.as_ref() else {
-        return Ok(None);
-    };
     if message.trim().is_empty() {
         return Err(ToolError::Other(anyhow::anyhow!(
             "Empty message can't be sent to an agent"
         )));
     }
-
-    let (delivery, wake_request) = {
-        let store = shared_store
-            .lock()
-            .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-        let target = store_resolve_agent_reference_in_tree_v2(&store, &deps.session_id, target)
-            .map_err(|err| tool_err("resolve agent target failed", err))?
-            .ok_or_else(|| {
-                ToolError::Other(anyhow::anyhow!("live agent path `{target}` not found"))
-            })?;
-        if trigger_turn && target.is_root {
-            return Err(ToolError::Other(anyhow::anyhow!(
-                "Tasks can't be assigned to the root agent"
-            )));
-        }
-        let target_status = store
-            .load_session(&target.session_id)
-            .map_err(|err| tool_err("load target agent failed", err))?
-            .map(|session| session.status);
-        if interrupt
-            && target_status
-                .as_ref()
-                .is_some_and(browser_use_protocol::SessionStatus::is_active)
-        {
-            store
-                .request_cancel(&target.session_id, "interrupted by send_input")
-                .map_err(|err| tool_err("interrupt target agent failed", err))?;
-        }
-        let msg = store
-            .send_agent_message(&deps.session_id, &target.session_id, message, trigger_turn)
-            .map_err(|err| tool_err("send agent message failed", err))?;
-        let author_path = display_agent_path_for_session(&store, &deps.session_id)
-            .map_err(|err| tool_err("resolve author path failed", err))?;
-        store
-            .append_event(
-                &deps.session_id,
-                "agent.message",
-                json!({
-                    "id": msg.id,
-                    "author_session_id": msg.author_session_id,
-                    "target_session_id": msg.target_session_id,
-                    "author_path": author_path,
-                    "recipient_path": target.agent_path,
-                    "child_session_id": target.session_id,
-                    "content": msg.content,
-                    "input_items": msg.input_items,
-                    "input_kind": msg.input_kind,
-                    "trigger_turn": msg.trigger_turn,
-                    "interrupt": interrupt,
-                }),
-            )
-            .map_err(|err| tool_err("record agent message failed", err))?;
-        let target_is_running = store
-            .load_session(&target.session_id)
-            .map_err(|err| tool_err("load target agent failed", err))?
-            .is_some_and(|session| session.status == browser_use_protocol::SessionStatus::Running);
-        let wake_request = if trigger_turn && !target_is_running {
-            if let Some(summary) = target.summary.as_ref() {
-                let run_id = browser_use_store::new_thread_id();
-                let run_config = latest_child_run_config(&store, &target.session_id)?;
-                Some(store_child_run_request(
-                    shared_store,
-                    summary,
-                    target.session_id.clone(),
-                    Some(target.agent_path.clone()),
-                    run_id,
-                    message.to_string(),
-                    None,
-                    run_config,
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let delivery = StoreDelivery {
-            agent_path: target.agent_path.clone(),
-            agent_id: target.session_id.clone(),
-            nickname: target
-                .summary
-                .as_ref()
-                .and_then(|summary| summary.agent_nickname.clone()),
-            role: target
-                .summary
-                .as_ref()
-                .and_then(|summary| summary.agent_role.clone()),
-            message_id: msg.id,
-            runtime_backed: false,
-        };
-        (delivery, wake_request)
-    };
-    if let (Some(runner), Some(request)) = (deps.child_runner.as_ref(), wake_request) {
-        if interrupt {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            store
-                .set_status(
-                    &request.child_session_id,
-                    browser_use_protocol::SessionStatus::Created,
-                )
-                .map_err(|err| tool_err("reset interrupted target agent failed", err))?;
-        }
-        runner
-            .run(request)
-            .map_err(|err| tool_err("trigger target agent failed", err))?;
+    if let Some(delivery) = runtime_message_tool(deps, target, message, trigger_turn, interrupt)? {
+        return Ok(Some(delivery));
     }
-    Ok(Some(delivery))
+    if deps.store.is_some() {
+        return Err(ToolError::Other(anyhow::anyhow!(
+            "subagent messaging requires a live runtime mailbox; Store-backed send is replay-only"
+        )));
+    }
+    Ok(None)
 }
 
 fn runtime_message_tool(
@@ -1507,127 +1400,22 @@ fn store_message_tool_v1(
     input_items: Option<Value>,
     interrupt: bool,
 ) -> Result<Option<StoreDelivery>, ToolError> {
-    if let Some(delivery) =
-        runtime_message_tool_v1(deps, target, message, input_items.clone(), interrupt)?
-    {
-        return Ok(Some(delivery));
-    }
-    let Some(shared_store) = deps.store.as_ref() else {
-        return Ok(None);
-    };
-    let target = legacy_agent_id_target(target)?;
     if message.trim().is_empty() {
         return Err(ToolError::Other(anyhow::anyhow!(
             "Empty message can't be sent to an agent"
         )));
     }
-
-    let (delivery, wake_request) = {
-        let store = shared_store
-            .lock()
-            .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-        let target_session = store
-            .load_session(target)
-            .map_err(|err| tool_err("load target agent failed", err))?
-            .ok_or_else(|| ToolError::Other(anyhow::anyhow!("agent with id {target} not found")))?;
-        if interrupt && target_session.status.is_active() {
-            store
-                .request_cancel(target, "interrupted by send_input")
-                .map_err(|err| tool_err("interrupt target agent failed", err))?;
-        }
-        let msg = store
-            .send_agent_message_with_input_items(
-                &deps.session_id,
-                target,
-                message,
-                input_items.clone(),
-                true,
-            )
-            .map_err(|err| tool_err("send agent message failed", err))?;
-        let author_path = display_agent_path_for_session(&store, &deps.session_id)
-            .map_err(|err| tool_err("resolve author path failed", err))?;
-        let recipient_path = display_agent_path_for_session(&store, target)
-            .map_err(|err| tool_err("resolve recipient path failed", err))?;
-        store
-            .append_event(
-                &deps.session_id,
-                "agent.message",
-                json!({
-                    "id": msg.id,
-                    "author_session_id": msg.author_session_id,
-                    "target_session_id": msg.target_session_id,
-                    "author_path": author_path,
-                    "recipient_path": recipient_path,
-                    "child_session_id": target,
-                    "content": msg.content,
-                    "input_items": msg.input_items,
-                    "input_kind": msg.input_kind,
-                    "trigger_turn": msg.trigger_turn,
-                    "interrupt": interrupt,
-                }),
-            )
-            .map_err(|err| tool_err("record agent message failed", err))?;
-        let target_is_running = store
-            .load_session(target)
-            .map_err(|err| tool_err("load target agent failed", err))?
-            .is_some_and(|session| session.status == browser_use_protocol::SessionStatus::Running);
-        let summary = store
-            .agent_summary_for_child(target)
-            .map_err(|err| tool_err("load target child edge failed", err))?;
-        let wake_request = if !target_is_running {
-            if let Some(summary) = summary.as_ref() {
-                let run_id = browser_use_store::new_thread_id();
-                let run_config = latest_child_run_config(&store, target)?;
-                Some(store_child_run_request(
-                    shared_store,
-                    summary,
-                    target.to_string(),
-                    Some(recipient_path.clone()),
-                    run_id,
-                    message.to_string(),
-                    input_items.clone(),
-                    run_config,
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        (
-            StoreDelivery {
-                agent_path: recipient_path,
-                agent_id: target.to_string(),
-                nickname: summary
-                    .as_ref()
-                    .and_then(|summary| summary.agent_nickname.clone()),
-                role: summary
-                    .as_ref()
-                    .and_then(|summary| summary.agent_role.clone()),
-                message_id: msg.id,
-                runtime_backed: false,
-            },
-            wake_request,
-        )
-    };
-    if let (Some(runner), Some(request)) = (deps.child_runner.as_ref(), wake_request) {
-        if interrupt {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            store
-                .set_status(
-                    &request.child_session_id,
-                    browser_use_protocol::SessionStatus::Created,
-                )
-                .map_err(|err| tool_err("reset interrupted target agent failed", err))?;
-        }
-        runner
-            .run(request)
-            .map_err(|err| tool_err("trigger target agent failed", err))?;
+    if let Some(delivery) =
+        runtime_message_tool_v1(deps, target, message, input_items.clone(), interrupt)?
+    {
+        return Ok(Some(delivery));
     }
-    Ok(Some(delivery))
+    if deps.store.is_some() {
+        return Err(ToolError::Other(anyhow::anyhow!(
+            "send_input requires a live runtime mailbox; Store-backed send is replay-only"
+        )));
+    }
+    Ok(None)
 }
 
 fn runtime_message_tool_v1(

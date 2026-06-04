@@ -1086,7 +1086,7 @@ async fn store_thread_limit_rejects_immediately_when_open_spawned_capacity_is_fu
 }
 
 #[tokio::test]
-async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
+async fn followup_task_requires_runtime_mailbox_for_store_child() {
     let (_dir, store, root_id, child_id, _sink, mut deps) = deps_with_store_tree();
     seed_child_run_config_marker(&store, &child_id);
     {
@@ -1124,7 +1124,7 @@ async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
     deps.child_runner = Some(runner);
     let followup = FollowupTaskTool::new(deps);
 
-    let out = run_handler(
+    let err = run_handler(
         &followup,
         &FollowupTaskRequest {
             target: "worker".to_string(),
@@ -1132,32 +1132,27 @@ async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
         },
     )
     .await
-    .expect("followup ok");
-    assert!(out.stdout.is_empty());
+    .expect_err("Store-backed follow-up should require runtime");
+    assert!(
+        format!("{err:?}").contains("subagent messaging requires a live runtime mailbox"),
+        "{err:?}"
+    );
 
     let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].child_session_id, child_id);
-    assert_eq!(requests[0].fork_turns.as_deref(), Some("none"));
-    assert!(requests[0].run_id.is_some());
-    assert_child_run_config_replayed(&requests[0]);
+    assert!(requests.is_empty());
     drop(requests);
 
     let store = store.lock().unwrap();
     let child_mail = store.messages_for_agent(&child_id).unwrap();
-    assert_eq!(child_mail.len(), 1);
-    assert_eq!(child_mail[0].content, "next task");
-    assert!(child_mail[0].trigger_turn);
+    assert!(child_mail.is_empty());
 
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
-    assert_eq!(parent_mail.len(), 1);
-    assert!(parent_mail[0].content.contains("<subagent_notification>"));
-    assert!(!parent_mail[0].trigger_turn);
+    assert!(parent_mail.is_empty());
     assert!(store
         .events_for_session(&root_id)
         .unwrap()
         .iter()
-        .any(|event| event.event_type == "agent.completed"));
+        .all(|event| event.event_type != "agent.completed"));
 }
 
 #[tokio::test]
@@ -1383,7 +1378,7 @@ async fn store_completion_handler_writes_current_run_completion_once() {
 }
 
 #[tokio::test]
-async fn send_input_interrupt_cancels_and_restarts_store_backed_child() {
+async fn send_input_interrupt_requires_runtime_mailbox_for_store_child() {
     let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
     seed_child_run_config_marker(&store, &child_id);
     let captured: Arc<Mutex<Vec<ChildAgentRunRequest>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1394,7 +1389,7 @@ async fn send_input_interrupt_cancels_and_restarts_store_backed_child() {
     }));
     let send = SendInputTool::new(deps);
 
-    let out = run_handler(
+    let err = run_handler(
         &send,
         &SendInputRequest {
             target: child_id.clone(),
@@ -1404,36 +1399,31 @@ async fn send_input_interrupt_cancels_and_restarts_store_backed_child() {
         },
     )
     .await
-    .expect("interrupting send_input should succeed");
-    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-    assert!(body["submission_id"].is_string());
+    .expect_err("Store-backed send_input should require runtime");
+    assert!(
+        format!("{err:?}").contains("send_input requires a live runtime mailbox"),
+        "{err:?}"
+    );
 
     let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].child_session_id, child_id);
-    assert_eq!(requests[0].fork_turns.as_deref(), Some("none"));
-    assert_eq!(requests[0].message, "redirect now");
-    assert_child_run_config_replayed(&requests[0]);
+    assert!(requests.is_empty());
     drop(requests);
 
     let store = store.lock().unwrap();
-    let child = store.load_session(&child_id).unwrap().unwrap();
-    assert_eq!(child.status, SessionStatus::Created);
     let child_events = store.events_for_session(&child_id).unwrap();
     assert!(child_events
         .iter()
-        .any(|event| event.event_type == "session.cancel_requested"));
+        .all(|event| event.event_type != "session.cancel_requested"));
     let child_mail = store.messages_for_agent(&child_id).unwrap();
-    assert_eq!(child_mail.len(), 1);
-    assert!(child_mail[0].trigger_turn);
+    assert!(child_mail.is_empty());
 }
 
 #[tokio::test]
-async fn send_input_items_preserves_structured_user_input_for_store_child() {
+async fn send_input_items_require_runtime_mailbox_for_store_child() {
     let (_dir, store, _root_id, child_id, _sink, deps) = deps_with_store_tree();
     let send = SendInputTool::new(deps);
 
-    run_handler(
+    let err = run_handler(
         &send,
         &SendInputRequest {
             target: child_id.clone(),
@@ -1451,17 +1441,15 @@ async fn send_input_items_preserves_structured_user_input_for_store_child() {
         },
     )
     .await
-    .expect("structured send_input should succeed");
+    .expect_err("Store-backed structured send_input should require runtime");
+    assert!(
+        format!("{err:?}").contains("send_input requires a live runtime mailbox"),
+        "{err:?}"
+    );
 
     let store = store.lock().unwrap();
     let child_mail = store.messages_for_agent(&child_id).unwrap();
-    assert_eq!(child_mail.len(), 1);
-    assert_eq!(child_mail[0].content, "preserve me");
-    assert_eq!(child_mail[0].input_kind, "user_input");
-    assert_eq!(
-        child_mail[0].input_items,
-        Some(serde_json::json!([{ "type": "text", "text": "preserve me" }]))
-    );
+    assert!(child_mail.is_empty());
 }
 
 #[tokio::test]
@@ -1539,7 +1527,7 @@ async fn wait_closed_completed_store_child_reports_shutdown() {
 }
 
 #[tokio::test]
-async fn send_input_wakes_resumed_store_backed_child() {
+async fn send_input_to_resumed_store_child_requires_runtime_mailbox() {
     let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
     {
         let store = store.lock().unwrap();
@@ -1566,7 +1554,7 @@ async fn send_input_wakes_resumed_store_backed_child() {
     }));
     let send = SendInputTool::new(deps);
 
-    run_handler(
+    let err = run_handler(
         &send,
         &SendInputRequest {
             target: child_id.clone(),
@@ -1576,12 +1564,14 @@ async fn send_input_wakes_resumed_store_backed_child() {
         },
     )
     .await
-    .expect("send_input after resume should wake the child runner");
+    .expect_err("send_input after resume should require runtime");
+    assert!(
+        format!("{err:?}").contains("send_input requires a live runtime mailbox"),
+        "{err:?}"
+    );
 
     let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].child_session_id, child_id);
-    assert_eq!(requests[0].message, "continue after resume");
+    assert!(requests.is_empty());
 }
 
 #[tokio::test]
