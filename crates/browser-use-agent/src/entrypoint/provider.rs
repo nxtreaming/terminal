@@ -50,9 +50,9 @@ use browser_use_llm::auth::{load_codex_auth, CodexAuth};
 use browser_use_llm::route::ModelClient;
 use browser_use_runtime::{
     AgentId as RuntimeAgentId, BrowserConfig as RuntimeBrowserConfig,
-    BrowserId as RuntimeBrowserId, BrowserLease as RuntimeBrowserLease,
-    Durability as RuntimeDurability, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
-    RuntimeHandle, SessionId as RuntimeSessionId,
+    BrowserId as RuntimeBrowserId, Durability as RuntimeDurability,
+    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RuntimeHandle,
+    SessionId as RuntimeSessionId,
 };
 use browser_use_store::Store;
 use serde::Serialize;
@@ -141,27 +141,14 @@ struct RuntimeBrowserBackend {
 }
 
 impl RuntimeBrowserBackend {
-    fn claim_browser(&self) -> anyhow::Result<RuntimeBrowserLease> {
-        self.runtime
-            .claim_browser(&self.browser_id, self.agent_id.clone())
-    }
-
-    fn release_browser(&self, lease: RuntimeBrowserLease) -> anyhow::Result<()> {
-        self.runtime.release_browser(&lease)
-    }
-
     fn with_browser_lease<T>(
         &self,
         action: impl FnOnce(&dyn BrowserBackend) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let lease = self.claim_browser()?;
-        let result = action(self.backend.as_ref());
-        let release_result = self.release_browser(lease);
-        match (result, release_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), _) => Err(error),
-        }
+        self.runtime
+            .with_browser_action(&self.browser_id, self.agent_id.clone(), || {
+                action(self.backend.as_ref())
+            })
     }
 }
 

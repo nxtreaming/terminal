@@ -474,6 +474,7 @@ pub struct BrowserLease {
 struct BrowserHandleState {
     status: BrowserStatus,
     active_agent_id: Option<AgentId>,
+    claim_depth: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -481,6 +482,7 @@ pub struct BrowserHandle {
     id: BrowserId,
     config: BrowserConfig,
     state: Arc<Mutex<BrowserHandleState>>,
+    action_lock: Arc<Mutex<()>>,
 }
 
 impl BrowserHandle {
@@ -491,7 +493,9 @@ impl BrowserHandle {
             state: Arc::new(Mutex::new(BrowserHandleState {
                 status: BrowserStatus::Created,
                 active_agent_id: None,
+                claim_depth: 0,
             })),
+            action_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -525,9 +529,16 @@ impl BrowserHandle {
                 }
                 .into());
             }
+            state.claim_depth = state.claim_depth.saturating_add(1);
+            state.status = BrowserStatus::Claimed;
+            return Ok(BrowserLease {
+                browser_id: self.id.clone(),
+                agent_id,
+            });
         }
         state.active_agent_id = Some(agent_id.clone());
         state.status = BrowserStatus::Claimed;
+        state.claim_depth = 1;
         Ok(BrowserLease {
             browser_id: self.id.clone(),
             agent_id,
@@ -541,8 +552,13 @@ impl BrowserHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match state.active_agent_id.as_ref() {
             Some(active_agent_id) if active_agent_id == agent_id => {
-                state.active_agent_id = None;
-                state.status = BrowserStatus::Released;
+                state.claim_depth = state.claim_depth.saturating_sub(1);
+                if state.claim_depth == 0 {
+                    state.active_agent_id = None;
+                    state.status = BrowserStatus::Released;
+                } else {
+                    state.status = BrowserStatus::Claimed;
+                }
                 Ok(())
             }
             other => Err(RuntimeError::BrowserLeaseMismatch {
@@ -568,6 +584,14 @@ impl BrowserHandle {
         }
         state.status = BrowserStatus::Closed;
         Ok(())
+    }
+
+    fn with_action_lock<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self
+            .action_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        action()
     }
 }
 
@@ -649,6 +673,24 @@ impl BrowserManager {
             .get(&lease.browser_id)
             .ok_or_else(|| RuntimeError::UnknownBrowser(lease.browser_id.as_str().to_string()))?;
         handle.release(&lease.agent_id)
+    }
+
+    pub fn with_action_lock<T>(
+        &self,
+        browser_id: &BrowserId,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let handle = {
+            let browsers = self
+                .browsers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            browsers
+                .get(browser_id)
+                .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?
+                .clone()
+        };
+        handle.with_action_lock(action)
     }
 
     pub fn close_browser(&self, browser_id: &BrowserId) -> Result<()> {
@@ -2707,6 +2749,24 @@ impl RuntimeHandle {
         self.inner.browsers.release_browser(lease)?;
         self.inner.events.publish(event);
         Ok(())
+    }
+
+    pub fn with_browser_action<T>(
+        &self,
+        browser_id: &BrowserId,
+        agent_id: AgentId,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.inner.browsers.with_action_lock(browser_id, || {
+            let lease = self.claim_browser(browser_id, agent_id)?;
+            let result = action();
+            let release_result = self.release_browser(&lease);
+            match (result, release_result) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Ok(_), Err(error)) => Err(error),
+                (Err(error), _) => Err(error),
+            }
+        })
     }
 
     pub fn close_browser(&self, browser_id: &BrowserId) -> Result<()> {
@@ -4943,6 +5003,69 @@ mod tests {
     }
 
     #[test]
+    fn browser_manager_same_agent_claims_are_depth_aware() -> Result<()> {
+        let manager = BrowserManager::new();
+        let browser_id = manager.create_browser(BrowserConfig::default());
+        let agent = AgentId::from_string("agent-a")?;
+
+        let outer = manager.claim_browser(&browser_id, agent.clone())?;
+        let inner = manager.claim_browser(&browser_id, agent.clone())?;
+        manager.release_browser(&inner)?;
+        assert_eq!(
+            manager.snapshot(&browser_id)?.active_agent_id,
+            Some(agent.clone())
+        );
+        assert_eq!(
+            manager.snapshot(&browser_id)?.status,
+            BrowserStatus::Claimed
+        );
+
+        manager.release_browser(&outer)?;
+        assert_eq!(manager.snapshot(&browser_id)?.active_agent_id, None);
+        assert_eq!(
+            manager.snapshot(&browser_id)?.status,
+            BrowserStatus::Released
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn browser_manager_action_lock_serializes_actions() -> Result<()> {
+        let manager = Arc::new(BrowserManager::new());
+        let browser_id = manager.create_browser(BrowserConfig::default());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let handles = (0..2)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                let browser_id = browser_id.clone();
+                let barrier = Arc::clone(&barrier);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                thread::spawn(move || -> Result<()> {
+                    barrier.wait();
+                    manager.with_action_lock(&browser_id, || {
+                        let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        max_active.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(25));
+                        active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle.join().expect("action thread should not panic")?;
+        }
+
+        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
     fn browser_release_requires_matching_lease_owner() -> Result<()> {
         let manager = BrowserManager::new();
         let browser_id = manager.create_browser(BrowserConfig::default());
@@ -5163,6 +5286,45 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(event_types.contains(&"browser.claimed".to_string()));
         assert!(event_types.contains(&"browser.released".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_browser_action_preserves_run_level_browser_lease() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id = handle.create_browser(BrowserConfig::default());
+        let browser_id_for_run = browser_id.clone();
+        let expected_agent_id = root.agent_id().clone();
+        let handle_for_run = handle.clone();
+
+        handle
+            .run_agent(
+                RunAgentRequest::new(root.session_id().clone())
+                    .with_agent_id(root.agent_id().clone())
+                    .with_browser_id(browser_id.clone()),
+                async move {
+                    handle_for_run.with_browser_action(
+                        &browser_id_for_run,
+                        expected_agent_id.clone(),
+                        || Ok::<_, anyhow::Error>(()),
+                    )?;
+                    let snapshot = handle_for_run.browsers().snapshot(&browser_id_for_run)?;
+                    assert_eq!(snapshot.active_agent_id, Some(expected_agent_id));
+                    assert_eq!(snapshot.status, BrowserStatus::Claimed);
+                    Ok::<_, anyhow::Error>("done".to_string())
+                },
+            )
+            .await?;
+
+        let snapshot = handle.browsers().snapshot(&browser_id)?;
+        assert_eq!(snapshot.active_agent_id, None);
+        assert_eq!(snapshot.status, BrowserStatus::Released);
         Ok(())
     }
 

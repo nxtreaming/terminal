@@ -75,8 +75,10 @@ BrowserUseRuntime
   projected runtime events separately from raw debug events, and Python
   `Agent.stream()` consumes the projected event queue after yielding an initial
   agent snapshot.
-- Browser metadata leases exist in `BrowserManager`, including barrier tests for
-  claim failure and same-browser ownership conflicts.
+- Browser leases in `BrowserManager` are barrier-journaled, depth-aware for
+  same-agent nested claims, and expose a runtime action-serialization helper used
+  by the runtime browser backend. Same-browser conflicting owners still fail at
+  the runtime boundary.
 - Runtime session resources are attached to the agent thread resource bag and
   are cleaned on `close_agent`; provider tests guard the runtime path against
   falling back to global exec/MCP/browser/Python resources.
@@ -112,10 +114,10 @@ BrowserUseRuntime
   for runtime-attached sessions. It is still named/typed as a generic resource
   set, and browser script ownership is still mediated through the provider-built
   runtime browser backend rather than a richer `BrowserHandle`.
-- `BrowserManager` is still mostly a metadata/lease manager. Actual
-  `browser_script` execution is not fully routed through a stateful
-  `BrowserHandle` with script registry, artifacts, cancellation, and crash/lost
-  resource semantics.
+- `BrowserManager` now owns browser lease depth and action serialization. Actual
+  CDP/session execution and the script registry are still held by the runtime
+  browser backend resource in the agent provider, not directly by a rich
+  `BrowserHandle` with artifacts and crash semantics.
 - TUI uses runtime for live cancellation/follow-up/mailbox counts and now
   overlays live session status from runtime snapshots, but active rendering is
   still substantially Store/history-cache based. The SDK consumes projected
