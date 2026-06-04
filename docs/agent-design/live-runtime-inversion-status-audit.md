@@ -68,6 +68,10 @@ BrowserUseRuntime
 - Runtime-backed compaction progress, errors, token usage, context-window-full
   markers, and `session.compacted` checkpoints now append through
   `RuntimeHandle::append_observed_session_event` when a runtime handle exists.
+- Runtime-backed prompt history reads, pre-turn replay cursor calculation, and
+  previous-model downshift compaction setup now prefer
+  `RuntimeHandle::events_for_session` before falling back to the compatibility
+  `Store` read.
 - Subagent lifecycle UI events use the runtime-backed event sink when a runtime
   handle exists.
 - `session.done` emitted by the turn observer is routed through the runtime
@@ -120,10 +124,11 @@ BrowserUseRuntime
   `run_session_once_with_config_with_cancel` path. The turn loop has been
   wrapped by runtime ownership, not moved into `browser-use-runtime`.
 - `LiveTurnState` still contains `SharedStore` and reconstructs durable prompt
-  history from Store/SQLite. Fresh input and mailbox are runtime-backed, but
-  prompt history and token replay are still Store-shaped. Runtime-backed
-  compaction checkpoint writes now route through runtime, but compaction state
-  itself still lives in the agent crate turn state.
+  history through the runtime journal reader when available, with Store fallback
+  for compatibility. Fresh input and mailbox are runtime-backed, but token
+  replay is still Store-shaped. Runtime-backed compaction checkpoint writes now
+  route through runtime, but compaction state itself still lives in the agent
+  crate turn state.
 - `run_session_with_config*` remains as compatibility wrappers over
   `RuntimeHandle::run_agent`. They are not an independent live authority when
   called normally, but they have not been deleted.

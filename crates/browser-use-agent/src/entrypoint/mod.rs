@@ -764,9 +764,10 @@ fn effective_context_window_for_config(config: &ProviderRunConfig) -> Option<i64
 fn previous_model_compaction_for_config(
     store: &SharedStore,
     session_id: &SessionId,
+    runtime_handle: Option<&RuntimeHandle>,
     config: &ProviderRunConfig,
 ) -> Option<PreviousModelCompaction> {
-    let events = events_from_store(store, session_id.as_str());
+    let events = runtime_or_store_events(runtime_handle, store, session_id.as_str());
     let previous_model = latest_model_request_model(&events)?;
     if previous_model == config.model {
         return None;
@@ -2457,7 +2458,7 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         .with_previous_model_compaction(previous_model_compaction);
 
         let pre_turn_replay_from_seq = if turn_has_fresh_input {
-            let events = events_from_store(&store, session_id.as_str());
+            let events = state.durable_events_blocking();
             latest_replay_seq_before_fresh_input(&events)
         } else {
             None
@@ -2932,8 +2933,12 @@ async fn run_session_once_with_config_with_cancel(
             let auto_compact_limit = metadata.auto_compact_token_limit_with_override(
                 config.options.model_auto_compact_token_limit,
             );
-            let previous_model_compaction =
-                previous_model_compaction_for_config(&store, &session_id, &config);
+            let previous_model_compaction = previous_model_compaction_for_config(
+                &store,
+                &session_id,
+                runtime_handle.as_ref(),
+                &config,
+            );
             let compaction_sampler = {
                 let store_guard = store.lock().expect("store mutex poisoned");
                 build_compaction_sampler(&config, Some(&store_guard))
@@ -3085,7 +3090,7 @@ mod tests {
     use crate::config_overrides::ProviderBackend;
     use crate::config_overrides::ProviderRunConfig;
     use browser_use_runtime::{
-        AgentId as RuntimeAgentId, AttachRootAgentRequest, BrowserUseRuntime,
+        AgentId as RuntimeAgentId, AttachRootAgentRequest, BrowserUseRuntime, CreateThreadRequest,
         LiveThreadPersistence, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
         MailboxItemKind as RuntimeMailboxItemKind,
         SendAgentMessageRequest as RuntimeSendAgentMessageRequest, SessionId as RuntimeSessionId,
@@ -3585,6 +3590,77 @@ mod tests {
         );
         assert!(!state.has_pending_input().await);
         assert!(!state.token_status().await.token_limit_reached);
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_state_reads_history_from_runtime_journal_first() {
+        let (_dir, store, session_id) = store_with_session();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    names::SESSION_INPUT,
+                    serde_json::json!({ "text": "store only text" }),
+                )
+                .expect("append store input");
+        }
+
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let runtime_session_id =
+            RuntimeSessionId::from_string(session_id.clone()).expect("runtime session id");
+        journal
+            .create_thread(CreateThreadRequest {
+                session_id: Some(runtime_session_id.clone()),
+                parent_session_id: None,
+                cwd: std::path::PathBuf::from("/work"),
+                artifact_root: None,
+                agent_path: None,
+                nickname: None,
+                role: None,
+            })
+            .expect("create runtime thread");
+        let runtime = runtime.handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: runtime_session_id.clone(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "runtime text".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        runtime
+            .append_observed_session_event(
+                runtime_session_id,
+                names::SESSION_INPUT,
+                serde_json::json!({ "text": "runtime journal text" }),
+                RuntimeDurability::Barrier,
+            )
+            .expect("append runtime input");
+
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime));
+
+        let prompt_text = state
+            .clone_history_for_prompt()
+            .await
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt_text.contains("runtime journal text"));
+        assert!(
+            !prompt_text.contains("store only text"),
+            "runtime-backed prompt history should come from RuntimeHandle::events_for_session first"
+        );
     }
 
     #[tokio::test]
