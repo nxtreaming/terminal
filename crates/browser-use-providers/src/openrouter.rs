@@ -197,7 +197,9 @@ pub fn fetch_provider_models(
         .timeout(FETCH_TIMEOUT)
         .build()
         .context("build model-list http client")?;
-    let mut request = client.get(models_url(source)).header("accept", "application/json");
+    let mut request = client
+        .get(models_url(source))
+        .header("accept", "application/json");
     if source == ModelSource::Anthropic {
         request = request.header("anthropic-version", "2023-06-01");
     }

@@ -109,9 +109,9 @@ use settings::{
     browser_use_cloud_env_key_present, bundled_openrouter_model_ids,
     display_and_provider_model_for_input, display_model_for_provider_model, fallback_model_choices,
     is_claude_code_account, model_choices_for_config, provider_model_choices,
-    provider_model_for_display, AgentBackend, ModelChoice, ACCOUNT_ANTHROPIC,
-    ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER,
-    BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
+    provider_model_for_display, AgentBackend, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES,
+    ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES,
+    BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
     BROWSER_USE_CLOUD_API_KEY_SETTING, RECOMMENDED_MODELS,
 };
 
@@ -3131,9 +3131,9 @@ impl App {
         if !self.model_configured {
             return None;
         }
-        RECOMMENDED_MODELS
-            .iter()
-            .position(|rec| self.account == rec.account && self.provider_model == rec.provider_model)
+        RECOMMENDED_MODELS.iter().position(|rec| {
+            self.account == rec.account && self.provider_model == rec.provider_model
+        })
     }
 
     /// Row to start the cursor on when opening the provider screen: the active
@@ -3169,7 +3169,9 @@ impl App {
     /// Row index of the active model within the model-search list, if present.
     fn current_model_search_index(&self) -> Option<usize> {
         let current = self.current_search_model_id()?.to_string();
-        self.model_search_rows().iter().position(|id| *id == current)
+        self.model_search_rows()
+            .iter()
+            .position(|id| *id == current)
     }
 
     /// Provider screen selection: a recommended quick-pick (top rows) or a
@@ -3405,9 +3407,11 @@ impl App {
         {
             return Some(value);
         }
-        env_names
-            .iter()
-            .find_map(|name| std::env::var(name).ok().filter(|value| !value.trim().is_empty()))
+        env_names.iter().find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
     }
 
     /// Pump a finished background provider fetch into state + per-source cache.
@@ -5464,8 +5468,8 @@ impl App {
         };
         let install_id = self.or_create_install_id().unwrap_or_default();
 
-        let base_url = std::env::var("BUT_FEEDBACK_URL")
-            .unwrap_or_else(|_| FEEDBACK_INGEST_URL.to_string());
+        let base_url =
+            std::env::var("BUT_FEEDBACK_URL").unwrap_or_else(|_| FEEDBACK_INGEST_URL.to_string());
         let url = format!("{base_url}/feedback");
 
         let payload = serde_json::json!({
@@ -7889,8 +7893,7 @@ fn run_terminal(mut app: App) -> Result<()> {
                 poll_interval = poll_interval.min(TYPEWRITER_TICK_INTERVAL);
             }
             if app.should_animate_feedback_thanks() {
-                poll_interval =
-                    poll_interval.min(Duration::from_millis(FEEDBACK_THANKS_FRAME_MS));
+                poll_interval = poll_interval.min(Duration::from_millis(FEEDBACK_THANKS_FRAME_MS));
             }
             if !event::poll(poll_interval)? {
                 // Animate the welcome-screen logo by advancing the anim and
@@ -12102,16 +12105,22 @@ wire_api = "responses"
         let app = ready_app(&temp)?;
         let rows = app.provider_rows();
         // OpenAI is a single row that opens the auth sub-dialogue.
-        let openai = rows.iter().find(|row| row.label == "OpenAI").expect("OpenAI row");
+        let openai = rows
+            .iter()
+            .find(|row| row.label == "OpenAI")
+            .expect("OpenAI row");
         assert!(openai.submenu);
         assert_eq!(openai.account, settings::ACCOUNT_CODEX);
         // No split "OpenAI · sign in" / "OpenAI · API key" rows anymore.
         assert!(!rows.iter().any(|row| row.label.contains("OpenAI ·")));
         // Other providers are single non-submenu rows; Anthropic stays BYOK-only.
-        assert!(rows.iter().any(
-            |row| row.label == "Anthropic · API key" && row.account == settings::ACCOUNT_ANTHROPIC
-        ));
-        assert!(!rows.iter().any(|row| row.label.contains("Anthropic · sign in")));
+        assert!(rows
+            .iter()
+            .any(|row| row.label == "Anthropic · API key"
+                && row.account == settings::ACCOUNT_ANTHROPIC));
+        assert!(!rows
+            .iter()
+            .any(|row| row.label.contains("Anthropic · sign in")));
         Ok(())
     }
 
@@ -12154,8 +12163,11 @@ wire_api = "responses"
         assert_eq!(app.surface, Surface::OpenAiAuth);
         // OAuth sign-in is gone; OpenAI connects via API key (or a detected Codex
         // login). The API-key method is always offered.
-        let methods: Vec<OpenAiAuthMethod> =
-            app.openai_auth_rows().iter().map(|row| row.method).collect();
+        let methods: Vec<OpenAiAuthMethod> = app
+            .openai_auth_rows()
+            .iter()
+            .map(|row| row.method)
+            .collect();
         assert!(methods.contains(&OpenAiAuthMethod::ApiKey));
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Use an API key"), "{screen}");
@@ -12198,7 +12210,10 @@ wire_api = "responses"
         assert!(rows.iter().any(|id| id.contains("kimi")));
         app.composer.set_input("vendor/brand-new-model".to_string());
         let rows = app.model_search_rows();
-        assert_eq!(rows.first().map(String::as_str), Some("vendor/brand-new-model"));
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("vendor/brand-new-model")
+        );
         Ok(())
     }
 
@@ -12243,7 +12258,9 @@ wire_api = "responses"
         let entries = app.model_search_entries();
         // Recommended section leads, and includes the bundled id.
         assert!(matches!(&entries[0], ModelSearchEntry::Header(h) if h == "recommended"));
-        assert!(entries.iter().any(|e| matches!(e, ModelSearchEntry::Item(id) if id == "moonshotai/kimi-k2.5")));
+        assert!(entries
+            .iter()
+            .any(|e| matches!(e, ModelSearchEntry::Item(id) if id == "moonshotai/kimi-k2.5")));
         // Provider group headers appear, alphabetically (deepseek before qwen).
         let headers: Vec<&str> = entries
             .iter()

@@ -1866,6 +1866,11 @@ impl BrowserSession {
         ) && self.mode == BrowserMode::Local
         {
             Some("browser local setup")
+        } else if self.connection.is_none()
+            && self.mode == BrowserMode::Local
+            && self.owner == BrowserOwner::External
+        {
+            Some("Run browser connect local explicitly when you are ready to reconnect to external local Chrome")
         } else if self.connection.is_none() {
             Some("browser recover reconnect-websocket")
         } else if self.current_target_id.is_some() && self.current_session_id.is_none() {
@@ -2899,6 +2904,10 @@ fn classify_browser_error(message: &str) -> &'static str {
         && lower.contains("read cdp")
     {
         "cdp-read-timeout"
+    } else if is_cdp_command_error(message) {
+        "cdp-command-error"
+    } else if lower.contains("browser is not connected") {
+        "browser-disconnected"
     } else if lower.contains("connection refused")
         || lower.contains("couldn't connect to server")
         || lower.contains("unable to connect")
@@ -2920,6 +2929,8 @@ fn classify_browser_script_failure(message: &str) -> &'static str {
         "browser-script-timeout"
     } else if lower.contains("browser_script did not emit a result") {
         "browser-script-no-result"
+    } else if is_cdp_command_error(message) {
+        "cdp-command-error"
     } else if lower.contains("read cdp")
         || lower.contains("send cdp")
         || lower.contains("cdp websocket")
@@ -3022,6 +3033,23 @@ fn browser_issue_diagnosis(
             browser_connected,
             page_usable,
         ),
+        "cdp-command-error" => (
+            if page_usable {
+                "The CDP command failed, but the browser page should still be reusable."
+            } else if browser_connected {
+                "The CDP command failed; browser is connected but page state needs checking."
+            } else {
+                "The CDP command failed and browser state needs checking."
+            },
+            "Chrome rejected a CDP command or helper-generated CDP parameters; this is a command/script error, not a dropped websocket.",
+            if page_usable {
+                "Fix the Python/browser_script code and rerun; keep using the same page state.".to_string()
+            } else {
+                fallback_next_step()
+            },
+            browser_connected,
+            page_usable,
+        ),
         "session-gone" => (
             if browser_connected {
                 "Browser is connected, but the current page session is stale."
@@ -3058,6 +3086,13 @@ fn browser_issue_diagnosis(
             "Chrome rejected browser control.",
             "The browser endpoint returned a permission or 403 error for CDP control.",
             status_next_step.unwrap_or("Run browser local setup, then reconnect.").to_string(),
+            false,
+            false,
+        ),
+        "browser-disconnected" => (
+            "Browser is not currently connected.",
+            "The browser runtime has no active CDP connection for this session.",
+            fallback_next_step(),
             false,
             false,
         ),
@@ -3101,6 +3136,22 @@ fn browser_issue_diagnosis(
 
 fn should_drop_browser_connection(error_kind: &str) -> bool {
     matches!(error_kind, "browser-closed" | "websocket-dropped")
+}
+
+fn is_cdp_command_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let has_cdp_failure =
+        lower.contains("cdp failed") || (lower.contains("cdp ") && lower.contains(" failed:"));
+    let has_protocol_error = lower.contains("\"code\":-32602")
+        || lower.contains("\"code\": -32602")
+        || lower.contains("\"code\":-32601")
+        || lower.contains("\"code\": -32601")
+        || lower.contains("\"code\":-32000")
+        || lower.contains("\"code\": -32000")
+        || lower.contains("invalid parameters")
+        || lower.contains("method not found")
+        || lower.contains("exception thrown");
+    has_cdp_failure && has_protocol_error
 }
 
 fn is_stale_session_error(message: &str) -> bool {
@@ -6931,6 +6982,23 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_external_local_chrome_requires_explicit_reconnect() {
+        let mut session = BrowserSession::default();
+        session.mode = BrowserMode::Local;
+        session.owner = BrowserOwner::External;
+        session.endpoint = Some(Endpoint {
+            kind: "devtools-active-port".to_string(),
+            http_url: Some("http://127.0.0.1:9222".to_string()),
+            ws_url: "ws://127.0.0.1:9222/devtools/browser/example".to_string(),
+            candidate_id: Some("local-1".to_string()),
+        });
+
+        let status = session.status_json();
+        assert_eq!(status["connection"], "disconnected");
+        assert!(status["next_step"].as_str().unwrap().contains("explicitly"));
+    }
+
+    #[test]
     fn local_setup_waits_for_user_confirmation_before_retry() {
         let status = local_setup_user_action_response(None);
         assert_eq!(status["status"], "needs-user-action");
@@ -6963,6 +7031,29 @@ mod tests {
     }
 
     #[test]
+    fn cdp_protocol_errors_are_command_errors_not_websocket_drops() {
+        let invalid_params = r#"CDP failed: {"code":-32602,"message":"Invalid parameters"}"#;
+        assert_eq!(classify_browser_error(invalid_params), "cdp-command-error");
+        assert_eq!(
+            classify_browser_script_failure(invalid_params),
+            "cdp-command-error"
+        );
+        assert!(!should_drop_browser_connection(classify_browser_error(
+            invalid_params
+        )));
+
+        let runtime_exception =
+            r#"CDP Runtime.evaluate failed: {"code":-32000,"message":"Exception thrown"}"#;
+        assert_eq!(
+            classify_browser_error(runtime_exception),
+            "cdp-command-error"
+        );
+        assert!(!should_drop_browser_connection(classify_browser_error(
+            runtime_exception
+        )));
+    }
+
+    #[test]
     fn cdp_read_timeout_diagnosis_keeps_page_reusable() {
         let diagnosis = browser_issue_diagnosis("cdp-read-timeout", true, true, None);
         assert!(diagnosis.browser_usable);
@@ -6990,8 +7081,13 @@ mod tests {
         let message = r#"RuntimeError: CDP Runtime.evaluate failed: {"code":-32000,"message":"Exception thrown"}"#;
         assert_eq!(
             classify_browser_script_failure(message),
-            "browser-script-error"
+            "cdp-command-error"
         );
+        let diagnosis =
+            browser_issue_diagnosis(classify_browser_script_failure(message), true, true, None);
+        assert!(diagnosis.browser_usable);
+        assert!(diagnosis.page_usable);
+        assert!(diagnosis.next_step.contains("Fix the Python"));
     }
 
     #[test]
@@ -7350,6 +7446,81 @@ print("return detection ok")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("return detection ok"));
+    }
+
+    #[test]
+    fn browser_script_js_serializes_function_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-js-args",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+events = []
+
+def _bridge(message):
+    events.append(message)
+    assert message["kind"] == "cdp", message
+    assert message["method"] == "Runtime.evaluate", message
+    params = message["params"]
+    expression = params["expression"]
+    assert "const fn =" in expression, expression
+    assert "return await fn(...args)" in expression, expression
+    assert '"hello"' in expression, expression
+    assert '"nested": [1, 2]' in expression, expression
+    assert params["returnByValue"] is True, params
+    return {"result": {"value": "ok"}}
+
+result = js("(x, payload) => payload.nested[0] + x", "hello", {"nested": [1, 2]})
+assert result == "ok", result
+assert len(events) == 1, events
+print("js args ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("js args ok"));
+    }
+
+    #[test]
+    fn browser_script_js_rejects_invalid_options_before_cdp() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-js-invalid-options",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+events = []
+
+def _bridge(message):
+    events.append(message)
+    return {}
+
+try:
+    js("document.title", returnByValue={"bad": True})
+except TypeError as exc:
+    assert "returnByValue" in str(exc), exc
+else:
+    raise AssertionError("expected TypeError")
+
+try:
+    js("(x) => x", float("nan"))
+except TypeError as exc:
+    assert "JSON-serializable" in str(exc), exc
+else:
+    raise AssertionError("expected TypeError")
+
+assert events == [], events
+print("js invalid options guard ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("js invalid options guard ok"));
     }
 
     #[test]

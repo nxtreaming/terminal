@@ -21,8 +21,8 @@ use browser_use_store::Store;
 use serde_json::json;
 
 use super::browser::{
-    desired_browser_connect_command, BrowserAction, BrowserBackend, BrowserRequest, BrowserTool,
-    BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX,
+    browser_command_is_passive, desired_browser_connect_command, BrowserAction, BrowserBackend,
+    BrowserRequest, BrowserTool, BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX,
 };
 use crate::session::SharedStore;
 use crate::tools::approval::AskForApproval;
@@ -406,13 +406,45 @@ async fn dynamic_browser_mode_uses_latest_store_browser_setting_mid_run() {
 #[test]
 fn selected_local_mode_reconnects_when_cloud_is_currently_attached() {
     assert_eq!(
-        desired_browser_connect_command("local", true, Some("remote-cloud")),
+        desired_browser_connect_command("local", true, Some("remote-cloud"), Some("rust")),
         Some("browser connect local")
     );
     assert_eq!(
-        desired_browser_connect_command("local", true, Some("local")),
+        desired_browser_connect_command("local", true, Some("local"), Some("external")),
         None
     );
+}
+
+#[test]
+fn selected_local_mode_does_not_auto_reconnect_disconnected_external_chrome() {
+    assert_eq!(
+        desired_browser_connect_command("local", false, Some("local"), Some("external")),
+        None
+    );
+    assert_eq!(
+        desired_browser_connect_command("local", false, Some("local"), Some("rust")),
+        Some("browser connect local")
+    );
+}
+
+#[test]
+fn passive_browser_commands_do_not_preflight_connect() {
+    for words in [
+        ["browser", "status", "--json"].as_slice(),
+        ["status", "--json"].as_slice(),
+        ["browser", "runtime", "logs"].as_slice(),
+        ["runtime", "logs"].as_slice(),
+        ["browser", "runtime", "ownership", "--json"].as_slice(),
+        ["runtime", "ownership", "--json"].as_slice(),
+    ] {
+        assert!(browser_command_is_passive(words), "{words:?}");
+    }
+    assert!(!browser_command_is_passive(&[
+        "browser",
+        "runtime",
+        "cleanup-stale"
+    ]));
+    assert!(!browser_command_is_passive(&["browser", "connect"]));
 }
 
 // (2) Script start routes to start_script, matching main's browser_script tool.

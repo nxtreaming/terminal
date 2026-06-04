@@ -24,10 +24,10 @@ use crate::transcript;
 
 use super::{
     collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
-    format_goal_tokens_compact, goal_command_hint, goal_status_label, ModelSearchEntry,
+    format_goal_tokens_compact, goal_command_hint, goal_status_label,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
-    CookieSyncStatus, FeedbackCategory, FeedbackStep, MessageActionKind, ProductState,
-    SetupResultKind, Surface,
+    CookieSyncStatus, FeedbackCategory, FeedbackStep, MessageActionKind, ModelSearchEntry,
+    ProductState, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -2685,7 +2685,10 @@ fn crop_model_lines(
         return lines.into_iter().map(|(_, line)| line).collect();
     }
     let pinned = pinned_head.min(height);
-    let head: Vec<Line<'static>> = lines[..pinned].iter().map(|(_, line)| line.clone()).collect();
+    let head: Vec<Line<'static>> = lines[..pinned]
+        .iter()
+        .map(|(_, line)| line.clone())
+        .collect();
     let body = &lines[pinned..];
     let visible = height - pinned;
     if visible == 0 || body.len() <= visible {
@@ -3739,10 +3742,7 @@ fn feedback_lines(app: &App) -> Vec<Line<'static>> {
         }
         FeedbackStep::UploadLogs => {
             let mut lines: Vec<Line<'static>> = Vec::new();
-            lines.push(Line::from(Span::styled(
-                "  Upload logs?",
-                text_style(),
-            )));
+            lines.push(Line::from(Span::styled("  Upload logs?", text_style())));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  Shares this session's full transcript and tool activity",

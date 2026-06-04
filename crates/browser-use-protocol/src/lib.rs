@@ -1467,7 +1467,7 @@ mod tests {
                 }),
             ),
         ];
-        let summary = browser_summary_from_events(&events, "test");
+        let summary = browser_summary_from_events(&events, "browser use cloud");
         assert_eq!(
             summary.live_url.as_deref(),
             Some("https://live.example.com/?wss=ws]0;pwnedx")

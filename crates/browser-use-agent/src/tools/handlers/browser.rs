@@ -419,6 +419,9 @@ impl RealBackend {
             return false;
         };
         let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+        if browser_command_is_passive(words.as_slice()) {
+            return false;
+        }
         !matches!(
             words.as_slice(),
             ["browser", "remote", "start", ..]
@@ -468,8 +471,9 @@ impl RealBackend {
         let connected =
             status.content.get("connection").and_then(Value::as_str) == Some("connected");
         let current_mode = status.content.get("mode").and_then(Value::as_str);
+        let owner = status.content.get("owner").and_then(Value::as_str);
         let Some(desired_command) =
-            desired_browser_connect_command(mode.as_str(), connected, current_mode)
+            desired_browser_connect_command(mode.as_str(), connected, current_mode, owner)
         else {
             return Ok(events);
         };
@@ -484,10 +488,23 @@ impl RealBackend {
     }
 }
 
+pub(crate) fn browser_command_is_passive(words: &[&str]) -> bool {
+    matches!(
+        words,
+        ["browser", "status", ..]
+            | ["status", ..]
+            | ["browser", "runtime", "logs", ..]
+            | ["runtime", "logs", ..]
+            | ["browser", "runtime", "ownership", ..]
+            | ["runtime", "ownership", ..]
+    )
+}
+
 pub(crate) fn desired_browser_connect_command(
     selected_mode: &str,
     connected: bool,
     current_mode: Option<&str>,
+    owner: Option<&str>,
 ) -> Option<&'static str> {
     match selected_mode {
         "cloud" => {
@@ -499,6 +516,8 @@ pub(crate) fn desired_browser_connect_command(
         }
         "local" | "local-chrome" => {
             if connected && current_mode == Some("local") {
+                None
+            } else if !connected && current_mode == Some("local") && owner == Some("external") {
                 None
             } else {
                 Some("browser connect local")
@@ -1827,10 +1846,19 @@ mod browser_mode_tests {
         // The browser layer serializes its cloud mode as "remote-cloud"; the
         // preference normalizer must treat it as cloud rather than bailing with
         // "unknown browser preference mode".
-        assert_eq!(normalize_browser_preference_mode("remote-cloud").unwrap(), "cloud");
-        assert_eq!(normalize_browser_preference_mode("remote_cloud").unwrap(), "cloud");
+        assert_eq!(
+            normalize_browser_preference_mode("remote-cloud").unwrap(),
+            "cloud"
+        );
+        assert_eq!(
+            normalize_browser_preference_mode("remote_cloud").unwrap(),
+            "cloud"
+        );
         assert_eq!(normalize_browser_preference_mode("cloud").unwrap(), "cloud");
-        assert_eq!(normalize_browser_preference_mode("browser-use-cloud").unwrap(), "cloud");
+        assert_eq!(
+            normalize_browser_preference_mode("browser-use-cloud").unwrap(),
+            "cloud"
+        );
     }
 
     #[test]

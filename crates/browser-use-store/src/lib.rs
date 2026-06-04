@@ -270,10 +270,7 @@ impl Store {
     }
 
     /// Agent reads/writes everything inside the per-session tmp dir
-    pub fn create_session_in_artifact_root(
-        &self,
-        parent_id: Option<&str>,
-    ) -> Result<SessionMeta> {
+    pub fn create_session_in_artifact_root(&self, parent_id: Option<&str>) -> Result<SessionMeta> {
         let id = new_thread_id();
         let artifact_root = self.state_dir.join("artifacts").join(&id);
         self.create_session_with_id_and_artifact_root(parent_id, &artifact_root, &artifact_root, id)
