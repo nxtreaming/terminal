@@ -230,6 +230,7 @@ enum Surface {
     Browser,
     BrowserSelect,
     CookieSync,
+    Context,
     Goal,
     History,
     Messages,
@@ -253,6 +254,7 @@ impl Surface {
                 | Self::Browser
                 | Self::BrowserSelect
                 | Self::CookieSync
+                | Self::Context
                 | Self::Goal
                 | Self::History
                 | Self::Messages
@@ -314,6 +316,7 @@ enum ScreenArg {
     Model,
     Mode,
     Browser,
+    Context,
     History,
     Developer,
 }
@@ -327,6 +330,7 @@ impl From<ScreenArg> for Surface {
             ScreenArg::Model => Self::Model,
             ScreenArg::Mode => Self::Mode,
             ScreenArg::Browser => Self::Browser,
+            ScreenArg::Context => Self::Context,
             ScreenArg::History => Self::History,
             ScreenArg::Developer => Self::Developer,
         }
@@ -5051,7 +5055,7 @@ impl App {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
-            Surface::Goal => self.close_surface(),
+            Surface::Context | Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
                 0 => self.dispatch(AppCommand::ConfigureTelemetry)?,
@@ -5297,6 +5301,7 @@ impl App {
         match action {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
+            PaletteAction::Context => self.open_surface(Surface::Context),
             PaletteAction::Goal => self.show_current_goal()?,
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
@@ -6665,7 +6670,7 @@ impl App {
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::CookieSync => self.cookie_sync_row_count(),
-            Surface::Goal => 0,
+            Surface::Context | Surface::Goal => 0,
             Surface::History => self.history_visible_indices()?.len(),
             Surface::Messages => self.message_action_rows().len(),
             Surface::Developer => 1,
@@ -10141,6 +10146,7 @@ mod redesign_tests {
             Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
             Surface::CookieSync => "Cookie Sync",
+            Surface::Context => "Context",
             Surface::Goal => "Goal",
             Surface::History => "History",
             Surface::Messages => "Messages",
@@ -11173,6 +11179,275 @@ mod redesign_tests {
         assert!(screen.contains("12.3k/100k"));
         assert!(!screen.contains("999/60k"));
         assert!(screen.contains("$0.0123"));
+        Ok(())
+    }
+
+    #[test]
+    fn context_surface_shows_current_window_attribution() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect context usage"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": {"code": "return document.body.innerText"}
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.output",
+            serde_json::json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "output": "visible page content ".repeat(500)
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Context attribution is visible."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 14000,
+                        "cached_input_tokens": 8000,
+                        "output_tokens": 500,
+                        "reasoning_output_tokens": 500,
+                        "total_tokens": 15000
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 42000,
+                        "cached_input_tokens": 2000,
+                        "output_tokens": 2000,
+                        "reasoning_output_tokens": 1000,
+                        "total_tokens": 47000
+                    },
+                    "model_context_window": 128000
+                },
+                "rate_limits": null,
+                "turn_idx": 0
+            }),
+        )?;
+
+        // The agent records the real system prompt + per-tool schema sizes here;
+        // they never appear as message events, so this is what lets the view
+        // attribute the window without an "Unattributed" bucket.
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({
+                "model": "gpt-5.5",
+                "provider": "openai",
+                "turn_idx": 0,
+                "attempt": 0,
+                "composition": {
+                    "system_prompt_tokens": 6400,
+                    "tools": [
+                        {"name": "browser_script", "tokens": 2100},
+                        {"name": "python", "tokens": 1300},
+                        {"name": "shell", "tokens": 900}
+                    ]
+                }
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("Context"));
+        // Real window headline from the provider.
+        assert!(screen.contains("128k"));
+        // With the composition recorded, system prompt + tools are split out.
+        assert!(screen.contains("System prompt"));
+        assert!(screen.contains("Tool definitions"));
+        // Conversation categories still attributed from message events.
+        assert!(screen.contains("Tool outputs"));
+        // No mystery bucket and no raw message-text labels.
+        assert!(!screen.contains("Unattributed"));
+        assert!(!screen.contains("base instructions"));
+        Ok(())
+    }
+
+    #[test]
+    fn context_surface_respects_latest_zero_input_tokens() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect context usage"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 50000, "total_tokens": 50500 },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 0
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 0, "total_tokens": 0 },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 1
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("0/128k"));
+        assert!(screen.contains("No context yet."));
+        assert!(!screen.contains("50k/128k"));
+        assert!(!screen.contains("User messages"));
+        Ok(())
+    }
+
+    // Without a recorded composition (older sessions), the rest of the window is
+    // shown as a single "System prompt + tools" row so the breakdown still
+    // covers the whole window — nothing hidden behind a disclaimer.
+    #[test]
+    fn context_surface_shows_system_and_tools_when_not_recorded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "summarize the page"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": {"code": "return document.body.innerText"}
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.output",
+            serde_json::json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "output": "visible page content ".repeat(400)
+            }),
+        )?;
+        // Real window is much larger than the ~5k of conversation; the rest is
+        // the system prompt + tool schemas this old session never recorded.
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 50000, "total_tokens": 50500 },
+                    "model_context_window": 258400
+                },
+                "turn_idx": 0
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let screen = render_dump(&mut app)?;
+
+        // The bulk of the window is shown, not hidden behind a disclaimer.
+        assert!(screen.contains("System prompt + tools"));
+        assert!(screen.contains("Tool outputs"));
+        assert!(!screen.contains("not recorded"));
+        assert!(!screen.contains("Unattributed"));
+        Ok(())
+    }
+
+    // The usage bar must actually paint each category in its own color (the
+    // text dump can't show this), so inspect the rendered buffer cells.
+    #[test]
+    fn context_surface_colors_bar_segments_by_category() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "summarize the page"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": {"code": "return document.body.innerText"}
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.output",
+            serde_json::json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "output": "visible page content ".repeat(300)
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 40000, "total_tokens": 40500 },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 0
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({
+                "composition": {
+                    "system_prompt_tokens": 6400,
+                    "tools": [{"name": "browser_script", "tokens": 2100}]
+                }
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let colors = render::render_filled_block_colors(&mut app)?;
+
+        // Each category's segment + swatch is painted in its own palette color.
+        assert!(colors.contains(&crate::theme::context_category_color("System prompt")));
+        assert!(colors.contains(&crate::theme::context_category_color("Tool definitions")));
+        assert!(colors.contains(&crate::theme::context_category_color("Tool outputs")));
+        // Distinct colors, not one flat fill.
+        assert!(colors.len() >= 3);
         Ok(())
     }
 
@@ -15147,6 +15422,7 @@ wire_api = "responses"
             Surface::Browser,
             Surface::BrowserSelect,
             Surface::CookieSync,
+            Surface::Context,
             Surface::Account,
         ] {
             app.open_surface(surface);

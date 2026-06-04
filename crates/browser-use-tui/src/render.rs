@@ -1,8 +1,11 @@
 use anyhow::Result;
-use browser_use_agent::prompts::CollaborationModeKind;
+use browser_use_agent::{
+    context::assembly::estimate_item_token_count, prompts::CollaborationModeKind,
+    session::provider_messages_from_events,
+};
 use browser_use_protocol::{
-    instruction_sources_from_events, startup_warnings_from_events, HistoryRow, TelemetrySummary,
-    WorkbenchState,
+    instruction_sources_from_events, startup_warnings_from_events, EventRecord, HistoryRow,
+    TelemetrySummary, WorkbenchState,
 };
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -11,6 +14,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
@@ -40,6 +45,30 @@ pub(crate) fn render_dump(app: &mut App) -> Result<String> {
     let mut terminal = Terminal::new(backend)?;
     terminal.draw(|frame| render(frame, app))?;
     Ok(buffer_to_string(terminal.backend().buffer()))
+}
+
+/// The set of foreground colors used by filled block cells ("█"), so tests can
+/// assert the context bar actually colors its segments per category.
+#[cfg(test)]
+pub(crate) fn render_filled_block_colors(
+    app: &mut App,
+) -> Result<std::collections::HashSet<ratatui::style::Color>> {
+    app.drain_store_notifications()?;
+    let backend = TestBackend::new(app.args.width, app.args.height);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.draw(|frame| render(frame, app))?;
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let mut colors = std::collections::HashSet::new();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            let cell = &buffer[(x, y)];
+            if cell.symbol() == "█" {
+                colors.insert(cell.fg);
+            }
+        }
+    }
+    Ok(colors)
 }
 
 fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
@@ -1351,6 +1380,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
             "Cookie Sync",
             "Import local browser cookies to Browser Use Cloud",
         ),
+        Surface::Context => ("Context", "Inspect current context window usage"),
         Surface::Goal => ("Goal", "Inspect or change the active task goal"),
         Surface::History => ("History", "Browse and resume previous tasks"),
         Surface::Messages => (
@@ -1397,6 +1427,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::CookieSync => "Enter:select | Esc:close",
+        Surface::Context => "Esc:close",
         Surface::Goal => "Esc:close",
         Surface::Developer => "Esc:close",
         Surface::Feedback => "Enter:next | Esc:back",
@@ -1456,6 +1487,7 @@ fn surface_lines(
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
         Surface::CookieSync => cookie_sync_lines(app, width),
+        Surface::Context => context_lines(app, state, width),
         Surface::Goal => goal_lines(app),
         Surface::History => history_lines(app, state, width),
         Surface::Messages => message_lines(app, width),
@@ -2908,6 +2940,364 @@ fn goal_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(Span::styled(goal_command_hint(status).to_string(), muted())),
     ]
+}
+
+/// System prompt + per-tool schema sizes the agent recorded for the most recent
+/// request (`model.turn.request` `composition`). These are assembled inside the
+/// agent and never persisted as message events, so without them the window
+/// cannot be fully attributed.
+#[derive(Debug, Default, Clone)]
+struct ContextComposition {
+    recorded: bool,
+    system_prompt_tokens: i64,
+    tools: Vec<(String, i64)>,
+}
+
+impl ContextComposition {
+    fn tool_total(&self) -> i64 {
+        self.tools.iter().map(|(_, tokens)| *tokens).sum()
+    }
+}
+
+/// One row of the attribution breakdown.
+#[derive(Debug, Clone)]
+struct ContextComponent {
+    label: &'static str,
+    tokens: i64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ContextUsageSummary {
+    latest_input_tokens: Option<i64>,
+    context_window: Option<i64>,
+}
+
+fn context_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
+    let Some(session) = state.current_session.as_ref() else {
+        return vec![Line::from(Span::styled("No task selected.", dim()))];
+    };
+    let events = app.cached_events_for_session(&session.id);
+    let usage = context_usage_from_events(events);
+    let composition = context_composition_from_events(events);
+
+    // What's actually in the window right now (provider-reported input tokens).
+    let conversation = message_categories_from_events(events);
+    let conversation_sum: i64 = conversation.iter().map(|component| component.tokens).sum();
+    let window_used = usage.latest_input_tokens.unwrap_or(conversation_sum);
+
+    // Build the breakdown so it always covers the WHOLE window — nothing hidden.
+    // Conversation categories come from message events; the system prompt + tool
+    // schemas come from the agent. When the agent recorded them we show them
+    // split; otherwise the remaining window (everything that isn't conversation)
+    // is exactly the system prompt + tool schemas, shown as one row.
+    let mut components: Vec<ContextComponent> = Vec::new();
+    if composition.recorded {
+        if composition.system_prompt_tokens > 0 {
+            components.push(ContextComponent {
+                label: "System prompt",
+                tokens: composition.system_prompt_tokens,
+            });
+        }
+        let tool_total = composition.tool_total();
+        if tool_total > 0 {
+            components.push(ContextComponent {
+                label: "Tool definitions",
+                tokens: tool_total,
+            });
+        }
+        components.extend(conversation);
+    } else {
+        components.extend(conversation);
+        let overhead = window_used.saturating_sub(conversation_sum);
+        if overhead > 0 {
+            components.push(ContextComponent {
+                label: "System prompt + tools",
+                tokens: overhead,
+            });
+        }
+    }
+
+    // Reconcile the heuristic estimate to the real window so the rows sum to it.
+    let attributed: i64 = components.iter().map(|component| component.tokens).sum();
+    if window_used == 0 {
+        components.clear();
+    } else if attributed > 0 {
+        for component in &mut components {
+            component.tokens =
+                ((component.tokens as i128 * window_used as i128) / attributed as i128) as i64;
+        }
+    }
+    components.sort_by_key(|component| std::cmp::Reverse(component.tokens));
+    let breakdown_total = components
+        .iter()
+        .map(|component| component.tokens)
+        .sum::<i64>()
+        .max(1);
+
+    // ---- Window bar (segments colored per category) ----
+    let mut lines = vec![Line::from(Span::styled("Window", bold())), Line::from("")];
+    if usage.context_window.is_some() || window_used > 0 {
+        let bar_width = width.saturating_sub(34).clamp(12, 42);
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<10}", "context"), muted()),
+        ];
+        spans.extend(context_segmented_bar_spans(
+            &components,
+            window_used,
+            usage.context_window,
+            bar_width,
+        ));
+        lines.push(Line::from(spans));
+    }
+
+    // ---- What's in it ----
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("What's using it", bold())));
+    lines.push(Line::from(""));
+    if components.is_empty() {
+        lines.push(Line::from(Span::styled("No context yet.", dim())));
+    } else {
+        for component in &components {
+            lines.push(context_component_line(
+                component.label,
+                component.tokens,
+                breakdown_total,
+                width,
+            ));
+        }
+    }
+
+    lines
+}
+
+fn context_usage_from_events(events: &[EventRecord]) -> ContextUsageSummary {
+    let mut summary = ContextUsageSummary::default();
+    for event in events {
+        if event.event_type != "token_count" {
+            continue;
+        }
+        let Some(info) = event.payload.get("info").filter(|info| info.is_object()) else {
+            continue;
+        };
+        if let Some(input) = info
+            .get("last_token_usage")
+            .and_then(|usage| usage.get("input_tokens"))
+            .and_then(Value::as_i64)
+        {
+            summary.latest_input_tokens = Some(input.max(0));
+        }
+        if let Some(context_window) = info
+            .get("model_context_window")
+            .and_then(Value::as_i64)
+            .filter(|tokens| *tokens > 0)
+        {
+            summary.context_window = Some(context_window);
+        }
+    }
+    summary
+}
+
+fn context_composition_from_events(events: &[EventRecord]) -> ContextComposition {
+    let mut composition = ContextComposition::default();
+    // Take the most recent recorded request; the loop overwrites earlier turns.
+    for event in events {
+        if event.event_type != "model.turn.request" {
+            continue;
+        }
+        let Some(value) = event
+            .payload
+            .get("composition")
+            .filter(|value| value.is_object())
+        else {
+            continue;
+        };
+        composition.recorded = true;
+        composition.system_prompt_tokens = value
+            .get("system_prompt_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        composition.tools = value
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        let name = tool.get("name").and_then(Value::as_str)?.trim();
+                        let tokens = tool
+                            .get("tokens")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0)
+                            .max(0);
+                        (!name.is_empty()).then(|| (name.to_string(), tokens))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    composition
+}
+
+fn message_categories_from_events(events: &[EventRecord]) -> Vec<ContextComponent> {
+    let provider_items = provider_messages_from_events(events);
+    let mut totals: BTreeMap<&'static str, i64> = BTreeMap::new();
+    for item in &provider_items {
+        let tokens = estimate_item_token_count(item).max(0);
+        if tokens == 0 {
+            continue;
+        }
+        *totals.entry(context_item_category(item)).or_default() += tokens;
+    }
+    totals
+        .into_iter()
+        .map(|(label, tokens)| ContextComponent { label, tokens })
+        .collect()
+}
+
+fn context_item_category(item: &Value) -> &'static str {
+    match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") => return "Reasoning",
+        Some("compaction") => return "Compaction",
+        Some("function_call") | Some("custom_tool_call") | Some("local_shell_call") => {
+            return "Tool calls"
+        }
+        Some("function_call_output") | Some("custom_tool_call_output") => return "Tool outputs",
+        _ => {}
+    }
+
+    match item.get("role").and_then(Value::as_str) {
+        Some("system") => "System prompts",
+        Some("user") => "User messages",
+        Some("assistant") if item_has_tool_calls(item) && item_preview_text(item).is_none() => {
+            "Tool calls"
+        }
+        Some("assistant") => "Assistant responses",
+        Some("tool") => "Tool outputs",
+        Some(_) => "Other context",
+        None => "Other context",
+    }
+}
+
+fn item_has_tool_calls(item: &Value) -> bool {
+    item.get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+}
+
+fn item_preview_text(item: &Value) -> Option<String> {
+    for field in ["text", "content", "output"] {
+        if let Some(value) = item.get(field) {
+            if let Some(preview) = preview_text_value(value) {
+                return Some(preview);
+            }
+        }
+    }
+    None
+}
+
+fn preview_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => trimmed_nonempty(text),
+        Value::Array(parts) => parts.iter().find_map(preview_text_value),
+        Value::Object(map) => ["text", "content", "output", "input"]
+            .into_iter()
+            .find_map(|field| map.get(field).and_then(preview_text_value)),
+        _ => None,
+    }
+}
+
+fn trimmed_nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn context_component_line(label: &str, tokens: i64, total: i64, width: usize) -> Line<'static> {
+    let token_text = format_token_count(tokens);
+    let percent = context_percent(tokens, total);
+    let color = context_category_color(label);
+    let category = Style::default().fg(color);
+    // Pad the label to a fixed column so the percent aligns down the list.
+    let label_col = 22.min(width.saturating_sub(18).max(8));
+    Line::from(vec![
+        Span::raw("  "),
+        // Swatch matches this row's bar segment.
+        Span::styled("█ ", category),
+        Span::styled(format!("{token_text:>6}"), category),
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<label_col$}", truncate(label, label_col)),
+            category,
+        ),
+        Span::styled(format!("  {percent:>4}"), dim()),
+    ])
+}
+
+/// A context bar whose filled portion is split into colored runs, one per
+/// category, sized to each category's share of the window. The empty tail is
+/// the remaining budget. Largest-remainder accumulation keeps the runs summing
+/// to the filled width exactly.
+fn context_segmented_bar_spans(
+    components: &[ContextComponent],
+    window_used: i64,
+    budget: Option<i64>,
+    bar_width: usize,
+) -> Vec<Span<'static>> {
+    let budget = budget
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(FALLBACK_CONTEXT_BUDGET_TOKENS);
+    let used = window_used.clamp(0, budget);
+    let used_blocks = ((used as f64 / budget as f64) * bar_width as f64).round() as usize;
+    let used_blocks = used_blocks.min(bar_width);
+
+    let mut spans = Vec::new();
+    if window_used > 0 && used_blocks > 0 {
+        let mut cumulative_tokens: i64 = 0;
+        let mut filled: usize = 0;
+        for component in components {
+            cumulative_tokens = cumulative_tokens.saturating_add(component.tokens.max(0));
+            let target = (((cumulative_tokens as f64 / window_used as f64) * used_blocks as f64)
+                .round() as usize)
+                .min(used_blocks);
+            let blocks = target.saturating_sub(filled);
+            filled = target;
+            if blocks == 0 {
+                continue;
+            }
+            spans.push(Span::styled(
+                "█".repeat(blocks),
+                Style::default().fg(context_category_color(component.label)),
+            ));
+        }
+        if filled < used_blocks {
+            spans.push(Span::styled("█".repeat(used_blocks - filled), muted()));
+        }
+    }
+    let empty = bar_width.saturating_sub(used_blocks);
+    if empty > 0 {
+        spans.push(Span::styled("░".repeat(empty), dim()));
+    }
+    let pct_left = (((budget - used) as f64 / budget as f64) * 100.0).round() as i64;
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!(
+            "{}/{}",
+            format_token_count(window_used),
+            format_token_count(budget)
+        ),
+        muted(),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(format!("{pct_left}% left"), muted()));
+    spans
+}
+
+fn context_percent(tokens: i64, total: i64) -> String {
+    if total <= 0 {
+        return "0%".to_string();
+    }
+    format!("{:.0}%", (tokens.max(0) as f64 / total as f64) * 100.0)
 }
 
 pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
