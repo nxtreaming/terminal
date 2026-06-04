@@ -163,15 +163,20 @@ impl RuntimeAgentExecutor {
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
         )?;
-        let initial_input =
-            latest_durable_prompt_input_event(&store, &request.session_id)?.map(|event| {
-                json!({
-                    "source": "durable_prompt_input",
-                    "event_type": event.event_type,
-                    "source_event_seq": event.seq,
-                    "payload": event.payload,
-                })
-            });
+        let initial_input = latest_runtime_or_store_durable_prompt_input_event(
+            &self.inner.runtime,
+            &store,
+            &runtime_session_id,
+            &request.session_id,
+        )?
+        .map(|event| {
+            json!({
+                "source": "durable_prompt_input",
+                "event_type": event.event_type,
+                "source_event_seq": event.seq,
+                "payload": event.payload,
+            })
+        });
         let session_meta = store
             .load_session(&request.session_id)?
             .with_context(|| format!("unknown session id: {}", request.session_id))?;
@@ -297,16 +302,32 @@ fn latest_durable_prompt_input_event(
     store: &Store,
     session_id: &str,
 ) -> Result<Option<EventRecord>> {
-    Ok(store
-        .events_for_session(session_id)?
-        .into_iter()
-        .rev()
-        .find(|event| {
-            matches!(
-                event.event_type.as_str(),
-                "session.input" | "session.followup" | "agent.mailbox_input"
-            )
-        }))
+    Ok(latest_durable_prompt_input_from_events(
+        store.events_for_session(session_id)?,
+    ))
+}
+
+fn latest_runtime_or_store_durable_prompt_input_event(
+    runtime: &RuntimeHandle,
+    store: &Store,
+    runtime_session_id: &RuntimeSessionId,
+    store_session_id: &str,
+) -> Result<Option<EventRecord>> {
+    if let Ok(events) = runtime.events_for_session(runtime_session_id) {
+        if let Some(event) = latest_durable_prompt_input_from_events(events) {
+            return Ok(Some(event));
+        }
+    }
+    latest_durable_prompt_input_event(store, store_session_id)
+}
+
+fn latest_durable_prompt_input_from_events(events: Vec<EventRecord>) -> Option<EventRecord> {
+    events.into_iter().rev().find(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "session.input" | "session.followup" | "agent.mailbox_input"
+        )
+    })
 }
 
 fn runtime_has_trigger_turn_mail(runtime: &RuntimeHandle, session_id: &RuntimeSessionId) -> bool {
@@ -435,7 +456,8 @@ fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
 mod tests {
     use super::*;
     use browser_use_runtime::{
-        BrowserUseRuntime, LiveThreadPersistence, SqliteJournal, StateIndex,
+        BrowserUseRuntime, CreateRootAgentRequest, Durability, LiveThreadPersistence,
+        SqliteJournal, StateIndex,
     };
     use serde_json::json;
     use tempfile::TempDir;
@@ -445,6 +467,77 @@ mod tests {
         let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
         let state_index: Arc<dyn StateIndex> = journal;
         Ok(BrowserUseRuntime::new(persistence, state_index).handle())
+    }
+
+    fn create_runtime_root(runtime: &RuntimeHandle, cwd: &Path) -> Result<RuntimeSessionId> {
+        let root = runtime.create_root_agent(CreateRootAgentRequest {
+            cwd: cwd.to_path_buf(),
+            task: "runtime root".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        Ok(root.session_id().clone())
+    }
+
+    #[test]
+    fn durable_prompt_input_prefers_runtime_journal_over_store() -> Result<()> {
+        let store_dir = TempDir::new()?;
+        let store = Store::open(store_dir.path())?;
+        let session = store.create_session(None, Path::new("/work"))?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            json!({ "text": "stale store input" }),
+        )?;
+
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let runtime = runtime.handle();
+        let runtime_session_id = create_runtime_root(&runtime, Path::new("/work"))?;
+        let runtime_input = runtime.append_observed_session_event(
+            runtime_session_id.clone(),
+            "session.input",
+            json!({ "text": "runtime input" }),
+            Durability::Barrier,
+        )?;
+
+        let selected = latest_runtime_or_store_durable_prompt_input_event(
+            &runtime,
+            &store,
+            &runtime_session_id,
+            &session.id,
+        )?
+        .context("missing selected durable input")?;
+
+        assert_eq!(selected.seq, runtime_input.seq.unwrap());
+        assert_eq!(selected.payload["text"], "runtime input");
+        Ok(())
+    }
+
+    #[test]
+    fn durable_prompt_input_falls_back_to_store_when_runtime_has_none() -> Result<()> {
+        let store_dir = TempDir::new()?;
+        let store = Store::open(store_dir.path())?;
+        let session = store.create_session(None, Path::new("/work"))?;
+        let store_input = store.append_event(
+            &session.id,
+            "session.input",
+            json!({ "text": "store replay input" }),
+        )?;
+
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let runtime = runtime.handle();
+        let runtime_session_id = create_runtime_root(&runtime, Path::new("/work"))?;
+
+        let selected = latest_runtime_or_store_durable_prompt_input_event(
+            &runtime,
+            &store,
+            &runtime_session_id,
+            &session.id,
+        )?
+        .context("missing selected durable input")?;
+
+        assert_eq!(selected.seq, store_input.seq);
+        assert_eq!(selected.payload["text"], "store replay input");
+        Ok(())
     }
 
     #[tokio::test]
