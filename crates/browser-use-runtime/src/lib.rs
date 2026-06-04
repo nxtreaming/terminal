@@ -117,6 +117,7 @@ pub enum RuntimeEventKind {
     AgentFailed,
     AgentCancelRequested,
     AgentCancelled,
+    AgentCloseRequested,
     AgentClosed,
     AgentContinuationStarted,
     AgentTurnStarted,
@@ -172,6 +173,7 @@ impl RuntimeEventKind {
             Self::AgentFailed => "agent.failed",
             Self::AgentCancelRequested => "agent.cancel_requested",
             Self::AgentCancelled => "agent.cancelled",
+            Self::AgentCloseRequested => "agent.close_requested",
             Self::AgentClosed => "agent.closed",
             Self::AgentContinuationStarted => "agent.continuation_started",
             Self::AgentTurnStarted => "agent.turn.started",
@@ -1634,6 +1636,14 @@ impl AgentLiveState {
             .current_run_id = None;
     }
 
+    fn close(&self) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.current_run_id = None;
+    }
+
     fn record_accepted_input(&self, item: &MailboxItem) {
         let mut state = self
             .inner
@@ -2016,14 +2026,16 @@ impl ActiveRunRegistry {
             .remove(session_id);
     }
 
-    pub fn cancel(&self, session_id: &SessionId) -> bool {
-        let Some(token) = self
-            .tokens
+    pub fn token(&self, session_id: &SessionId) -> Option<CancellationToken> {
+        self.tokens
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(session_id)
             .cloned()
-        else {
+    }
+
+    pub fn cancel(&self, session_id: &SessionId) -> bool {
+        let Some(token) = self.token(session_id) else {
             return false;
         };
         token.cancel();
@@ -2197,6 +2209,7 @@ impl RuntimeEventProjection {
             | RuntimeEventKind::AgentCompleted
             | RuntimeEventKind::AgentFailed
             | RuntimeEventKind::AgentCancelled
+            | RuntimeEventKind::AgentCloseRequested
             | RuntimeEventKind::AgentClosed => ProjectedEventKind::ThreadStatusChanged,
             RuntimeEventKind::AgentTurnStarted => ProjectedEventKind::TurnStarted,
             RuntimeEventKind::AgentTurnCompleted | RuntimeEventKind::AgentTurnAborted => {
@@ -2493,24 +2506,28 @@ impl RuntimeHandle {
         self.inner.active_runs.unregister(session_id);
     }
 
+    pub fn request_cancel_run(&self, session_id: &SessionId) -> Result<bool> {
+        let Some(token) = self.inner.active_runs.token(session_id) else {
+            return Ok(false);
+        };
+        let thread = self.inner.agents.thread_for_session(session_id)?;
+        let event = RuntimeEvent::new(RuntimeEventKind::AgentCancelRequested, Durability::Barrier)
+            .with_agent_id(thread.agent_id.clone())
+            .with_session_id(thread.session_id.clone())
+            .with_root_id(thread.root_id.clone())
+            .with_payload(json!({
+                "runtime_owned": true,
+            }));
+        self.inner.append_runtime_event(&event)?;
+        thread.set_status(AgentThreadStatus::Cancelling);
+        thread.live_state.request_cancel();
+        token.cancel();
+        self.inner.events.publish(event);
+        Ok(true)
+    }
+
     pub fn cancel_run(&self, session_id: &SessionId) -> bool {
-        let cancelled = self.inner.active_runs.cancel(session_id);
-        if cancelled {
-            if let Ok(thread) = self.inner.agents.thread_for_session(session_id) {
-                thread.set_status(AgentThreadStatus::Cancelling);
-                thread.live_state.request_cancel();
-                let mut event =
-                    RuntimeEvent::new(RuntimeEventKind::AgentCancelRequested, Durability::Barrier)
-                        .with_agent_id(thread.agent_id.clone())
-                        .with_session_id(thread.session_id.clone())
-                        .with_payload(json!({
-                            "runtime_owned": true,
-                        }));
-                event.root_id = Some(thread.root_id.clone());
-                let _ = self.inner.publish_after_barrier(event);
-            }
-        }
-        cancelled
+        self.request_cancel_run(session_id).unwrap_or(false)
     }
 
     pub async fn run_agent<T, Fut>(
@@ -3193,21 +3210,28 @@ impl BrowserUseRuntime {
         let mut threads = vec![thread.clone()];
         if thread.parent_agent_id.is_some() {
             for edge in self.state_index.list_descendants(&thread.session_id)? {
-                self.state_index.close_spawn_edge(&edge.child_session_id)?;
                 if let Ok(descendant) = self.agents.thread_for_session(&edge.child_session_id) {
                     threads.push(descendant);
                 }
             }
         }
         for closing in threads.iter().rev() {
-            let _ = self.active_runs.cancel(&closing.session_id);
-            let cleaned_resources = closing.resources.cleanup_all();
-            closing.set_status(AgentThreadStatus::Closed);
-            if closing.parent_agent_id.is_some() {
-                let control = self.agents.control_for_thread(closing)?;
-                control.scheduler.close_spawned_agent(&closing.agent_id);
-                self.state_index.close_spawn_edge(&closing.session_id)?;
+            let mut requested =
+                RuntimeEvent::new(RuntimeEventKind::AgentCloseRequested, Durability::Barrier)
+                    .with_session_id(closing.session_id.clone())
+                    .with_agent_id(closing.agent_id.clone())
+                    .with_payload(json!({
+                        "reason": reason.clone(),
+                        "agent_path": closing.agent_path.as_str(),
+                    }));
+            requested.root_id = Some(closing.root_id.clone());
+            self.publish_after_barrier(requested)?;
+
+            let cancelled = self.active_runs.cancel(&closing.session_id);
+            if cancelled {
+                closing.live_state.request_cancel();
             }
+            let cleaned_resources = closing.resources.cleanup_all();
             let mut event = RuntimeEvent::new(RuntimeEventKind::AgentClosed, Durability::Barrier)
                 .with_session_id(closing.session_id.clone())
                 .with_agent_id(closing.agent_id.clone())
@@ -3215,9 +3239,18 @@ impl BrowserUseRuntime {
                     "reason": reason.clone(),
                     "agent_path": closing.agent_path.as_str(),
                     "cleaned_resources": cleaned_resources,
+                    "cancelled_active_run": cancelled,
                 }));
             event.root_id = Some(closing.root_id.clone());
-            self.publish_after_barrier(event)?;
+            self.append_runtime_event(&event)?;
+            closing.set_status(AgentThreadStatus::Closed);
+            closing.live_state.close();
+            if closing.parent_agent_id.is_some() {
+                let control = self.agents.control_for_thread(closing)?;
+                control.scheduler.close_spawned_agent(&closing.agent_id);
+                self.state_index.close_spawn_edge(&closing.session_id)?;
+            }
+            self.events.publish(event);
         }
         if let Some(parent_agent_id) = thread.parent_agent_id.as_ref() {
             let parent = self.agents.thread(parent_agent_id)?;
@@ -3569,7 +3602,7 @@ pub fn handle_local_runtime_request(
             }
         }
         LocalRuntimeRequest::CancelRun { session_id } => {
-            let cancelled = runtime.cancel_run(&SessionId::from_string(session_id)?);
+            let cancelled = runtime.request_cancel_run(&SessionId::from_string(session_id)?)?;
             Ok(json!({ "cancelled": cancelled }))
         }
         LocalRuntimeRequest::CloseAgent { agent_id, reason } => {
@@ -4309,6 +4342,31 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn cancel_request_barrier_failure_does_not_cancel_token_or_live_state() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let token = CancellationToken::new();
+        handle.register_run_with_token(root.session_id().clone(), token.clone());
+        root.set_status(AgentThreadStatus::Running);
+        journal.fail_event_type("agent.cancel_requested");
+
+        let err = handle
+            .request_cancel_run(root.session_id())
+            .expect_err("cancel must fail before live token cancellation");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        assert!(!token.is_cancelled());
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.status, AgentThreadStatus::Running);
+        assert!(!snapshot.live.cancellation_requested);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runtime_run_agent_owns_active_run_lifecycle_and_events() -> Result<()> {
         let (runtime, journal) = BrowserUseRuntime::memory();
@@ -4495,6 +4553,96 @@ mod tests {
         assert!(*cleaned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner));
+        Ok(())
+    }
+
+    #[test]
+    fn close_request_barrier_failure_does_not_clean_or_close_agent() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let cleaned = Arc::new(Mutex::new(false));
+        let cleaned_for_callback = Arc::clone(&cleaned);
+        handle.get_or_insert_session_resource(
+            root.session_id(),
+            "test.close_cleanup",
+            || "resource".to_string(),
+            move |_resource: Arc<String>| {
+                *cleaned_for_callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                1
+            },
+        )?;
+        journal.fail_event_type("agent.close_requested");
+
+        let err = handle
+            .close_agent(CloseAgentRequest {
+                agent_id: root.agent_id().clone(),
+                reason: "test close".to_string(),
+            })
+            .expect_err("close request must fail before live cleanup");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        assert!(!*cleaned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner));
+        assert_eq!(root.snapshot().status, AgentThreadStatus::Created);
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(!event_types.contains(&"agent.close_requested".to_string()));
+        assert!(!event_types.contains(&"agent.closed".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn close_terminal_barrier_failure_does_not_mark_agent_closed() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let cleaned = Arc::new(Mutex::new(false));
+        let cleaned_for_callback = Arc::clone(&cleaned);
+        handle.get_or_insert_session_resource(
+            root.session_id(),
+            "test.close_cleanup",
+            || "resource".to_string(),
+            move |_resource: Arc<String>| {
+                *cleaned_for_callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                1
+            },
+        )?;
+        journal.fail_event_type("agent.closed");
+
+        let err = handle
+            .close_agent(CloseAgentRequest {
+                agent_id: root.agent_id().clone(),
+                reason: "test close".to_string(),
+            })
+            .expect_err("terminal close must fail before closed status");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        assert!(*cleaned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner));
+        assert_eq!(root.snapshot().status, AgentThreadStatus::Created);
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"agent.close_requested".to_string()));
+        assert!(!event_types.contains(&"agent.closed".to_string()));
         Ok(())
     }
 
