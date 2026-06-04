@@ -26,7 +26,7 @@ use browser_use_runtime::{
     AgentId as RuntimeAgentId, AgentTarget as RuntimeAgentTarget,
     AgentThreadStatus as RuntimeAgentThreadStatus, CloseAgentRequest as RuntimeCloseAgentRequest,
     Durability as RuntimeDurability, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
-    MailboxItemKind as RuntimeMailboxItemKind, RuntimeError, RuntimeHandle,
+    MailboxItemKind as RuntimeMailboxItemKind, RuntimeHandle,
     SendAgentMessageRequest as RuntimeSendAgentMessageRequest, SessionId as RuntimeSessionId,
     WaitAgentOutcome as RuntimeWaitAgentOutcome,
 };
@@ -395,78 +395,6 @@ fn emit_collab_resume_end(
             "status": status,
         }),
     );
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct StoreThreadLimitSnapshot {
-    max_open_spawned_agents: usize,
-    open_spawned_agents: usize,
-}
-
-fn store_thread_limit_snapshot(
-    deps: &SubagentToolDeps,
-) -> Result<Option<StoreThreadLimitSnapshot>, ToolError> {
-    let (Some(limit), Some(shared_store)) =
-        (deps.max_concurrent_threads_per_session, deps.store.as_ref())
-    else {
-        return Ok(None);
-    };
-    let max_open_spawned_agents = limit.saturating_sub(1);
-    let store = shared_store
-        .lock()
-        .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-    let root_id = store_root_session_id(&store, &deps.session_id)
-        .map_err(|err| tool_err("resolve root session failed", err))?;
-    let open_spawned_agents = store_collect_agent_tree(&store, &root_id)
-        .map_err(|err| tool_err("collect agent tree failed", err))?
-        .into_iter()
-        .filter(|agent| agent.status == "open")
-        .count();
-    Ok(Some(StoreThreadLimitSnapshot {
-        max_open_spawned_agents,
-        open_spawned_agents,
-    }))
-}
-
-#[derive(Clone)]
-struct AgentControl {
-    deps: SubagentToolDeps,
-}
-
-impl AgentControl {
-    fn new(deps: &SubagentToolDeps) -> Self {
-        Self { deps: deps.clone() }
-    }
-
-    fn reserve_spawn_capacity_strict(
-        &self,
-        ctx: &ToolCtx,
-        task_name: &str,
-    ) -> Result<(), ToolError> {
-        let Some(snapshot) = store_thread_limit_snapshot(&self.deps)? else {
-            return Ok(());
-        };
-        if snapshot.open_spawned_agents < snapshot.max_open_spawned_agents {
-            return Ok(());
-        }
-        self.deps.emit(
-            "subagent.spawn_rejected",
-            json!({
-                "call_id": ctx.call_id,
-                "task_name": task_name,
-                "reason": "agent_limit_reached",
-                "limit": snapshot.max_open_spawned_agents,
-                "open_spawned_agents": snapshot.open_spawned_agents,
-            }),
-        );
-        Err(ToolError::Other(
-            RuntimeError::AgentLimitReached {
-                limit: snapshot.max_open_spawned_agents,
-                open_spawned_agents: snapshot.open_spawned_agents,
-            }
-            .into(),
-        ))
-    }
 }
 
 #[derive(Debug)]
@@ -2084,7 +2012,6 @@ impl ToolRuntime<SpawnAgentArgs, ExecOutput> for SpawnAgentTool {
         ctx: &ToolCtx,
     ) -> Result<ExecOutput, ToolError> {
         let _spawn_gate = self.deps.spawn_gate.lock().await;
-        AgentControl::new(&self.deps).reserve_spawn_capacity_strict(ctx, &req.task_name)?;
         let mut args = req.clone();
         args.input_is_inter_agent_communication = true;
         let prompt = args.message.clone();
@@ -2264,7 +2191,6 @@ impl ToolRuntime<SpawnAgentV1Request, ExecOutput> for SpawnAgentV1Tool {
             }),
             fork_context: None,
         };
-        AgentControl::new(&self.deps).reserve_spawn_capacity_strict(ctx, &args.task_name)?;
         let prompt = args.message.clone();
         emit_collab_spawn_begin(
             &self.deps,

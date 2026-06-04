@@ -2007,6 +2007,19 @@ pub enum LocalRuntimeRequest {
     PendingAgentMail {
         session_id: String,
     },
+    SpawnChild {
+        parent_agent_id: String,
+        #[serde(default)]
+        child_agent_id: Option<String>,
+        #[serde(default)]
+        child_session_id: Option<String>,
+        task_name: String,
+        message: String,
+        #[serde(default)]
+        nickname: Option<String>,
+        #[serde(default)]
+        role: Option<String>,
+    },
     SendAgentMessage {
         author_agent_id: String,
         target_agent_id: String,
@@ -3920,6 +3933,28 @@ pub fn handle_local_runtime_request(
             Ok(json!({
                 "count": items.len(),
                 "items": items,
+            }))
+        }
+        LocalRuntimeRequest::SpawnChild {
+            parent_agent_id,
+            child_agent_id,
+            child_session_id,
+            task_name,
+            message,
+            nickname,
+            role,
+        } => {
+            let child = runtime.spawn_child(SpawnChildRequest {
+                parent_agent_id: AgentId::from_string(parent_agent_id)?,
+                child_agent_id: child_agent_id.map(AgentId::from_string).transpose()?,
+                child_session_id: child_session_id.map(SessionId::from_string).transpose()?,
+                task_name,
+                message,
+                nickname,
+                role,
+            })?;
+            Ok(json!({
+                "agent": child.snapshot(),
             }))
         }
         LocalRuntimeRequest::SendAgentMessage {

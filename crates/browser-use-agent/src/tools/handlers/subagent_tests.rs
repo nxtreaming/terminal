@@ -1071,16 +1071,17 @@ async fn store_thread_limit_ignores_terminal_child_edges() {
 }
 
 #[tokio::test]
-async fn store_thread_limit_rejects_immediately_when_open_spawned_capacity_is_full() {
+async fn store_tree_is_not_live_spawn_capacity_authority() {
     let (_dir, _store, _root_id, _child_id, sink, mut deps) = deps_with_store_tree();
     deps.max_concurrent_threads_per_session = Some(2);
     let spawn = SpawnAgentTool::new(deps);
 
-    let err = run_handler(&spawn, &spawn_args("next", "new task"))
+    let out = run_handler(&spawn, &spawn_args("next", "new task"))
         .await
-        .expect_err("root plus one open child fills cap 2");
-    assert!(format!("{err:?}").contains("agent limit reached"));
-    assert!(sink
+        .expect("historical Store children must not reject live spawn capacity");
+    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(body["task_name"].as_str(), Some("/root/next"));
+    assert!(!sink
         .types()
         .contains(&"subagent.spawn_rejected".to_string()));
 }

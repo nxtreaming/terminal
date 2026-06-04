@@ -4329,11 +4329,11 @@ fn spawn_agent(
     nickname: Option<String>,
     role: Option<String>,
 ) -> Result<()> {
-    let parent = ensure_task_exists(store, parent_id)?;
+    ensure_task_exists(store, parent_id)?;
     if task_name.is_some() && path.is_some() {
         bail!("spawn-agent accepts either --task-name or --path, not both");
     }
-    let agent_path = match (task_name.as_deref(), path.as_deref()) {
+    let requested_agent_path = match (task_name.as_deref(), path.as_deref()) {
         (Some(task_name), None) => {
             let parent_agent_path = display_agent_path_for_session(store, parent_id)?;
             Some(
@@ -4347,13 +4347,30 @@ fn spawn_agent(
     };
     let parent_events = store.events_for_session(parent_id)?;
     let inherited_context = sanitized_agent_context_from_events(&parent_events);
-    let child = store.create_child_session(
+    let Some(runtime_child) = spawn_agent_via_live_runtime(
+        store,
         parent_id,
-        Path::new(&parent.cwd),
-        agent_path.as_deref(),
+        &message,
+        task_name.as_deref(),
+        requested_agent_path.as_deref(),
         nickname.as_deref(),
         role.as_deref(),
-    )?;
+    )?
+    else {
+        bail!("spawn-agent requires a live runtime socket; Store-backed spawn is replay-only");
+    };
+    let child_session_id = runtime_child
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("local runtime spawn_child response missing session_id")?;
+    let agent_path = runtime_child
+        .get("agent_path")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or(requested_agent_path);
+    let child = store
+        .load_session(child_session_id)?
+        .with_context(|| format!("runtime did not create child session {child_session_id}"))?;
     store.append_event(
         &child.id,
         "agent.context",
@@ -4385,6 +4402,54 @@ fn spawn_agent(
     )?;
     println!("{}", child.id);
     Ok(())
+}
+
+fn spawn_agent_via_live_runtime(
+    store: &Store,
+    parent_id: &str,
+    message: &str,
+    task_name: Option<&str>,
+    requested_agent_path: Option<&str>,
+    nickname: Option<&str>,
+    role: Option<&str>,
+) -> Result<Option<Value>> {
+    let child_id = browser_use_store::new_thread_id();
+    let runtime_task_name = task_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            requested_agent_path
+                .and_then(|path| path.rsplit('/').find(|segment| !segment.trim().is_empty()))
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "agent".to_string());
+    let request = LocalRuntimeRequest::SpawnChild {
+        parent_agent_id: parent_id.to_string(),
+        child_agent_id: Some(child_id.clone()),
+        child_session_id: Some(child_id),
+        task_name: runtime_task_name,
+        message: message.to_string(),
+        nickname: nickname.map(ToOwned::to_owned),
+        role: role.map(ToOwned::to_owned),
+    };
+    let Some(response) =
+        send_local_runtime_request(store.state_dir(), &request, Duration::from_secs(5))?
+    else {
+        return Ok(None);
+    };
+    if !response.ok {
+        let error = response
+            .error
+            .unwrap_or_else(|| "local runtime spawn_child failed".to_string());
+        bail!(error);
+    }
+    let agent = response
+        .result
+        .get("agent")
+        .cloned()
+        .context("local runtime spawn_child response missing agent")?;
+    Ok(Some(agent))
 }
 
 fn list_agents(
@@ -6828,6 +6893,8 @@ command = "test-mcp"
         std::fs::create_dir_all(&parent_cwd)?;
         let store = Store::open(&state_dir)?;
         let parent = store.create_session(None, &parent_cwd)?;
+        let (_runtime, socket_path) =
+            start_runtime_socket_for_parent(&state_dir, &parent, &parent_cwd, 3)?;
 
         spawn_agent(
             &store,
@@ -6874,6 +6941,36 @@ command = "test-mcp"
         assert!(err
             .to_string()
             .contains("either --task-name or --path, not both"));
+
+        let _ = std::fs::remove_file(socket_path);
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_spawn_agent_requires_live_runtime_socket() -> Result<()> {
+        let temp = unique_cli_test_dir("spawn-agent-no-runtime")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+
+        let err = spawn_agent(
+            &store,
+            &parent.id,
+            "inspect from cli".to_string(),
+            Some("cli_child".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect_err("Store-backed CLI spawn must not be a live path");
+        assert!(
+            err.to_string().contains("requires a live runtime socket"),
+            "{err}"
+        );
+        assert!(store.list_child_agents(&parent.id)?.is_empty());
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -6944,6 +7041,8 @@ command = "test-mcp"
         std::fs::create_dir_all(&parent_cwd)?;
         let store = Store::open(&state_dir)?;
         let parent = store.create_session(None, &parent_cwd)?;
+        let (_runtime, socket_path) =
+            start_runtime_socket_for_parent(&state_dir, &parent, &parent_cwd, 3)?;
 
         spawn_agent(
             &store,
@@ -6975,6 +7074,7 @@ command = "test-mcp"
             .iter()
             .any(|part| part["text"].as_str().unwrap_or_default().contains("app://")));
 
+        let _ = std::fs::remove_file(socket_path);
         std::fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -7978,5 +8078,26 @@ command = "test-mcp"
         ));
         std::fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    fn start_runtime_socket_for_parent(
+        state_dir: &std::path::Path,
+        parent: &browser_use_protocol::SessionMeta,
+        parent_cwd: &std::path::Path,
+        max_concurrent_threads_per_session: usize,
+    ) -> Result<(RuntimeHandle, std::path::PathBuf)> {
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(state_dir)?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime.attach_root_agent(AttachRootAgentRequest {
+            session_id: SessionId::from_string(parent.id.clone())?,
+            cwd: parent_cwd.to_path_buf(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session,
+        })?;
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(state_dir, runtime.clone())?;
+        Ok((runtime, socket_path))
     }
 }
