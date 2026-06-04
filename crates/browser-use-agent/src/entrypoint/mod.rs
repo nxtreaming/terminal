@@ -1777,42 +1777,45 @@ impl TurnState for LiveTurnState {
     }
 
     async fn has_pending_input(&self) -> bool {
+        if let Some(runtime_handle) = self.runtime_handle.clone() {
+            let session_id = self.session_id.as_str().to_string();
+            let mailbox_delivery_phase = *self.mailbox_delivery_phase.lock().unwrap();
+            return tokio::task::spawn_blocking(move || match mailbox_delivery_phase {
+                MailboxDeliveryPhase::CurrentTurn => has_pending_runtime_agent_mail(
+                    &runtime_handle,
+                    &session_id,
+                    mailbox_delivery_phase,
+                ),
+                MailboxDeliveryPhase::NextTurn => has_pending_runtime_trigger_turn_agent_mail(
+                    &runtime_handle,
+                    &session_id,
+                    mailbox_delivery_phase,
+                ),
+            })
+            .await
+            .unwrap_or(false);
+        }
+
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
-        let mailbox_delivery_phase = *self.mailbox_delivery_phase.lock().unwrap();
-        let runtime_handle = self.runtime_handle.clone();
-        tokio::task::spawn_blocking(move || {
-            let runtime_backed = runtime_handle.is_some();
-            let has_pending_mail = if let Some(runtime_handle) = runtime_handle {
-                match mailbox_delivery_phase {
-                    MailboxDeliveryPhase::CurrentTurn => has_pending_runtime_agent_mail(
-                        &runtime_handle,
-                        &session_id,
-                        mailbox_delivery_phase,
-                    ),
-                    MailboxDeliveryPhase::NextTurn => has_pending_runtime_trigger_turn_agent_mail(
-                        &runtime_handle,
-                        &session_id,
-                        mailbox_delivery_phase,
-                    ),
-                }
-            } else {
-                false
-            };
-            has_pending_active_followup(&store, &session_id) || (runtime_backed && has_pending_mail)
-        })
-        .await
-        .unwrap_or(false)
+        tokio::task::spawn_blocking(move || has_pending_active_followup(&store, &session_id))
+            .await
+            .unwrap_or(false)
     }
 
     async fn take_pending_input(&self) -> Vec<Message> {
-        let store_for_followup = Arc::clone(&self.store);
-        let session_id_for_followup = self.session_id.as_str().to_string();
-        let followup_pending = tokio::task::spawn_blocking(move || {
-            has_pending_active_followup(&store_for_followup, &session_id_for_followup)
-        })
-        .await
-        .unwrap_or(false);
+        let runtime_backed = self.runtime_handle.is_some();
+        let followup_pending = if runtime_backed {
+            false
+        } else {
+            let store_for_followup = Arc::clone(&self.store);
+            let session_id_for_followup = self.session_id.as_str().to_string();
+            tokio::task::spawn_blocking(move || {
+                has_pending_active_followup(&store_for_followup, &session_id_for_followup)
+            })
+            .await
+            .unwrap_or(false)
+        };
         if followup_pending {
             *self.mailbox_delivery_phase.lock().unwrap() = MailboxDeliveryPhase::CurrentTurn;
         }
