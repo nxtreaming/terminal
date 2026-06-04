@@ -372,17 +372,45 @@ pub trait BrowserBackend: Send + Sync {
 
     /// Cancel an in-flight run. Wraps `cancel_browser_script`.
     fn cancel_script(&self, session_id: &str, run_id: &str) -> anyhow::Result<BrowserScriptOutput>;
+
+    /// Clean up backend-owned browser/session/script resources for a session.
+    fn cleanup_session(&self, _session_id: &str) -> usize {
+        0
+    }
 }
 
 /// Production backend: a thin delegation to `browser-use-browser`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RealBackend {
     browser_mode: Option<String>,
+    script_registry: browser_use_browser::BrowserScriptRunRegistry,
+}
+
+impl Default for RealBackend {
+    fn default() -> Self {
+        Self {
+            browser_mode: None,
+            script_registry: browser_use_browser::BrowserScriptRunRegistry::global(),
+        }
+    }
 }
 
 impl RealBackend {
     pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
-        Self { browser_mode }
+        Self {
+            browser_mode,
+            script_registry: browser_use_browser::BrowserScriptRunRegistry::global(),
+        }
+    }
+
+    pub fn with_browser_mode_and_script_registry(
+        browser_mode: Option<String>,
+        script_registry: browser_use_browser::BrowserScriptRunRegistry,
+    ) -> Self {
+        Self {
+            browser_mode,
+            script_registry,
+        }
     }
 
     fn normalized_browser_mode(&self) -> Option<&str> {
@@ -444,11 +472,13 @@ impl RealBackend {
         let Some(mode) = self.normalized_browser_mode() else {
             return Ok(Vec::new());
         };
-        let status = browser_use_browser::run_browser_command(
+        let status = browser_use_browser::run_browser_command_with_options_and_script_registry(
             session_id,
             cwd,
             artifact_dir,
             "browser status --json",
+            browser_use_browser::BrowserCommandOptions::default(),
+            &self.script_registry,
         )?;
         let mut events = status.events;
         let connected =
@@ -469,12 +499,15 @@ impl RealBackend {
             }
             _ => return Ok(events),
         };
-        let mut started = browser_use_browser::run_browser_command(
-            session_id,
-            cwd,
-            artifact_dir,
-            desired_command,
-        )?;
+        let mut started =
+            browser_use_browser::run_browser_command_with_options_and_script_registry(
+                session_id,
+                cwd,
+                artifact_dir,
+                desired_command,
+                browser_use_browser::BrowserCommandOptions::default(),
+                &self.script_registry,
+            )?;
         events.append(&mut started.events);
         Ok(events)
     }
@@ -494,11 +527,13 @@ impl BrowserBackend for RealBackend {
             Vec::new()
         };
         let effective_command = self.rewrite_command_for_mode(command);
-        let mut output = browser_use_browser::run_browser_command(
+        let mut output = browser_use_browser::run_browser_command_with_options_and_script_registry(
             session_id,
             cwd,
             artifact_dir,
             &effective_command,
+            browser_use_browser::BrowserCommandOptions::default(),
+            &self.script_registry,
         )?;
         if !events.is_empty() {
             events.append(&mut output.events);
@@ -539,12 +574,13 @@ impl BrowserBackend for RealBackend {
         timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
         let mut events = self.ensure_configured_browser(session_id, cwd, artifact_dir)?;
-        let mut output = browser_use_browser::start_browser_script(
+        let mut output = browser_use_browser::start_browser_script_with_registry(
             session_id,
             cwd,
             artifact_dir,
             code,
             timeout_secs,
+            &self.script_registry,
         )?;
         if !events.is_empty() {
             events.append(&mut output.browser_events);
@@ -559,11 +595,24 @@ impl BrowserBackend for RealBackend {
         run_id: &str,
         observe_timeout_ms: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
-        browser_use_browser::observe_browser_script(session_id, run_id, observe_timeout_ms)
+        browser_use_browser::observe_browser_script_with_registry(
+            session_id,
+            run_id,
+            observe_timeout_ms,
+            &self.script_registry,
+        )
     }
 
     fn cancel_script(&self, session_id: &str, run_id: &str) -> anyhow::Result<BrowserScriptOutput> {
-        browser_use_browser::cancel_browser_script(session_id, run_id)
+        browser_use_browser::cancel_browser_script_with_registry(
+            session_id,
+            run_id,
+            &self.script_registry,
+        )
+    }
+
+    fn cleanup_session(&self, session_id: &str) -> usize {
+        browser_use_browser::cleanup_session_with_script_registry(session_id, &self.script_registry)
     }
 }
 

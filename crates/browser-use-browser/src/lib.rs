@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -219,7 +219,7 @@ impl Default for BrowserSession {
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
-static BROWSER_SCRIPT_RUNS: OnceLock<Mutex<HashMap<String, BrowserScriptRun>>> = OnceLock::new();
+static BROWSER_SCRIPT_RUNS: OnceLock<BrowserScriptRunRegistry> = OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct BrowserScriptRun {
@@ -240,6 +240,47 @@ struct BrowserScriptRun {
     deadline: Instant,
 }
 
+#[derive(Clone, Default)]
+pub struct BrowserScriptRunRegistry {
+    runs: Arc<Mutex<HashMap<String, BrowserScriptRun>>>,
+}
+
+impl std::fmt::Debug for BrowserScriptRunRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserScriptRunRegistry")
+            .field("active_run_count", &self.active_run_count())
+            .finish()
+    }
+}
+
+impl BrowserScriptRunRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn global() -> Self {
+        browser_script_runs().clone()
+    }
+
+    pub fn active_run_count(&self) -> usize {
+        self.lock()
+            .expect("browser_script run registry poisoned")
+            .len()
+    }
+
+    pub fn active_run_count_for_session(&self, session_id: &str) -> usize {
+        self.lock()
+            .expect("browser_script run registry poisoned")
+            .values()
+            .filter(|run| run.session_id == session_id)
+            .count()
+    }
+
+    fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, HashMap<String, BrowserScriptRun>>> {
+        self.runs.lock()
+    }
+}
+
 #[derive(Default)]
 struct BrowserScriptDelta {
     text: String,
@@ -251,12 +292,19 @@ struct BrowserScriptDelta {
     consumed_bytes: u64,
 }
 
-fn browser_script_runs() -> &'static Mutex<HashMap<String, BrowserScriptRun>> {
-    BROWSER_SCRIPT_RUNS.get_or_init(|| Mutex::new(HashMap::new()))
+fn browser_script_runs() -> &'static BrowserScriptRunRegistry {
+    BROWSER_SCRIPT_RUNS.get_or_init(BrowserScriptRunRegistry::new)
 }
 
 fn active_browser_script_runs_json(session_id: &str) -> Value {
-    let mut runs = browser_script_runs()
+    active_browser_script_runs_json_with_registry(session_id, browser_script_runs())
+}
+
+fn active_browser_script_runs_json_with_registry(
+    session_id: &str,
+    registry: &BrowserScriptRunRegistry,
+) -> Value {
+    let mut runs = registry
         .lock()
         .expect("browser_script run registry poisoned");
     Value::Array(
@@ -325,6 +373,24 @@ pub fn run_browser_command_with_options(
     raw_cmd: &str,
     options: BrowserCommandOptions,
 ) -> Result<BrowserCommandOutput> {
+    run_browser_command_with_options_and_script_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        raw_cmd,
+        options,
+        browser_script_runs(),
+    )
+}
+
+pub fn run_browser_command_with_options_and_script_registry(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    raw_cmd: &str,
+    options: BrowserCommandOptions,
+    script_registry: &BrowserScriptRunRegistry,
+) -> Result<BrowserCommandOutput> {
     let mut argv = shell_words(raw_cmd)?;
     if argv.first().is_some_and(|arg| arg == "browser") {
         argv.remove(0);
@@ -342,7 +408,7 @@ pub fn run_browser_command_with_options(
             session.session_id = Some(session_id.to_string());
             session.log(format!("browser {}", argv.join(" ")));
         }
-        let content = dispatch_script_runtime(session_id, &argv)?;
+        let content = dispatch_script_runtime(session_id, &argv, script_registry)?;
         let mut sessions = sessions()
             .lock()
             .expect("browser session registry poisoned");
@@ -365,6 +431,7 @@ pub fn run_browser_command_with_options(
         artifact_dir.as_ref(),
         &argv,
         &options,
+        script_registry,
     )?;
     let events = session.browser_events();
     let connected = session.connection.is_some();
@@ -402,6 +469,24 @@ pub fn start_browser_script(
     artifact_dir: impl AsRef<Path>,
     code: &str,
     timeout_seconds: u64,
+) -> Result<BrowserScriptOutput> {
+    start_browser_script_with_registry(
+        session_id,
+        cwd,
+        artifact_dir,
+        code,
+        timeout_seconds,
+        browser_script_runs(),
+    )
+}
+
+pub fn start_browser_script_with_registry(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    code: &str,
+    timeout_seconds: u64,
+    registry: &BrowserScriptRunRegistry,
 ) -> Result<BrowserScriptOutput> {
     let mut run = spawn_browser_script(session_id, cwd, artifact_dir, code, timeout_seconds)?;
     let initial_deadline = Instant::now() + Duration::from_millis(BROWSER_SCRIPT_INITIAL_WAIT_MS);
@@ -441,7 +526,7 @@ pub fn start_browser_script(
                 ..Default::default()
             };
             attach_inline_window_stitch(&mut run, &mut output);
-            browser_script_runs()
+            registry
                 .lock()
                 .expect("browser_script run registry poisoned")
                 .insert(run_id, run);
@@ -456,14 +541,28 @@ pub fn observe_browser_script(
     run_id: &str,
     observe_timeout_ms: u64,
 ) -> Result<BrowserScriptOutput> {
-    let mut run = browser_script_runs()
+    observe_browser_script_with_registry(
+        session_id,
+        run_id,
+        observe_timeout_ms,
+        browser_script_runs(),
+    )
+}
+
+pub fn observe_browser_script_with_registry(
+    session_id: &str,
+    run_id: &str,
+    observe_timeout_ms: u64,
+    registry: &BrowserScriptRunRegistry,
+) -> Result<BrowserScriptOutput> {
+    let mut run = registry
         .lock()
         .expect("browser_script run registry poisoned")
         .remove(run_id)
         .ok_or_else(|| anyhow!("unknown browser_script run_id {run_id:?}"))?;
     if run.session_id != session_id {
         let owner = run.session_id.clone();
-        browser_script_runs()
+        registry
             .lock()
             .expect("browser_script run registry poisoned")
             .insert(run.id.clone(), run);
@@ -483,7 +582,7 @@ pub fn observe_browser_script(
         if delta.has_content() {
             let mut output = browser_script_running_output(&run, Some(delta), observe_timeout_ms);
             attach_inline_window_stitch(&mut run, &mut output);
-            browser_script_runs()
+            registry
                 .lock()
                 .expect("browser_script run registry poisoned")
                 .insert(run.id.clone(), run);
@@ -492,7 +591,7 @@ pub fn observe_browser_script(
         if Instant::now() >= observe_deadline {
             let mut output = browser_script_running_output(&run, None, observe_timeout_ms);
             attach_inline_window_stitch(&mut run, &mut output);
-            browser_script_runs()
+            registry
                 .lock()
                 .expect("browser_script run registry poisoned")
                 .insert(run.id.clone(), run);
@@ -503,14 +602,22 @@ pub fn observe_browser_script(
 }
 
 pub fn cancel_browser_script(session_id: &str, run_id: &str) -> Result<BrowserScriptOutput> {
-    let mut run = browser_script_runs()
+    cancel_browser_script_with_registry(session_id, run_id, browser_script_runs())
+}
+
+pub fn cancel_browser_script_with_registry(
+    session_id: &str,
+    run_id: &str,
+    registry: &BrowserScriptRunRegistry,
+) -> Result<BrowserScriptOutput> {
+    let mut run = registry
         .lock()
         .expect("browser_script run registry poisoned")
         .remove(run_id)
         .ok_or_else(|| anyhow!("unknown browser_script run_id {run_id:?}"))?;
     if run.session_id != session_id {
         let owner = run.session_id.clone();
-        browser_script_runs()
+        registry
             .lock()
             .expect("browser_script run registry poisoned")
             .insert(run.id.clone(), run);
@@ -1271,7 +1378,14 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn cleanup_session(session_id: &str) -> usize {
-    cancel_browser_script_runs_for_session(session_id);
+    cleanup_session_with_script_registry(session_id, browser_script_runs())
+}
+
+pub fn cleanup_session_with_script_registry(
+    session_id: &str,
+    script_registry: &BrowserScriptRunRegistry,
+) -> usize {
+    cancel_browser_script_runs_for_session(session_id, script_registry);
     let session = {
         let mut sessions = sessions()
             .lock()
@@ -1289,9 +1403,12 @@ pub fn cleanup_session(session_id: &str) -> usize {
     }
 }
 
-fn cancel_browser_script_runs_for_session(session_id: &str) {
+fn cancel_browser_script_runs_for_session(
+    session_id: &str,
+    script_registry: &BrowserScriptRunRegistry,
+) {
     let runs = {
-        let mut registry = browser_script_runs()
+        let mut registry = script_registry
             .lock()
             .expect("browser_script run registry poisoned");
         let run_ids = registry
@@ -1319,6 +1436,7 @@ fn dispatch_browser_command(
     artifact_dir: &Path,
     argv: &[String],
     options: &BrowserCommandOptions,
+    script_registry: &BrowserScriptRunRegistry,
 ) -> Result<Value> {
     match argv.first().map(String::as_str).unwrap_or("help") {
         "help" | "--help" | "-h" => Ok(Value::String(browser_help().to_string())),
@@ -1342,25 +1460,32 @@ fn dispatch_browser_command(
                 .session_id
                 .as_deref()
                 .ok_or_else(|| anyhow!("browser script runtime is missing session id"))?;
-            dispatch_script_runtime(session_id, argv)
+            dispatch_script_runtime(session_id, argv, script_registry)
         }
         "runtime" => dispatch_runtime(session, argv),
         other => bail!("unknown browser command: {other}. Run `browser help`."),
     }
 }
 
-fn dispatch_script_runtime(session_id: &str, argv: &[String]) -> Result<Value> {
+fn dispatch_script_runtime(
+    session_id: &str,
+    argv: &[String],
+    script_registry: &BrowserScriptRunRegistry,
+) -> Result<Value> {
     match argv.get(1).map(String::as_str) {
         Some("runs") => Ok(json!({
             "status": "ok",
-            "active_scripts": active_browser_script_runs_json(session_id),
+            "active_scripts": active_browser_script_runs_json_with_registry(
+                session_id,
+                script_registry,
+            ),
         })),
         Some("cancel") => {
             let run_id = argv
                 .get(2)
                 .map(String::as_str)
                 .ok_or_else(|| anyhow!("browser script cancel requires <run_id>"))?;
-            let output = cancel_browser_script(session_id, run_id)?;
+            let output = cancel_browser_script_with_registry(session_id, run_id, script_registry)?;
             Ok(json!({
                 "status": output.status.unwrap_or_else(|| "cancelled".to_string()),
                 "run_id": output.run_id,
@@ -7850,6 +7975,50 @@ print("http_get parity ok")
             "internal stream file leaked as artifact: {:?}",
             finished.artifacts
         );
+    }
+
+    #[test]
+    fn browser_script_private_registry_isolates_background_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "script-private-registry";
+        let registry = BrowserScriptRunRegistry::new();
+        let started = start_browser_script_with_registry(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import time\nprint('private chunk')\ntime.sleep(1.2)\nprint('private done')",
+            5,
+            &registry,
+        )
+        .unwrap();
+
+        assert_eq!(started.status.as_deref(), Some("running"));
+        assert_eq!(registry.active_run_count_for_session(session_id), 1);
+        assert_eq!(
+            BrowserScriptRunRegistry::global().active_run_count_for_session(session_id),
+            0,
+            "private browser_script runs must not be inserted into the legacy global registry"
+        );
+        let run_id = started.run_id.as_deref().unwrap();
+        let global_err = observe_browser_script(session_id, run_id, 50)
+            .expect_err("global registry must not see private run");
+        assert!(
+            global_err
+                .to_string()
+                .contains("unknown browser_script run_id"),
+            "unexpected global observe error: {global_err}"
+        );
+
+        let mut finished =
+            observe_browser_script_with_registry(session_id, run_id, 2_500, &registry).unwrap();
+        if finished.status.as_deref() == Some("running") {
+            finished =
+                observe_browser_script_with_registry(session_id, run_id, 2_500, &registry).unwrap();
+        }
+        assert!(finished.ok);
+        assert_eq!(finished.status.as_deref(), Some("finished"));
+        assert!(finished.text.contains("private done"));
+        assert_eq!(registry.active_run_count_for_session(session_id), 0);
     }
 
     #[test]

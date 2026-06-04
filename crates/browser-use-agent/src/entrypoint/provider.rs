@@ -383,20 +383,22 @@ fn browser_backend_for_runtime_or_config(
                         headless: None,
                         profile_id: Some(session_id.as_str().to_string()),
                     });
+                    let script_registry = browser_use_browser::BrowserScriptRunRegistry::new();
                     RuntimeBrowserBackend {
                         session_id: session_id.as_str().to_string(),
                         runtime: handle.clone(),
                         agent_id,
                         browser_id,
                         backend: Arc::new(
-                            crate::tools::handlers::browser::RealBackend::with_browser_mode(
+                            crate::tools::handlers::browser::RealBackend::with_browser_mode_and_script_registry(
                                 config.options.browser_mode.clone(),
+                                script_registry,
                             ),
                         ),
                     }
                 },
                 |resource: Arc<RuntimeBrowserBackend>| {
-                    let cleaned = browser_use_browser::cleanup_session(&resource.session_id);
+                    let cleaned = resource.backend.cleanup_session(&resource.session_id);
                     let _ = resource.runtime.close_browser(&resource.browser_id);
                     cleaned
                 },
