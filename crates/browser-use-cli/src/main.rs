@@ -71,7 +71,7 @@ use browser_use_runtime::{
     CompleteAgentRequest, CreateRootAgentRequest, FailAgentRequest, LiveThreadPersistence,
     LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    RuntimeHandle, SessionId, SpawnChildRequest, SqliteJournal, StateIndex,
+    RuntimeHandle, SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
@@ -4043,10 +4043,23 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
     {
+        let payload = typed_user_input_payload_from_text_for_cwd(followup, &session.cwd)?;
+        let submitted = context.runtime.submit_followup(SubmitInputRequest {
+            target_agent_id: agent_id.clone(),
+            content: followup.to_string(),
+            trigger_turn: true,
+            delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+            input_items: payload.get("items").cloned(),
+            payload: serde_json::json!({ "source": "sdk" }),
+        })?;
         let record = context.store.append_event(
             session_id.as_str(),
-            "session.followup",
-            typed_user_input_payload_from_text_for_cwd(followup, &session.cwd)?,
+            "session.followup.runtime_queued",
+            serde_json::json!({
+                "source": "sdk",
+                "runtime_mailbox_id": submitted.mailbox_item.id,
+                "runtime_mailbox_seq": submitted.mailbox_item.seq,
+            }),
         )?;
         capture_user_message(
             &context.store,
@@ -6621,6 +6634,10 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
         );
         let agent_id = agent["result"]["agent_id"].as_str().context("agent id")?;
+        let session_id = agent["result"]
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("session id")?;
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -6628,7 +6645,8 @@ command = "test-mcp"
             "params": {
                 "agent_id": agent_id,
                 "max_steps": 2,
-                "llm": {"provider": "fake", "model": "fake"}
+                "llm": {"provider": "fake", "model": "fake"},
+                "followups": ["extract title next"]
             }
         });
 
@@ -6638,6 +6656,26 @@ command = "test-mcp"
         assert_eq!(
             result["result"]["history"]["output"],
             serde_json::Value::String("Fake result for: inspect".to_string())
+        );
+        let events = context.store.events_for_session(session_id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "mailbox.enqueued"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "mailbox.delivered"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "mailbox.consumed"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.followup.runtime_queued"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.followup"));
+        assert!(
+            context.store.messages_for_agent(session_id)?.is_empty(),
+            "SDK followups must not enqueue Store-backed agent_messages rows"
         );
 
         std::fs::remove_dir_all(temp)?;
