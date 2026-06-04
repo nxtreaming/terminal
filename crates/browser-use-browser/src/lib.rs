@@ -1633,15 +1633,21 @@ fn open_local_profile(
     profile: &LocalBrowserProfile,
 ) -> Result<Value> {
     let profile_directory_arg = format!("--profile-directory={}", profile.profile_dir);
-    let marker = format!(
-        "browser-use-profile-target-{}",
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default()
-    );
-    let target_url =
-        format!("data:text/html,<title>Browser%20Use</title><meta%20name=browser-use-profile-target%20content={marker}>");
+    let needs_marker = local_candidates()
+        .iter()
+        .any(|candidate| candidate.browser_running == Some(true));
+    let marker = needs_marker.then(|| {
+        format!(
+            "browser-use-profile-target-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default()
+        )
+    });
+    let target_url = marker.as_ref().map(|marker| {
+        format!("data:text/html,<title>Browser%20Use</title><meta%20name=browser-use-profile-target%20content={marker}>")
+    });
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new(&profile.browser_path);
@@ -1650,16 +1656,22 @@ fn open_local_profile(
             profile.user_data_dir.display()
         ));
         command.arg(&profile_directory_arg);
-        command.arg("--new-window");
-        command.arg(&target_url);
+        if let Some(target_url) = target_url.as_deref() {
+            command.arg(target_url);
+        } else {
+            command.arg("--no-startup-window");
+        }
         command
     };
     #[cfg(not(target_os = "macos"))]
     let mut command = {
         let mut command = Command::new(&profile.browser_path);
         command.arg(&profile_directory_arg);
-        command.arg("--new-window");
-        command.arg(&target_url);
+        if let Some(target_url) = target_url.as_deref() {
+            command.arg(target_url);
+        } else {
+            command.arg("--no-startup-window");
+        }
         command
     };
     command
@@ -1673,16 +1685,22 @@ fn open_local_profile(
                 profile.browser_name, profile.profile_name
             )
         })?;
-    session.preferred_target_marker = Some(marker.clone());
+    session.preferred_target_marker = marker.clone();
     session.preferred_profile_id = Some(profile.id.clone());
-    Ok(json!({
+    let mut response = json!({
         "status": "ok",
         "opened": true,
         "profile": profile,
-        "target_marker": marker,
-        "target_url": target_url,
+        "profile_targeting": if marker.is_some() { "marker" } else { "profile-launch" },
         "next_step": "Give Chrome a moment to start, then run browser connect local.",
-    }))
+    });
+    if let Some(marker) = marker {
+        response["target_marker"] = json!(marker);
+    }
+    if let Some(target_url) = target_url {
+        response["target_url"] = json!(target_url);
+    }
+    Ok(response)
 }
 
 fn local_setup_user_action_response(profile: Option<LocalBrowserProfile>) -> Value {
@@ -2747,6 +2765,7 @@ impl BrowserSession {
     fn attach_first_page(&mut self) -> Result<()> {
         let preferred_marker = self.preferred_target_marker.clone();
         let mut attached_profile_marker = false;
+        let mut attached_launched_profile = false;
         let mut attached_browser_context_id = None;
         let mut attached_profile_id = None;
         let target_id = if let Some(marker) = preferred_marker.as_deref() {
@@ -2784,10 +2803,31 @@ impl BrowserSession {
             }
         } else {
             let targets = self.targets()?;
-            targets
-                .iter()
-                .find(|target| is_real_page_target(target))
-                .and_then(|target| target.get("targetId").and_then(Value::as_str))
+            let launched_profile_id = self.preferred_profile_id.take();
+            let target_info = if launched_profile_id.is_some() {
+                targets
+                    .iter()
+                    .find(|target| is_page_target(target) && !is_profile_marker_target(target))
+                    .cloned()
+            } else {
+                targets
+                    .iter()
+                    .find(|target| is_real_page_target(target))
+                    .cloned()
+            };
+            if launched_profile_id.is_some() {
+                attached_profile_id = launched_profile_id;
+                attached_browser_context_id = target_info
+                    .as_ref()
+                    .and_then(|target| target.get("browserContextId"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                attached_launched_profile = attached_browser_context_id.is_some();
+            }
+            target_info
+                .as_ref()
+                .and_then(|target| target.get("targetId"))
+                .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         };
         let target_id = match target_id {
@@ -2799,10 +2839,27 @@ impl BrowserSession {
                 .ok_or_else(|| anyhow!("Target.createTarget response missing targetId"))?
                 .to_string(),
         };
+        if attached_profile_id.is_some() && attached_browser_context_id.is_none() {
+            attached_browser_context_id = self
+                .targets()
+                .ok()
+                .and_then(|targets| {
+                    targets.into_iter().find(|target| {
+                        target.get("targetId").and_then(Value::as_str) == Some(target_id.as_str())
+                    })
+                })
+                .and_then(|target| {
+                    target
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+            attached_launched_profile = attached_browser_context_id.is_some();
+        }
         let session_id = self.attach_target(&target_id)?;
         self.current_target_id = Some(target_id);
         self.current_session_id = Some(session_id);
-        if attached_profile_marker {
+        if attached_profile_marker || attached_launched_profile {
             self.preferred_browser_context_id = attached_browser_context_id.clone();
             self.active_local_profile_id = attached_profile_id;
         } else {
@@ -6845,7 +6902,7 @@ fn attach_inline_window_stitch(run: &mut BrowserScriptRun, output: &mut BrowserS
 }
 
 fn is_real_page_target(target: &Value) -> bool {
-    if target.get("type").and_then(Value::as_str) != Some("page") {
+    if !is_page_target(target) {
         return false;
     }
     if is_profile_marker_target(target) {
@@ -6857,6 +6914,10 @@ fn is_real_page_target(target: &Value) -> bool {
             .get("title")
             .and_then(Value::as_str)
             .is_some_and(|title| !title.trim().is_empty())
+}
+
+fn is_page_target(target: &Value) -> bool {
+    target.get("type").and_then(Value::as_str) == Some("page")
 }
 
 fn target_url_contains_marker(target: &Value, marker: &str) -> bool {

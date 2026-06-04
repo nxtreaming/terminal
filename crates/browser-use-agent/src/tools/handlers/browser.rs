@@ -499,6 +499,8 @@ pub(crate) fn browser_command_is_passive(words: &[&str]) -> bool {
             | ["local", "list", ..]
             | ["browser", "local", "profiles", ..]
             | ["local", "profiles", ..]
+            | ["browser", "local", "open", ..]
+            | ["local", "open", ..]
             | ["browser", "local", "setup", ..]
             | ["local", "setup", ..]
             | ["browser", "runtime", "logs", ..]
@@ -919,23 +921,23 @@ fn enrich_local_connect_recovery_with_default_profile(
         "permission-blocked" => {
             content.insert("default_profile_id".to_string(), json!(profile_id));
             content.insert(
+                "next_step".to_string(),
+                json!(
+                    "Ask the user to click Allow in Chrome's 'Allow remote debugging?' popup, then run `browser connect local`. Do not run `browser local open` again while permission is pending; the selected profile was already opened before this connect attempt."
+                ),
+            );
+        }
+        "profile-target-missing" => {
+            content.insert("default_profile_id".to_string(), json!(profile_id));
+            content.insert(
                 "profile_recovery_command".to_string(),
                 json!(format!("browser local open --profile {quoted_profile}")),
             );
             content.insert(
                 "next_step".to_string(),
                 json!(format!(
-                    "If the Allow popup is not visible, run `browser local open --profile {quoted_profile}` to focus the default profile window. Then ask the user to click Allow in Chrome's 'Allow remote debugging?' popup and run `browser connect local`."
+                    "Do not ask the user to open a Chrome profile manually. Run `browser local open --profile {quoted_profile}`, give Chrome a moment, then run `browser connect local` again. If this repeats, report that Chrome ignored the selected profile launch."
                 )),
-            );
-        }
-        "profile-target-missing" => {
-            content.insert("default_profile_id".to_string(), json!(profile_id));
-            content.insert(
-                "next_step".to_string(),
-                json!(
-                    "Do not ask the user to choose a profile again; a default profile is already set. Tell the user Chrome did not expose the expected selected-profile tab and ask them to open that Chrome profile window or close other Chrome profile windows, then retry `browser connect local`."
-                ),
             );
         }
         _ => {}
@@ -1035,7 +1037,20 @@ fn ensure_local_browser_ready_for_work(
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    bail!("local Chrome is not ready for the selected default profile before browser work; connect status: {status}");
+    let state = connect
+        .content
+        .get("state")
+        .or_else(|| connect.content.get("loss_reason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let next_step = connect
+        .content
+        .get("next_step")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("follow the browser tool recovery instructions");
+    bail!(
+        "Browser work is blocked; do not answer the user's browser/search/page task from memory. local Chrome is not ready for the selected default profile before browser work; connect status: {status}; state: {state}; next_step: {next_step}"
+    );
 }
 
 fn local_browser_ready_for_profile(value: &serde_json::Value, profile_id: &str) -> bool {
@@ -1466,7 +1481,8 @@ fn display_browser_to_mode(display: &str) -> Option<&'static str> {
 /// list. We serialize `content` onto stdout (the model-facing payload) and the
 /// events list onto stderr, with `exit_code = 0` (a failed command surfaces its
 /// failure inside `content`; the wrapped fn errors are handled separately).
-fn map_command_output(out: BrowserCommandOutput) -> ExecOutput {
+fn map_command_output(mut out: BrowserCommandOutput) -> ExecOutput {
+    add_browser_blocked_model_instruction(&mut out.content);
     let stdout = match serde_json::to_string(&out.content) {
         Ok(s) => s,
         Err(e) => format!("<unserializable browser content: {e}>"),
@@ -1481,6 +1497,47 @@ fn map_command_output(out: BrowserCommandOutput) -> ExecOutput {
         stdout,
         stderr,
     }
+}
+
+fn add_browser_blocked_model_instruction(content: &mut Value) {
+    let connection = content
+        .get("connection")
+        .or_else(|| content.pointer("/browser/connection"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(object) = content.as_object_mut() else {
+        return;
+    };
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let state = object
+        .get("state")
+        .or_else(|| object.get("loss_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let blocked = matches!(status, "blocked" | "needs-user-action")
+        || matches!(connection.as_str(), "disconnected" | "not-configured")
+        || matches!(
+            state,
+            "cdp-disabled"
+                | "permission-blocked"
+                | "stale-port"
+                | "browser-not-running"
+                | "profile-target-missing"
+        );
+    if !blocked {
+        return;
+    }
+    object.insert("browser_task_blocked".to_string(), json!(true));
+    object.insert(
+        "model_instruction".to_string(),
+        json!(
+            "Browser work is blocked. Do not answer the user's browser/search/page task from memory or cached knowledge. Follow next_step/tool instructions, or ask the user for the required Chrome action, then retry browser work."
+        ),
+    );
 }
 
 /// Map a [`BrowserScriptOutput`] into [`ExecOutput`], using the same

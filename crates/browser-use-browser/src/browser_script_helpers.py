@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
+PROFILE_MARKER = "browser-use-profile-target"
 __last_domain_skills = []
 
 
@@ -434,6 +435,8 @@ def list_tabs(include_chrome=True, include_other_contexts=False):
         if current_context and target.get("browserContextId") != current_context:
             continue
         url = target.get("url", "")
+        if not include_chrome and PROFILE_MARKER in url:
+            continue
         if not include_chrome and url.startswith(INTERNAL):
             continue
         target_id = target.get("targetId")
@@ -493,13 +496,24 @@ def _current_target_browser_context_id():
         return None
 
 
+def _is_placeholder_tab_url(url):
+    if url in ("", "about:blank"):
+        return True
+    if not url:
+        return False
+    return (
+        url.startswith("about:blank#")
+        or PROFILE_MARKER in url
+        or url.startswith("chrome://newtab")
+        or url.startswith("chrome://new-tab-page")
+    )
+
+
 def new_tab(url="about:blank"):
     # Reuse the current controlled tab when it's just a placeholder
     if url != "about:blank":
         current_url = _current_target_url()
-        if current_url in ("", "about:blank") or (
-            current_url and "browser-use-profile-target" in current_url
-        ):
+        if _is_placeholder_tab_url(current_url):
             goto_url(url)
             return current_tab().get("targetId")
     # Match browser-harness: create blank first, attach, then navigate. Passing

@@ -615,6 +615,15 @@ fn passive_browser_commands_do_not_preflight_connect() {
         ["local", "list", "--json"].as_slice(),
         ["browser", "local", "profiles", "--json"].as_slice(),
         ["local", "profiles", "--json"].as_slice(),
+        [
+            "browser",
+            "local",
+            "open",
+            "--profile",
+            "google-chrome:Default",
+        ]
+        .as_slice(),
+        ["local", "open", "--profile", "google-chrome:Default"].as_slice(),
         ["browser", "local", "setup"].as_slice(),
         ["local", "setup"].as_slice(),
     ] {
