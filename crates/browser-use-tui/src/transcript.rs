@@ -20,13 +20,16 @@ use super::{
     active_followup_is_after_next_tool_call, active_followup_is_cancelled_in_events,
     active_followup_is_pending_in_events, user_input_display_text_from_payload, App,
     PENDING_FOLLOWUP_INTERRUPT_REASON, SESSION_MAILBOX_CONTINUATION_STARTED_EVENT,
-    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
+    SESSION_PAUSED_REASON, SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
 };
 
 const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
 const GROUP_VALUE_LAST_PREFIX: &str = "  └ ";
 const ACTIVE_FALLBACK_STATUS: &str = "running browser task";
 const LIVE_STREAM_QUIET_STATUS_DELAY_MS: i64 = 500;
+const SESSION_PAUSED_TITLE: &str = "Conversation paused";
+const SESSION_PAUSED_TEXT: &str =
+    "What should the model do differently? If something went wrong, please use /feedback :)";
 /// Mirror of the agent crate's `pub(crate)` rollback event type. Used only to
 /// decide whether the rollback-filtered event buffer can be extended in place
 /// (append-only, no rollback) or must be rebuilt from scratch.
@@ -236,7 +239,9 @@ enum TranscriptKind {
         text: String,
     },
     Cancelled {
+        title: String,
         text: String,
+        style: NodeStyle,
     },
 }
 
@@ -314,12 +319,9 @@ impl TranscriptNode {
                 NodeStyle::Failed,
                 width,
             ),
-            TranscriptKind::Cancelled { text } => grouped_lines(
-                "stopped",
-                std::slice::from_ref(text),
-                NodeStyle::Muted,
-                width,
-            ),
+            TranscriptKind::Cancelled { title, text, style } => {
+                grouped_lines(title, std::slice::from_ref(text), *style, width)
+            }
         }
     }
 
@@ -379,9 +381,9 @@ impl TranscriptNode {
                     format!("{GROUP_VALUE_LAST_PREFIX}{}", friendly_error_message(text)),
                 ]
             }
-            TranscriptKind::Cancelled { text } => {
+            TranscriptKind::Cancelled { title, text, .. } => {
                 vec![
-                    "• stopped".to_string(),
+                    format!("• {title}"),
                     format!("{GROUP_VALUE_LAST_PREFIX}{text}"),
                 ]
             }
@@ -989,12 +991,23 @@ fn committed_node_for_event(
                     NodeStyle::Muted,
                 ));
             }
+            let reason = event
+                .payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str);
+            let (title, text, style) = if reason == Some(SESSION_PAUSED_REASON) {
+                (SESSION_PAUSED_TITLE, SESSION_PAUSED_TEXT, NodeStyle::Failed)
+            } else {
+                ("stopped", "Progress is saved in history.", NodeStyle::Muted)
+            };
             let node = TranscriptNode {
                 id,
                 seq: event.seq,
                 revision: event.seq.max(0) as u64,
                 kind: TranscriptKind::Cancelled {
-                    text: "Progress is saved in history.".to_string(),
+                    title: title.to_string(),
+                    text: text.to_string(),
+                    style,
                 },
             };
             Some(with_streaming_commentary_before_event(
@@ -2985,11 +2998,19 @@ fn payload_string(event: &EventRecord, key: &str) -> Option<String> {
 }
 
 fn source_for_state(state: &WorkbenchState) -> Option<String> {
-    state
+    if let Some(source) = state
         .browser
         .url
         .as_deref()
-        .or(state.browser.live_url.as_deref())
+        .filter(|source| is_useful_source_for_backend(source, &state.browser.backend))
+    {
+        return Some(source.to_string());
+    }
+    state
+        .browser
+        .live_url
+        .as_deref()
+        .filter(|_| browser_backend_supports_live_url(&state.browser.backend))
         .filter(|source| is_useful_source(source))
         .map(ToOwned::to_owned)
 }
@@ -2997,6 +3018,22 @@ fn source_for_state(state: &WorkbenchState) -> Option<String> {
 fn is_useful_source(source: &str) -> bool {
     let source = source.trim();
     !source.is_empty() && source != "about:blank"
+}
+
+fn is_useful_source_for_backend(source: &str, backend: &str) -> bool {
+    is_useful_source(source)
+        && (browser_backend_supports_live_url(backend) || !is_cloud_live_url(source))
+}
+
+fn browser_backend_supports_live_url(backend: &str) -> bool {
+    backend.to_ascii_lowercase().contains("cloud")
+}
+
+fn is_cloud_live_url(source: &str) -> bool {
+    source
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("https://live.browser-use.com/")
 }
 
 fn tool_failed_lines(event: &EventRecord) -> Vec<String> {

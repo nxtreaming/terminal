@@ -329,7 +329,7 @@ fn prepare_tui_agent_run(
         None
     };
     if browser == BROWSER_USE_CLOUD && browser_use_cloud_api_key.is_none() {
-        let error = "Browser Use cloud selected, but BROWSER_USE_API_KEY is not set";
+        let error = "Browser Use Cloud selected, but BROWSER_USE_API_KEY is not set";
         let _ = store.append_event(
             &session_id,
             "session.failed",
@@ -838,12 +838,14 @@ fn tui_agent_options(
         "Headless Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headless")
+            .with_dynamic_browser_mode_from_store(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
         BROWSER_USE_CLOUD => {
             let mut options = AgentRunOptions::default()
                 .with_collaboration_mode(collaboration_mode)
                 .with_browser_mode("cloud")
+                .with_dynamic_browser_mode_from_store(true)
                 .with_model_compaction(true)
                 .with_analytics_source("tui");
             if let Some(api_key) =
@@ -859,6 +861,7 @@ fn tui_agent_options(
         _ => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("local")
+            .with_dynamic_browser_mode_from_store(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
     };
@@ -938,6 +941,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("local"));
+        assert!(options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
@@ -954,6 +958,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("managed-headless"));
+        assert!(options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
@@ -976,7 +981,7 @@ mod tests {
     #[test]
     fn browser_use_cloud_keeps_cloud_mode() {
         let options = tui_agent_options(
-            "Browser Use cloud",
+            BROWSER_USE_CLOUD,
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),
@@ -986,13 +991,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("cloud"));
+        assert!(options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
     #[test]
     fn browser_use_cloud_passes_stored_key_to_worker_env() {
         let options = tui_agent_options(
-            "Browser Use cloud",
+            BROWSER_USE_CLOUD,
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),

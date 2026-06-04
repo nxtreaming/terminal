@@ -384,6 +384,7 @@ dependencies = [
  "open",
  "pulldown-cmark",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "signal-hook",
@@ -395,6 +396,7 @@ dependencies = [
  "toml",
  "two-face",
  "unicode-width",
+ "uuid",
 ]
 
 [[package]]

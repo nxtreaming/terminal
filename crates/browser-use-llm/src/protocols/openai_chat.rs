@@ -25,13 +25,34 @@ const TEXT_ID: &str = "0";
 const REASONING_ID: &str = "reasoning";
 
 /// Adapter for the OpenAI-compatible Chat Completions wire format.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct OpenAiChatProtocol;
+#[derive(Debug, Clone, Copy)]
+pub struct OpenAiChatProtocol {
+    include_image_content: bool,
+}
 
 impl OpenAiChatProtocol {
     /// Create a new protocol adapter.
     pub fn new() -> Self {
-        Self
+        Self {
+            include_image_content: true,
+        }
+    }
+
+    /// Create a protocol adapter that keeps image media out of Chat content.
+    ///
+    /// Some OpenAI-compatible endpoints, including DeepSeek's chat endpoint, use
+    /// the Chat Completions text-part schema but reject `image_url` content
+    /// parts. Tool screenshots are retained as textual omission notes instead.
+    pub fn without_image_content() -> Self {
+        Self {
+            include_image_content: false,
+        }
+    }
+}
+
+impl Default for OpenAiChatProtocol {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -53,7 +74,7 @@ impl Protocol for OpenAiChatProtocol {
             messages.push(json!({ "role": "system", "content": system_text }));
         }
         for message in &req.messages {
-            append_message(message, &mut messages)?;
+            append_message(message, &mut messages, self.include_image_content)?;
         }
         body.insert("messages".to_string(), Value::Array(messages));
 
@@ -130,10 +151,14 @@ fn reasoning_effort_str(effort: ReasoningEffort) -> &'static str {
 }
 
 /// Translate a neutral [`Message`] into one or more Chat Completions message objects.
-fn append_message(message: &Message, out: &mut Vec<Value>) -> Result<(), LlmError> {
+fn append_message(
+    message: &Message,
+    out: &mut Vec<Value>,
+    include_image_content: bool,
+) -> Result<(), LlmError> {
     match message.role {
         MessageRole::Tool => {
-            append_tool_messages(message, out);
+            append_tool_messages(message, out, include_image_content);
             Ok(())
         }
         MessageRole::Assistant => {
@@ -141,24 +166,32 @@ fn append_message(message: &Message, out: &mut Vec<Value>) -> Result<(), LlmErro
             Ok(())
         }
         MessageRole::System => {
-            out.push(build_simple_message("system", message));
+            out.push(build_simple_message(
+                "system",
+                message,
+                include_image_content,
+            ));
             Ok(())
         }
         MessageRole::Developer => {
-            out.push(build_simple_message("developer", message));
+            out.push(build_simple_message(
+                "developer",
+                message,
+                include_image_content,
+            ));
             Ok(())
         }
         MessageRole::User => {
-            out.push(build_simple_message("user", message));
+            out.push(build_simple_message("user", message, include_image_content));
             Ok(())
         }
     }
 }
 
 /// Render a `system`/`developer`/`user` message.
-fn build_simple_message(role: &str, message: &Message) -> Value {
+fn build_simple_message(role: &str, message: &Message, include_image_content: bool) -> Value {
     if role == "user" {
-        json!({ "role": role, "content": build_user_content(message) })
+        json!({ "role": role, "content": build_user_content(message, include_image_content) })
     } else {
         json!({ "role": role, "content": collect_text(message) })
     }
@@ -168,7 +201,6 @@ fn build_simple_message(role: &str, message: &Message) -> Value {
 fn build_assistant_message(message: &Message) -> Result<Value, LlmError> {
     let mut obj = Map::new();
     obj.insert("role".to_string(), json!("assistant"));
-    obj.insert("content".to_string(), json!(collect_text(message)));
 
     let mut tool_calls: Vec<Value> = Vec::new();
     for part in &message.content {
@@ -189,6 +221,14 @@ fn build_assistant_message(message: &Message) -> Result<Value, LlmError> {
             }));
         }
     }
+    // Omit `content` for a tool-only assistant turn rather than sending an empty
+    // string. OpenAI tolerates `content: ""`, but strict downstream providers
+    // (e.g. Amazon Bedrock via OpenRouter) reject a blank text content block:
+    // "The text field in the ContentBlock object ... is blank."
+    let text = collect_text(message);
+    if !text.is_empty() || tool_calls.is_empty() {
+        obj.insert("content".to_string(), json!(text));
+    }
     if !tool_calls.is_empty() {
         obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
@@ -201,7 +241,7 @@ fn build_assistant_message(message: &Message) -> Result<Value, LlmError> {
 /// Chat Completions tool messages are text-only in practice. When a tool result
 /// carries image media, keep the required tool message as text and append a
 /// follow-up user message that carries the actual image parts.
-fn append_tool_messages(message: &Message, out: &mut Vec<Value>) {
+fn append_tool_messages(message: &Message, out: &mut Vec<Value>, include_image_content: bool) {
     let mut obj = Map::new();
     obj.insert("role".to_string(), json!("tool"));
     for part in &message.content {
@@ -214,10 +254,12 @@ fn append_tool_messages(message: &Message, out: &mut Vec<Value>) {
             obj.insert("tool_call_id".to_string(), json!(tool_call_id));
             obj.insert(
                 "content".to_string(),
-                json!(tool_result_text_for_chat(content)),
+                json!(tool_result_text_for_chat(content, include_image_content)),
             );
             out.push(Value::Object(obj));
-            if let Some(visual_context) = tool_result_visual_context(tool_call_id, content) {
+            if let Some(visual_context) =
+                tool_result_visual_context(tool_call_id, content, include_image_content)
+            {
                 out.push(visual_context);
             }
             break;
@@ -225,7 +267,7 @@ fn append_tool_messages(message: &Message, out: &mut Vec<Value>) {
     }
 }
 
-fn build_user_content(message: &Message) -> Value {
+fn build_user_content(message: &Message, include_image_content: bool) -> Value {
     let mut text = String::new();
     let mut parts = Vec::new();
     let mut has_media = false;
@@ -244,18 +286,28 @@ fn build_user_content(message: &Message) -> Value {
                 url,
                 detail,
             } => {
-                if let Some(image) = chat_image_part(
-                    mime_type,
-                    data.as_deref(),
-                    url.as_deref(),
-                    detail.as_deref(),
-                ) {
-                    has_media = true;
-                    parts.push(image);
+                if include_image_content {
+                    if let Some(image) = chat_image_part(
+                        mime_type,
+                        data.as_deref(),
+                        url.as_deref(),
+                        detail.as_deref(),
+                    ) {
+                        has_media = true;
+                        parts.push(image);
+                    }
+                } else if mime_type.starts_with("image/") {
+                    append_omitted_image_text(&mut text, &mut parts);
                 }
             }
             ContentPart::ToolResult { content, .. } => {
-                append_chat_content_parts(content, &mut text, &mut parts, &mut has_media);
+                append_chat_content_parts(
+                    content,
+                    &mut text,
+                    &mut parts,
+                    &mut has_media,
+                    include_image_content,
+                );
             }
             ContentPart::ToolCall { .. } => {}
         }
@@ -267,7 +319,7 @@ fn build_user_content(message: &Message) -> Value {
     }
 }
 
-fn tool_result_text_for_chat(content: &[ContentPart]) -> String {
+fn tool_result_text_for_chat(content: &[ContentPart], include_image_content: bool) -> String {
     let mut text = String::new();
     let mut image_count = 0usize;
     collect_tool_result_text_and_images(content, &mut text, &mut image_count);
@@ -275,23 +327,47 @@ fn tool_result_text_for_chat(content: &[ContentPart]) -> String {
         if !text.is_empty() {
             text.push('\n');
         }
-        text.push_str(&format!(
-            "[{image_count} image(s) attached in the following visual context message]"
-        ));
+        if include_image_content {
+            text.push_str(&format!(
+                "[{image_count} image(s) attached in the following visual context message]"
+            ));
+        } else {
+            text.push_str(&format!(
+                "[{image_count} image(s) omitted because this model endpoint does not accept image content]"
+            ));
+        }
     }
     text
 }
 
-fn tool_result_visual_context(tool_call_id: &str, content: &[ContentPart]) -> Option<Value> {
+fn tool_result_visual_context(
+    tool_call_id: &str,
+    content: &[ContentPart],
+    include_image_content: bool,
+) -> Option<Value> {
     let mut parts = vec![json!({
         "type": "text",
-        "text": format!("Visual context from tool call {tool_call_id}. Use these images as the tool result."),
+        "text": if include_image_content {
+            format!("Visual context from tool call {tool_call_id}. Use these images as the tool result.")
+        } else {
+            format!("Visual output from tool call {tool_call_id} was omitted because this model endpoint does not accept image content. Continue using text, DOM state, and browser script inspection instead.")
+        },
     })];
-    append_tool_result_images(content, &mut parts);
-    (parts.len() > 1).then_some(json!({
-        "role": "user",
-        "content": parts,
-    }))
+    if include_image_content {
+        append_tool_result_images(content, &mut parts);
+        (parts.len() > 1).then_some(json!({
+            "role": "user",
+            "content": parts,
+        }))
+    } else {
+        let mut text = String::new();
+        let mut image_count = 0usize;
+        collect_tool_result_text_and_images(content, &mut text, &mut image_count);
+        (image_count > 0).then_some(json!({
+            "role": "user",
+            "content": parts,
+        }))
+    }
 }
 
 fn append_chat_content_parts(
@@ -299,6 +375,7 @@ fn append_chat_content_parts(
     text: &mut String,
     parts: &mut Vec<Value>,
     has_media: &mut bool,
+    include_image_content: bool,
 ) {
     for part in content {
         match part {
@@ -315,22 +392,32 @@ fn append_chat_content_parts(
                 url,
                 detail,
             } => {
-                if let Some(image) = chat_image_part(
-                    mime_type,
-                    data.as_deref(),
-                    url.as_deref(),
-                    detail.as_deref(),
-                ) {
-                    *has_media = true;
-                    parts.push(image);
+                if include_image_content {
+                    if let Some(image) = chat_image_part(
+                        mime_type,
+                        data.as_deref(),
+                        url.as_deref(),
+                        detail.as_deref(),
+                    ) {
+                        *has_media = true;
+                        parts.push(image);
+                    }
+                } else if mime_type.starts_with("image/") {
+                    append_omitted_image_text(text, parts);
                 }
             }
             ContentPart::ToolResult { content, .. } => {
-                append_chat_content_parts(content, text, parts, has_media);
+                append_chat_content_parts(content, text, parts, has_media, include_image_content);
             }
             ContentPart::ToolCall { .. } => {}
         }
     }
+}
+
+fn append_omitted_image_text(text: &mut String, parts: &mut Vec<Value>) {
+    const OMITTED: &str = "[image omitted: selected model endpoint does not accept image content]";
+    text.push_str(OMITTED);
+    parts.push(json!({ "type": "text", "text": OMITTED }));
 }
 
 fn collect_tool_result_text_and_images(
@@ -681,7 +768,6 @@ mod tests {
                 { "role": "user", "content": "what is the weather?" },
                 {
                     "role": "assistant",
-                    "content": "",
                     "tool_calls": [
                         {
                             "id": "call_1",

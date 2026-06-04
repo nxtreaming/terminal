@@ -1,8 +1,11 @@
 use anyhow::Result;
-use browser_use_agent::prompts::CollaborationModeKind;
+use browser_use_agent::{
+    context::assembly::estimate_item_token_count, prompts::CollaborationModeKind,
+    session::provider_messages_from_events,
+};
 use browser_use_protocol::{
-    instruction_sources_from_events, startup_warnings_from_events, HistoryRow, TelemetrySummary,
-    WorkbenchState,
+    instruction_sources_from_events, startup_warnings_from_events, EventRecord, HistoryRow,
+    TelemetrySummary, WorkbenchState,
 };
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -11,12 +14,15 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
 use crate::settings::{
-    is_claude_code_account, ModelChoiceGroup, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
+    is_claude_code_account, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
     ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
+    RECOMMENDED_MODELS,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -25,7 +31,8 @@ use super::{
     collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
     format_goal_tokens_compact, goal_command_hint, goal_status_label,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
-    CookieSyncStatus, MessageActionKind, ProductState, SetupResultKind, Surface,
+    CookieSyncStatus, FeedbackCategory, FeedbackStep, MessageActionKind, ModelSearchEntry,
+    ProductState, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -38,6 +45,30 @@ pub(crate) fn render_dump(app: &mut App) -> Result<String> {
     let mut terminal = Terminal::new(backend)?;
     terminal.draw(|frame| render(frame, app))?;
     Ok(buffer_to_string(terminal.backend().buffer()))
+}
+
+/// The set of foreground colors used by filled block cells ("█"), so tests can
+/// assert the context bar actually colors its segments per category.
+#[cfg(test)]
+pub(crate) fn render_filled_block_colors(
+    app: &mut App,
+) -> Result<std::collections::HashSet<ratatui::style::Color>> {
+    app.drain_store_notifications()?;
+    let backend = TestBackend::new(app.args.width, app.args.height);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.draw(|frame| render(frame, app))?;
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let mut colors = std::collections::HashSet::new();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            let cell = &buffer[(x, y)];
+            if cell.symbol() == "█" {
+                colors.insert(cell.fg);
+            }
+        }
+    }
+    Ok(colors)
 }
 
 fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
@@ -102,6 +133,9 @@ pub(crate) fn lines_plain_text(lines: &[Line<'static>]) -> String {
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let full_area = frame.area();
     let area = app_surface(full_area);
+    // Reset each frame; only the composer status line re-records it when the
+    // live URL is actually drawn. Prevents a stale link after disconnect.
+    *app.live_link_overlay.borrow_mut() = None;
 
     if app.is_first_run_setup_visible().unwrap_or(false) {
         app.modal_background = None;
@@ -178,6 +212,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
                     buffer: frame.buffer_mut().clone(),
                 });
             }
+        }
+        Surface::FeedbackThanks => {
+            app.modal_background = None;
+            render_feedback_thanks(frame, area, app);
         }
         surface => {
             app.modal_background = None;
@@ -908,13 +946,17 @@ fn render_surface_popup_box(
     }
     // For text-input popups, position the terminal cursor at the end of the
     // masked secret line so the user sees a blinking caret in the input field.
-    let cursor_pos: Option<Position> = if surface.is_text_input_popup() {
+    let cursor_pos: Option<Position> = if surface.is_text_input_popup()
+        && (surface != Surface::ModelSearch || app.model_search_has_filter_input())
+    {
         let masked = match surface {
             Surface::Telemetry => masked_secret(app.composer.input()),
             Surface::ApiKey => {
                 let account = app.api_key_account.as_deref().unwrap_or("");
                 masked_secret_for_account(account, app.composer.input())
             }
+            // The model search field is not a secret — show the raw query.
+            Surface::ModelSearch => app.composer.input().to_string(),
             _ => String::new(),
         };
         let target = format!("  {masked}");
@@ -1329,14 +1371,18 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Account => ("Authenticate", "Sign in to a model provider"),
         Surface::ApiKey => ("API key", "Enter your provider API key"),
         Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
+        Surface::Provider => ("Model", "Pick a recommended model or choose a provider"),
+        Surface::OpenAiAuth => ("OpenAI", "Choose how to connect to OpenAI"),
         Surface::Model => ("Model", "Choose the model and provider for this session"),
-        Surface::Mode => ("Mode", "Default execution mode is active"),
+        Surface::ModelSearch => ("Model", "Search this provider's models"),
+        Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
         Surface::CookieSync => (
             "Cookie Sync",
-            "Import local browser cookies to Browser Use cloud",
+            "Import local browser cookies to Browser Use Cloud",
         ),
+        Surface::Context => ("Context", "Inspect current context window usage"),
         Surface::Goal => ("Goal", "Inspect or change the active task goal"),
         Surface::History => ("History", "Browse and resume previous tasks"),
         Surface::Messages => (
@@ -1344,6 +1390,8 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
             "Edit submitted prompts or cancel queued follow-ups",
         ),
         Surface::Developer => ("Developer", "Developer tools and diagnostics"),
+        Surface::Feedback => ("Feedback", "Report a bug or share feedback"),
+        Surface::FeedbackThanks => ("Feedback", ""),
         Surface::Main => ("", ""),
     }
 }
@@ -1381,8 +1429,11 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::CookieSync => "Enter:select | Esc:close",
+        Surface::Context => "Esc:close",
         Surface::Goal => "Esc:close",
         Surface::Developer => "Esc:close",
+        Surface::Feedback => "Enter:next | Esc:back",
+        Surface::FeedbackThanks => "",
         _ => "Enter:select | Esc:back",
     }
 }
@@ -1396,10 +1447,23 @@ fn messages_footer(app: &App) -> &'static str {
 }
 
 fn surface_footer_for_app(surface: Surface, app: &App) -> &'static str {
-    if surface == Surface::Messages {
-        messages_footer(app)
+    match surface {
+        Surface::Messages => messages_footer(app),
+        Surface::Feedback => feedback_footer(app),
+        _ => surface_footer(surface),
+    }
+}
+
+fn feedback_footer(app: &App) -> &'static str {
+    // The final step submits on Enter; earlier steps advance. On the home
+    // screen (no selected session) the description step is the last one.
+    let submits = matches!(app.feedback.step, FeedbackStep::UploadLogs)
+        || (matches!(app.feedback.step, FeedbackStep::Description)
+            && app.selected_session_id.is_none());
+    if submits {
+        "Enter:submit | Esc:back"
     } else {
-        surface_footer(surface)
+        "Enter:next | Esc:back"
     }
 }
 
@@ -1417,15 +1481,21 @@ fn surface_lines(
         Surface::Account => account_lines(app),
         Surface::ApiKey => api_key_lines(app),
         Surface::Telemetry => telemetry_key_lines(app),
+        Surface::Provider => provider_lines(app),
+        Surface::OpenAiAuth => openai_auth_lines(app),
         Surface::Model => model_lines(app, height),
+        Surface::ModelSearch => model_search_lines(app, height),
         Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
         Surface::CookieSync => cookie_sync_lines(app, width),
+        Surface::Context => context_lines(app, state, width),
         Surface::Goal => goal_lines(app),
         Surface::History => history_lines(app, state, width),
         Surface::Messages => message_lines(app, width),
         Surface::Developer => developer_lines(app, state),
+        Surface::Feedback => feedback_lines(app),
+        Surface::FeedbackThanks => Vec::new(),
         Surface::Main => Vec::new(),
     }
 }
@@ -1550,14 +1620,26 @@ fn render_composer(
             vertical: 0,
             horizontal: 2,
         });
-        frame.render_widget(
-            Paragraph::new(composer_status_line(
-                app,
-                state,
-                status_inner.width as usize,
-            )),
-            status_inner,
-        );
+        let (status_line, live_link) =
+            composer_status_line(app, state, status_inner.width as usize);
+        frame.render_widget(Paragraph::new(status_line), status_inner);
+        // Record where the live URL landed so the caller can paint an OSC-8
+        // hyperlink over it after the frame is flushed (see LiveLinkOverlay).
+        if let Some(link) = live_link {
+            let col = status_inner.x.saturating_add(link.col as u16);
+            let max_visible = status_inner.right().saturating_sub(col) as usize;
+            let width = link.width.min(max_visible);
+            if width > 0 {
+                let text: String = link.text.chars().take(width).collect();
+                *app.live_link_overlay.borrow_mut() = Some(LiveLinkOverlay {
+                    col,
+                    row: status_inner.y,
+                    text,
+                    url: link.url,
+                    fg: muted().fg.unwrap_or(ratatui::style::Color::Reset),
+                });
+            }
+        }
     }
 }
 
@@ -1593,10 +1675,53 @@ fn composer_bottom_border(width: u16, app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Geometry of the clickable live-view link inside the status row, as built
+/// by `composer_status_line`. Columns are relative to the status row origin;
+/// the caller resolves them to absolute screen coordinates.
+struct LiveLink {
+    /// Column of the first URL cell, relative to the status row origin.
+    col: usize,
+    /// Visible width (in cells) of the truncated URL text.
+    width: usize,
+    /// The visible (possibly truncated) URL text actually drawn.
+    text: String,
+    /// The full, untruncated live-view URL to open on click.
+    url: String,
+}
+
+/// On-screen placement of the live-view link, in absolute terminal
+/// coordinates, recorded during render so the caller can paint an OSC-8
+/// hyperlink over the already-drawn cells *after* the frame is flushed.
+///
+/// The link can't be bound inside the frame buffer: ratatui's draw diff
+/// measures each cell's symbol display width, so escape bytes embedded in a
+/// cell are counted as visible columns and corrupt the layout (skipped
+/// cells, misaligned click region). Painting it post-draw, the way the
+/// manual modal overlay does, sidesteps the diff entirely.
+pub(crate) struct LiveLinkOverlay {
+    /// Absolute column of the first URL cell.
+    pub(crate) col: u16,
+    /// Absolute row of the status line.
+    pub(crate) row: u16,
+    /// The visible URL text to reprint between the OSC-8 open/close.
+    pub(crate) text: String,
+    /// The full URL bound as the hyperlink target.
+    pub(crate) url: String,
+    /// Foreground color to reprint the text with (matches `muted()`).
+    pub(crate) fg: ratatui::style::Color,
+}
+
 /// Status row below the composer: active model and context-fill bar,
 /// plus running cost when there is one. The browser lives on the box's
 /// bottom border, not here.
-fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line<'static> {
+///
+/// Returns the rendered line plus, when present, the geometry of the live
+/// URL so the caller can attach an OSC-8 hyperlink to the full URL.
+fn composer_status_line(
+    app: &App,
+    state: &WorkbenchState,
+    width: usize,
+) -> (Line<'static>, Option<LiveLink>) {
     let usage = session_usage(app, state);
     let mut spans = vec![Span::styled(app.model.clone(), accent())];
     spans.push(status_separator());
@@ -1608,15 +1733,17 @@ fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line
         spans.push(status_separator());
         spans.push(Span::styled(goal, muted()));
     }
-    spans.push(status_separator());
-    spans.extend(context_bar_spans(
-        usage.context_tokens.unwrap_or(0),
-        usage.context_budget_tokens,
-    ));
+    if let (Some(context_tokens), Some(context_budget_tokens)) =
+        (usage.context_tokens, usage.context_budget_tokens)
+    {
+        spans.push(status_separator());
+        spans.extend(context_bar_spans(context_tokens, context_budget_tokens));
+    }
     if usage.cost_usd > 0.0 {
         spans.push(status_separator());
         spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
     }
+    let mut live_link = None;
     if let Some(live_url) = state
         .browser
         .live_url
@@ -1628,14 +1755,21 @@ fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line
         let prefix_width = status_separator_width() + "live ".chars().count();
         if width > used.saturating_add(prefix_width).saturating_add(8) {
             let available = width.saturating_sub(used + prefix_width);
+            let shown = truncate(live_url, available);
+            // The URL text starts after everything rendered so far plus the
+            // separator and the "live " label.
+            let url_col = used + prefix_width;
+            live_link = Some(LiveLink {
+                col: url_col,
+                width: shown.chars().count(),
+                text: shown.clone(),
+                url: live_url.to_string(),
+            });
             spans.push(status_separator());
-            spans.push(Span::styled(
-                format!("live {}", truncate(live_url, available)),
-                muted(),
-            ));
+            spans.push(Span::styled(format!("live {shown}"), muted()));
         }
     }
-    Line::from(spans)
+    (Line::from(spans), live_link)
 }
 
 /// Dropdown rows used by the fused composer. No top/bottom rules and no
@@ -1678,8 +1812,8 @@ fn slash_palette_item_description(_app: &App, item: &palette::PaletteItem) -> &'
     item.description
 }
 
-/// Fallback budget for older sessions that predate Codex-style `token_count`
-/// events with model context-window metadata.
+/// Fallback budget for context-surface attribution in older sessions that
+/// predate Codex-style `token_count` events with model context-window metadata.
 const FALLBACK_CONTEXT_BUDGET_TOKENS: i64 = 60_000;
 
 /// Width, in cells, of the filled/empty context bar.
@@ -1688,11 +1822,9 @@ const CONTEXT_BAR_WIDTH: usize = 10;
 /// A plain context bar — solid `█` fill over a `░` track — followed by the
 /// `used/budget` token counts. Turns red as the conversation nears the
 /// compaction budget.
-fn context_bar_spans(used_tokens: i64, budget_tokens: Option<i64>) -> Vec<Span<'static>> {
+fn context_bar_spans(used_tokens: i64, budget_tokens: i64) -> Vec<Span<'static>> {
     let used_tokens = used_tokens.max(0);
-    let budget_tokens = budget_tokens
-        .filter(|tokens| *tokens > 0)
-        .unwrap_or(FALLBACK_CONTEXT_BUDGET_TOKENS);
+    let budget_tokens = budget_tokens.max(1);
     let ratio = (used_tokens as f64 / budget_tokens as f64).clamp(0.0, 1.0);
     let fill_style = if ratio >= 0.9 { failed() } else { accent() };
 
@@ -1728,8 +1860,8 @@ fn spans_text_width(spans: &[Span<'_>]) -> usize {
 }
 
 /// Per-session token and cost totals. Codex-style `token_count` events are the
-/// source of truth for context occupancy; legacy `model.usage` remains a
-/// fallback for old sessions and the cost source.
+/// source of truth for context occupancy; legacy `model.usage` remains only
+/// the cost source.
 struct SessionUsage {
     /// Prompt tokens of the most recent model turn — i.e. current context occupancy.
     context_tokens: Option<i64>,
@@ -1747,19 +1879,18 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
     let Some(session) = state.current_session.as_ref() else {
         return usage;
     };
-    let mut legacy_context_tokens = None;
     for event in app.cached_events_for_session(&session.id) {
         match event.event_type.as_str() {
             "token_count" => {
                 let Some(info) = event.payload.get("info").filter(|info| info.is_object()) else {
                     continue;
                 };
-                if let Some(total_tokens) = info
+                if let Some(input_tokens) = info
                     .get("last_token_usage")
-                    .and_then(|usage| usage.get("total_tokens"))
+                    .and_then(|usage| usage.get("input_tokens"))
                     .and_then(serde_json::Value::as_i64)
                 {
-                    usage.context_tokens = Some(total_tokens);
+                    usage.context_tokens = Some(input_tokens.max(0));
                 }
                 if let Some(model_context_window) = info
                     .get("model_context_window")
@@ -1770,13 +1901,6 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
                 }
             }
             "model.usage" => {
-                if let Some(input_tokens) = event
-                    .payload
-                    .get("input_tokens")
-                    .and_then(serde_json::Value::as_i64)
-                {
-                    legacy_context_tokens = Some(input_tokens);
-                }
                 if let Some(cost) = event
                     .payload
                     .get("cost_usd")
@@ -1787,9 +1911,6 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
             }
             _ => {}
         }
-    }
-    if usage.context_tokens.is_none() {
-        usage.context_tokens = legacy_context_tokens;
     }
     usage
 }
@@ -1885,6 +2006,8 @@ fn render_footer(
         "esc again to edit messages"
     } else if app.surface == Surface::Messages {
         messages_footer(app)
+    } else if app.surface == Surface::Feedback {
+        feedback_footer(app)
     } else if app.surface.is_bottom_pane() {
         surface_footer(app.surface)
     } else {
@@ -2070,8 +2193,20 @@ fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(Span::styled("PROVIDERS", muted())));
     lines.push(Line::from(""));
 
-    for (idx, label) in ACCOUNT_CHOICES.iter().enumerate() {
-        lines.push(setup_account_row(label, idx, app.selected_row));
+    for (idx, account) in app
+        .setup_account_choices()
+        .unwrap_or_else(|_| {
+            vec![
+                ACCOUNT_OPENAI,
+                ACCOUNT_ANTHROPIC,
+                ACCOUNT_OPENROUTER,
+                ACCOUNT_DEEPSEEK,
+            ]
+        })
+        .iter()
+        .enumerate()
+    {
+        lines.push(setup_account_row(account, idx, app.selected_row));
     }
     lines.extend([
         Line::from(""),
@@ -2082,14 +2217,26 @@ fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
 
 fn setup_account_row(label: &str, idx: usize, selected_row: usize) -> Line<'static> {
     let is_selected = idx == selected_row;
+    let detected_codex = label == ACCOUNT_CODEX;
+    let display = if detected_codex {
+        "Continue with Codex login"
+    } else {
+        label
+    };
     Line::from(vec![
         Span::styled(
             if is_selected { "> " } else { "  " },
             if is_selected { accent() } else { dim() },
         ),
         Span::styled(
-            label.to_string(),
-            if is_selected { bold() } else { text_style() },
+            display.to_string(),
+            if detected_codex {
+                done()
+            } else if is_selected {
+                bold()
+            } else {
+                text_style()
+            },
         ),
     ])
 }
@@ -2099,14 +2246,16 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
         .setup_pending_account
         .as_deref()
         .unwrap_or(ACCOUNT_CODEX);
-    let mut lines = vec![
-        Line::from(Span::styled(format!("Use {account}?"), bold())),
-        Line::from(""),
-    ];
+    let title = if account == ACCOUNT_CODEX {
+        "Continue with Codex login?".to_string()
+    } else {
+        format!("Use {account}?")
+    };
+    let mut lines = vec![Line::from(Span::styled(title, bold())), Line::from("")];
     if account == ACCOUNT_CODEX {
         lines.extend([
-            Line::from("  Imports your local Codex auth."),
-            Line::from("  Uses GPT-5.5 with your ChatGPT plan."),
+            Line::from("  A local Codex login is already available."),
+            Line::from("  Continue to choose a model for this login."),
             Line::from("  No API key is required."),
         ]);
     } else if is_claude_code_account(account) {
@@ -2129,7 +2278,7 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
         if is_claude_code_account(account) && !app.account_ready(account).unwrap_or(false) {
             "Open sign-in"
         } else if account == ACCOUNT_CODEX {
-            "Use Codex auth"
+            "Continue"
         } else {
             "Continue"
         };
@@ -2168,13 +2317,23 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     if is_success {
         let next_message = if app.pending_model_after_auth.is_some() {
             "  Continue applies the selected model."
+        } else if app.setup_complete {
+            "  Continue keeps your current model."
         } else {
-            "  A default model will be selected automatically."
+            "  Continue to choose a model."
         };
         lines.extend([
             Line::from(Span::styled(next_message, muted())),
             Line::from(""),
-            selected("Continue", 0, app.selected_row),
+            selected(
+                if app.setup_complete {
+                    "Continue"
+                } else {
+                    "Choose model"
+                },
+                0,
+                app.selected_row,
+            ),
         ]);
     } else if is_pending {
         if result.account == ACCOUNT_CODEX {
@@ -2288,6 +2447,44 @@ fn centered_line_in_width(text: &str, width: usize, style: Style) -> Line<'stati
     ])
 }
 
+const FEEDBACK_THANKS_FACE_FRAME_0: &str = r"\(•◡•)/";
+const FEEDBACK_THANKS_FACE_FRAME_1: &str = r"/(•◡•)\";
+const FEEDBACK_THANKS_MESSAGE: &str = "Thanks for the feedback!";
+const FEEDBACK_THANKS_HINT: &str = "press any key to continue";
+
+fn render_feedback_thanks(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    frame.render_widget(Clear, frame.area());
+    let elapsed_ms = app
+        .feedback_thanks_started
+        .map(|t| t.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    let frame_idx = (elapsed_ms / crate::FEEDBACK_THANKS_FRAME_MS) % 2;
+    let face = if frame_idx == 0 {
+        FEEDBACK_THANKS_FACE_FRAME_0
+    } else {
+        FEEDBACK_THANKS_FACE_FRAME_1
+    };
+    let w = area.width as usize;
+    let content_lines: Vec<Line<'static>> = vec![
+        centered_line(face, w, accent()),
+        Line::from(""),
+        centered_line(FEEDBACK_THANKS_MESSAGE, w, accent()),
+        Line::from(""),
+        centered_line(FEEDBACK_THANKS_HINT, w, muted()),
+    ];
+    let content_h = content_lines.len() as u16;
+    let top_pad = area.height.saturating_sub(content_h) / 2;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_pad),
+            Constraint::Length(content_h),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    frame.render_widget(Paragraph::new(content_lines), chunks[1]);
+}
+
 fn line_width(line: &Line<'_>) -> usize {
     line.spans
         .iter()
@@ -2380,51 +2577,172 @@ fn telemetry_key_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+/// The provider screen: recommended quick-picks, then the provider/account list
+/// with auth status. One flat `selected_row` spans recommended-then-provider rows.
+fn provider_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push(Line::from(Span::styled(notice.clone(), failed())));
+        lines.push(Line::from(""));
+    }
+    // The active model is shown current on its recommended row (if it's one of
+    // the top picks) OR on its provider row below (so it's visible either way).
+    let current_recommended = app.current_recommended_index();
+    lines.push(Line::from(Span::styled("recommended", muted())));
+    for (idx, rec) in RECOMMENDED_MODELS.iter().enumerate() {
+        lines.push(selectable_row(
+            &format!("{:<22} {}", rec.display, access_label(rec.account)),
+            idx,
+            app.selected_row,
+            current_recommended == Some(idx),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("providers", muted())));
+    let base = RECOMMENDED_MODELS.len();
+    for (idx, row) in app.provider_rows().iter().enumerate() {
+        let status = if app.account_ready(row.account).unwrap_or(false) {
+            "connected"
+        } else if row.account.contains("API key") {
+            "needs key"
+        } else {
+            "needs auth"
+        };
+        // Mark the provider row current only when the active model isn't a
+        // recommended pick (avoids double-marking top + bottom).
+        let is_current = current_recommended.is_none() && app.provider_row_is_current(row);
+        lines.push(selectable_row(
+            &format!("{:<24} {status}", row.label),
+            base + idx,
+            app.selected_row,
+            is_current,
+        ));
+    }
+    lines
+}
+
+/// The OpenAI auth sub-dialogue: connect via Codex / API key, with the current
+/// method shown green.
+fn openai_auth_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled("connect openai", muted()))];
+    let current = app.current_openai_method();
+    for (idx, row) in app.openai_auth_rows().iter().enumerate() {
+        lines.push(selectable_row(
+            &row.label,
+            idx,
+            app.selected_row,
+            current == Some(row.method),
+        ));
+    }
+    lines
+}
+
 fn model_lines(app: &App, height: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<(Option<usize>, Line<'static>)> = Vec::new();
     if let Some(notice) = app.status_notice.as_ref() {
         lines.push((None, Line::from(Span::styled(notice.clone(), failed()))));
         lines.push((None, Line::from("")));
     }
-    lines.push((None, Line::from(Span::styled("recommended", muted()))));
-    let mut row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::Recommended, 0);
-    lines.push((None, Line::from("")));
-    lines.push((
-        None,
-        Line::from(Span::styled("bring your own key", muted())),
-    ));
-    row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::BringYourOwnKey, row_idx);
-    lines.push((None, Line::from("")));
-    lines.push((None, Line::from(Span::styled("openrouter", muted()))));
-    row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::OpenRouter, row_idx);
-    lines.push((None, Line::from("")));
-    lines.push((None, Line::from(Span::styled("deepseek", muted()))));
-    push_model_group_lines(&mut lines, app, ModelChoiceGroup::Deepseek, row_idx);
-    crop_model_lines(lines, app.selected_row, height)
-}
-
-fn push_model_group_lines(
-    lines: &mut Vec<(Option<usize>, Line<'static>)>,
-    app: &App,
-    group: ModelChoiceGroup,
-    mut row_idx: usize,
-) -> usize {
-    for (idx, _) in app
-        .model_choices
-        .iter()
-        .enumerate()
-        .filter(|(_, choice)| choice.group == group)
-    {
-        lines.push((Some(row_idx), model_row(idx, row_idx, app)));
+    let choices = app.model_surface_choices();
+    let mut row_idx = 0usize;
+    for choice in &choices {
+        lines.push((Some(row_idx), model_row(choice, row_idx, app)));
         row_idx += 1;
     }
-    row_idx
+    if app.model_surface_has_custom_row() {
+        let is_selected = row_idx == app.selected_row;
+        lines.push((Some(row_idx), model_custom_row(is_selected)));
+    }
+    // Plain catalog list — no pinned header, scroll every row.
+    crop_model_lines(lines, app.selected_row, height, 0)
 }
 
+/// The trailing "enter a custom model" row on the OpenRouter model screen.
+fn model_custom_row(is_selected: bool) -> Line<'static> {
+    let style = if is_selected { bold() } else { text_style() };
+    highlight_selectable_row(
+        vec![Span::styled(
+            "+ Enter a custom OpenRouter model".to_string(),
+            style,
+        )],
+        is_selected,
+        68,
+    )
+}
+
+/// The OpenRouter free-text search screen: a query input followed by typeahead
+/// suggestions (and the raw typed id as the first row when not an exact match).
+fn model_search_lines(app: &App, height: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<(Option<usize>, Line<'static>)> = Vec::new();
+    if app.model_search_has_filter_input() {
+        // Query input line; the popup cursor logic positions the caret at its end.
+        lines.push((None, Line::from(format!("  {}", app.composer.input()))));
+        lines.push((None, Line::from("")));
+    }
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push((None, Line::from(Span::styled(notice.clone(), failed()))));
+        lines.push((None, Line::from("")));
+    }
+    let entries = app.model_search_entries();
+    if entries.is_empty() {
+        let empty_message = if !app.model_search_has_filter_input() {
+            "  No models available"
+        } else if app.selected_provider == Some(ACCOUNT_OPENROUTER) {
+            "  Type a model id, e.g. moonshotai/kimi-k2.5"
+        } else {
+            "  No matching models"
+        };
+        lines.push((
+            None,
+            Line::from(Span::styled(empty_message.to_string(), muted())),
+        ));
+    }
+    // Items carry a running selectable index (matching `model_search_rows`);
+    // headers are non-selectable section labels.
+    let current_id = app.current_search_model_id();
+    let mut item_idx = 0usize;
+    for entry in &entries {
+        match entry {
+            ModelSearchEntry::Header(label) => {
+                lines.push((None, Line::from(Span::styled(label.clone(), muted()))));
+            }
+            ModelSearchEntry::Item(id) => {
+                let is_selected = item_idx == app.selected_row;
+                let is_current = current_id == Some(id.as_str());
+                let style = if is_current {
+                    current()
+                } else if is_selected {
+                    bold()
+                } else {
+                    text_style()
+                };
+                let mut spans = vec![Span::styled(id.clone(), style)];
+                if app.provider_model_is_vision(id) {
+                    spans.push(Span::styled("  · vision".to_string(), muted()));
+                }
+                lines.push((
+                    Some(item_idx),
+                    highlight_selectable_row(spans, is_selected, 68),
+                ));
+                item_idx += 1;
+            }
+        }
+    }
+    // Pin the query-input line (index 0) only when the provider has one, so
+    // plain curated lists scroll every row normally.
+    let pinned_head = usize::from(app.model_search_has_filter_input());
+    crop_model_lines(lines, app.selected_row, height, pinned_head)
+}
+
+/// Crop `lines` to `height` rows, centering on `selected_row`. `pinned_head`
+/// leading lines are kept fixed at the top (used by the search surface to keep
+/// its query-input line — and the popup caret — visible while the rows beneath
+/// scroll); pass `0` for a plain list with no header to scroll normally.
 fn crop_model_lines(
     lines: Vec<(Option<usize>, Line<'static>)>,
     selected_row: usize,
     height: usize,
+    pinned_head: usize,
 ) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
@@ -2432,30 +2750,42 @@ fn crop_model_lines(
     if lines.len() <= height {
         return lines.into_iter().map(|(_, line)| line).collect();
     }
-    let selected_line = lines
+    let pinned = pinned_head.min(height);
+    let head: Vec<Line<'static>> = lines[..pinned]
+        .iter()
+        .map(|(_, line)| line.clone())
+        .collect();
+    let body = &lines[pinned..];
+    let visible = height - pinned;
+    if visible == 0 || body.len() <= visible {
+        let mut out = head;
+        out.extend(body.iter().map(|(_, line)| line.clone()));
+        return out;
+    }
+    let selected_line = body
         .iter()
         .position(|(row, _)| *row == Some(selected_row))
         .unwrap_or(0);
-    let visible = height;
     let mut start = selected_line.saturating_sub(visible / 2);
-    start = start.min(lines.len().saturating_sub(visible));
-    let end = (start + visible).min(lines.len());
-    let mut visible_lines = lines[start..end]
+    start = start.min(body.len().saturating_sub(visible));
+    let end = (start + visible).min(body.len());
+    let mut data = body[start..end]
         .iter()
         .map(|(_, line)| line.clone())
         .collect::<Vec<_>>();
     if start > 0 {
-        visible_lines[0] = Line::from(Span::styled("  ...", muted()));
+        data[0] = Line::from(Span::styled("  ...", muted()));
     }
-    if end < lines.len() {
-        let last = visible_lines.len().saturating_sub(1);
-        visible_lines[last] = Line::from(Span::styled("  ...", muted()));
+    if end < body.len() {
+        let last = data.len().saturating_sub(1);
+        data[last] = Line::from(Span::styled("  ...", muted()));
     }
-    visible_lines
+    let mut out = head;
+    out.extend(data);
+    out
 }
 
-fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
-    let choice = &app.model_choices[idx];
+fn model_row(choice: &ModelChoice, row_idx: usize, app: &App) -> Line<'static> {
     let is_selected = row_idx == app.selected_row;
     let current =
         app.model_configured && app.model == choice.display && app.account == choice.account;
@@ -2467,17 +2797,25 @@ fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
     } else {
         muted()
     };
+    // Truncate an over-long descriptor to the column width, but do not right-pad
+    // a short one, so the current-model `*` sits immediately after the text
+    // instead of floating at the far end of a fixed 22-char column.
+    let descriptor_cell = if descriptor.chars().count() <= 22 {
+        descriptor.to_string()
+    } else {
+        fixed_width_cell(descriptor, 22)
+    };
     highlight_selectable_row(
         vec![
             Span::styled(fixed_width_cell(&choice.display, 20), name_style),
             Span::styled(format!("{:<22}", access), muted()),
-            Span::styled(fixed_width_cell(descriptor, 22), descriptor_style),
+            Span::styled(descriptor_cell, descriptor_style),
             Span::styled(if current { " *" } else { "" }.to_string(), done()),
         ],
         is_selected,
-        // 2-space indent + 20 + 22 + 22 columns + " *" — width of the longest
-        // possible row (one with the current-selection marker), so every row
-        // highlights to the same end column.
+        // 2-space indent + 20 + 22 + up-to-22 descriptor + " *" — keep the
+        // highlight padding target at the widest possible row so every selected
+        // row still highlights to the same end column.
         68,
     )
 }
@@ -2638,6 +2976,364 @@ fn goal_lines(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
+/// System prompt + per-tool schema sizes the agent recorded for the most recent
+/// request (`model.turn.request` `composition`). These are assembled inside the
+/// agent and never persisted as message events, so without them the window
+/// cannot be fully attributed.
+#[derive(Debug, Default, Clone)]
+struct ContextComposition {
+    recorded: bool,
+    system_prompt_tokens: i64,
+    tools: Vec<(String, i64)>,
+}
+
+impl ContextComposition {
+    fn tool_total(&self) -> i64 {
+        self.tools.iter().map(|(_, tokens)| *tokens).sum()
+    }
+}
+
+/// One row of the attribution breakdown.
+#[derive(Debug, Clone)]
+struct ContextComponent {
+    label: &'static str,
+    tokens: i64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ContextUsageSummary {
+    latest_input_tokens: Option<i64>,
+    context_window: Option<i64>,
+}
+
+fn context_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
+    let Some(session) = state.current_session.as_ref() else {
+        return vec![Line::from(Span::styled("No task selected.", dim()))];
+    };
+    let events = app.cached_events_for_session(&session.id);
+    let usage = context_usage_from_events(events);
+    let composition = context_composition_from_events(events);
+
+    // What's actually in the window right now (provider-reported input tokens).
+    let conversation = message_categories_from_events(events);
+    let conversation_sum: i64 = conversation.iter().map(|component| component.tokens).sum();
+    let window_used = usage.latest_input_tokens.unwrap_or(conversation_sum);
+
+    // Build the breakdown so it always covers the WHOLE window — nothing hidden.
+    // Conversation categories come from message events; the system prompt + tool
+    // schemas come from the agent. When the agent recorded them we show them
+    // split; otherwise the remaining window (everything that isn't conversation)
+    // is exactly the system prompt + tool schemas, shown as one row.
+    let mut components: Vec<ContextComponent> = Vec::new();
+    if composition.recorded {
+        if composition.system_prompt_tokens > 0 {
+            components.push(ContextComponent {
+                label: "System prompt",
+                tokens: composition.system_prompt_tokens,
+            });
+        }
+        let tool_total = composition.tool_total();
+        if tool_total > 0 {
+            components.push(ContextComponent {
+                label: "Tool definitions",
+                tokens: tool_total,
+            });
+        }
+        components.extend(conversation);
+    } else {
+        components.extend(conversation);
+        let overhead = window_used.saturating_sub(conversation_sum);
+        if overhead > 0 {
+            components.push(ContextComponent {
+                label: "System prompt + tools",
+                tokens: overhead,
+            });
+        }
+    }
+
+    // Reconcile the heuristic estimate to the real window so the rows sum to it.
+    let attributed: i64 = components.iter().map(|component| component.tokens).sum();
+    if window_used == 0 {
+        components.clear();
+    } else if attributed > 0 {
+        for component in &mut components {
+            component.tokens =
+                ((component.tokens as i128 * window_used as i128) / attributed as i128) as i64;
+        }
+    }
+    components.sort_by_key(|component| std::cmp::Reverse(component.tokens));
+    let breakdown_total = components
+        .iter()
+        .map(|component| component.tokens)
+        .sum::<i64>()
+        .max(1);
+
+    // ---- Window bar (segments colored per category) ----
+    let mut lines = vec![Line::from(Span::styled("Window", bold())), Line::from("")];
+    if usage.context_window.is_some() || window_used > 0 {
+        let bar_width = width.saturating_sub(34).clamp(12, 42);
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<10}", "context"), muted()),
+        ];
+        spans.extend(context_segmented_bar_spans(
+            &components,
+            window_used,
+            usage.context_window,
+            bar_width,
+        ));
+        lines.push(Line::from(spans));
+    }
+
+    // ---- What's in it ----
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("What's using it", bold())));
+    lines.push(Line::from(""));
+    if components.is_empty() {
+        lines.push(Line::from(Span::styled("No context yet.", dim())));
+    } else {
+        for component in &components {
+            lines.push(context_component_line(
+                component.label,
+                component.tokens,
+                breakdown_total,
+                width,
+            ));
+        }
+    }
+
+    lines
+}
+
+fn context_usage_from_events(events: &[EventRecord]) -> ContextUsageSummary {
+    let mut summary = ContextUsageSummary::default();
+    for event in events {
+        if event.event_type != "token_count" {
+            continue;
+        }
+        let Some(info) = event.payload.get("info").filter(|info| info.is_object()) else {
+            continue;
+        };
+        if let Some(input) = info
+            .get("last_token_usage")
+            .and_then(|usage| usage.get("input_tokens"))
+            .and_then(Value::as_i64)
+        {
+            summary.latest_input_tokens = Some(input.max(0));
+        }
+        if let Some(context_window) = info
+            .get("model_context_window")
+            .and_then(Value::as_i64)
+            .filter(|tokens| *tokens > 0)
+        {
+            summary.context_window = Some(context_window);
+        }
+    }
+    summary
+}
+
+fn context_composition_from_events(events: &[EventRecord]) -> ContextComposition {
+    let mut composition = ContextComposition::default();
+    // Take the most recent recorded request; the loop overwrites earlier turns.
+    for event in events {
+        if event.event_type != "model.turn.request" {
+            continue;
+        }
+        let Some(value) = event
+            .payload
+            .get("composition")
+            .filter(|value| value.is_object())
+        else {
+            continue;
+        };
+        composition.recorded = true;
+        composition.system_prompt_tokens = value
+            .get("system_prompt_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        composition.tools = value
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        let name = tool.get("name").and_then(Value::as_str)?.trim();
+                        let tokens = tool
+                            .get("tokens")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0)
+                            .max(0);
+                        (!name.is_empty()).then(|| (name.to_string(), tokens))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    composition
+}
+
+fn message_categories_from_events(events: &[EventRecord]) -> Vec<ContextComponent> {
+    let provider_items = provider_messages_from_events(events);
+    let mut totals: BTreeMap<&'static str, i64> = BTreeMap::new();
+    for item in &provider_items {
+        let tokens = estimate_item_token_count(item).max(0);
+        if tokens == 0 {
+            continue;
+        }
+        *totals.entry(context_item_category(item)).or_default() += tokens;
+    }
+    totals
+        .into_iter()
+        .map(|(label, tokens)| ContextComponent { label, tokens })
+        .collect()
+}
+
+fn context_item_category(item: &Value) -> &'static str {
+    match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") => return "Reasoning",
+        Some("compaction") => return "Compaction",
+        Some("function_call") | Some("custom_tool_call") | Some("local_shell_call") => {
+            return "Tool calls"
+        }
+        Some("function_call_output") | Some("custom_tool_call_output") => return "Tool outputs",
+        _ => {}
+    }
+
+    match item.get("role").and_then(Value::as_str) {
+        Some("system") => "System prompts",
+        Some("user") => "User messages",
+        Some("assistant") if item_has_tool_calls(item) && item_preview_text(item).is_none() => {
+            "Tool calls"
+        }
+        Some("assistant") => "Assistant responses",
+        Some("tool") => "Tool outputs",
+        Some(_) => "Other context",
+        None => "Other context",
+    }
+}
+
+fn item_has_tool_calls(item: &Value) -> bool {
+    item.get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+}
+
+fn item_preview_text(item: &Value) -> Option<String> {
+    for field in ["text", "content", "output"] {
+        if let Some(value) = item.get(field) {
+            if let Some(preview) = preview_text_value(value) {
+                return Some(preview);
+            }
+        }
+    }
+    None
+}
+
+fn preview_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => trimmed_nonempty(text),
+        Value::Array(parts) => parts.iter().find_map(preview_text_value),
+        Value::Object(map) => ["text", "content", "output", "input"]
+            .into_iter()
+            .find_map(|field| map.get(field).and_then(preview_text_value)),
+        _ => None,
+    }
+}
+
+fn trimmed_nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn context_component_line(label: &str, tokens: i64, total: i64, width: usize) -> Line<'static> {
+    let token_text = format_token_count(tokens);
+    let percent = context_percent(tokens, total);
+    let color = context_category_color(label);
+    let category = Style::default().fg(color);
+    // Pad the label to a fixed column so the percent aligns down the list.
+    let label_col = 22.min(width.saturating_sub(18).max(8));
+    Line::from(vec![
+        Span::raw("  "),
+        // Swatch matches this row's bar segment.
+        Span::styled("█ ", category),
+        Span::styled(format!("{token_text:>6}"), category),
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<label_col$}", truncate(label, label_col)),
+            category,
+        ),
+        Span::styled(format!("  {percent:>4}"), dim()),
+    ])
+}
+
+/// A context bar whose filled portion is split into colored runs, one per
+/// category, sized to each category's share of the window. The empty tail is
+/// the remaining budget. Largest-remainder accumulation keeps the runs summing
+/// to the filled width exactly.
+fn context_segmented_bar_spans(
+    components: &[ContextComponent],
+    window_used: i64,
+    budget: Option<i64>,
+    bar_width: usize,
+) -> Vec<Span<'static>> {
+    let budget = budget
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(FALLBACK_CONTEXT_BUDGET_TOKENS);
+    let used = window_used.clamp(0, budget);
+    let used_blocks = ((used as f64 / budget as f64) * bar_width as f64).round() as usize;
+    let used_blocks = used_blocks.min(bar_width);
+
+    let mut spans = Vec::new();
+    if window_used > 0 && used_blocks > 0 {
+        let mut cumulative_tokens: i64 = 0;
+        let mut filled: usize = 0;
+        for component in components {
+            cumulative_tokens = cumulative_tokens.saturating_add(component.tokens.max(0));
+            let target = (((cumulative_tokens as f64 / window_used as f64) * used_blocks as f64)
+                .round() as usize)
+                .min(used_blocks);
+            let blocks = target.saturating_sub(filled);
+            filled = target;
+            if blocks == 0 {
+                continue;
+            }
+            spans.push(Span::styled(
+                "█".repeat(blocks),
+                Style::default().fg(context_category_color(component.label)),
+            ));
+        }
+        if filled < used_blocks {
+            spans.push(Span::styled("█".repeat(used_blocks - filled), muted()));
+        }
+    }
+    let empty = bar_width.saturating_sub(used_blocks);
+    if empty > 0 {
+        spans.push(Span::styled("░".repeat(empty), dim()));
+    }
+    let pct_left = (((budget - used) as f64 / budget as f64) * 100.0).round() as i64;
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!(
+            "{}/{}",
+            format_token_count(window_used),
+            format_token_count(budget)
+        ),
+        muted(),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(format!("{pct_left}% left"), muted()));
+    spans
+}
+
+fn context_percent(tokens: i64, total: i64) -> String {
+    if total <= 0 {
+        return "0%".to_string();
+    }
+    format!("{:.0}%", (tokens.max(0) as f64 / total as f64) * 100.0)
+}
+
 pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let body_width = cookie_sync_body_width(width);
     let mut lines = vec![
@@ -2646,7 +3342,7 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     ];
     match &app.cookie_sync.status {
         CookieSyncStatus::NeedsAuth => {
-            lines.push(Line::from("  Browser Use cloud key is missing."));
+            lines.push(Line::from("  Browser Use Cloud key is missing."));
             lines.push(Line::from(""));
             lines.push(selected("Add Browser Use key", 0, app.selected_row));
         }
@@ -2655,7 +3351,7 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
         CookieSyncStatus::Ready => {
             lines.push(kv_line("scope", "all cookies"));
-            lines.push(kv_line("target", "new Browser Use cloud profile"));
+            lines.push(kv_line("target", "new Browser Use Cloud profile"));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("LOCAL PROFILES", muted())));
             lines.push(Line::from(""));
@@ -2880,6 +3576,7 @@ fn next_action_lines(
             let (primary, secondary) = failure_actions(error);
             vec![primary, secondary, "Retry", "New task"]
         }
+        ProductState::Cancelled if app.selected_session_is_paused() => return None,
         ProductState::Cancelled => vec![
             "Continue with a follow-up",
             "Start a new task",
@@ -3255,19 +3952,27 @@ fn highlight_selectable_row(
 }
 
 fn selected(text: &str, idx: usize, selected: usize) -> Line<'static> {
+    selectable_row(text, idx, selected, false)
+}
+
+/// A selectable list row. The cursor (the row being navigated) gets a blue `>`
+/// and bold text; the item currently *in use* gets green text so the active
+/// choice is visible even when the cursor has moved elsewhere.
+fn selectable_row(text: &str, idx: usize, selected: usize, is_current: bool) -> Line<'static> {
+    let cursor = idx == selected;
+    let body = if is_current {
+        current()
+    } else if cursor {
+        bold()
+    } else {
+        text_style()
+    };
     Line::from(vec![
         Span::styled(
-            if idx == selected { "> " } else { "  " },
-            if idx == selected { accent() } else { dim() },
+            if cursor { "> " } else { "  " },
+            if cursor { accent() } else { dim() },
         ),
-        Span::styled(
-            text.to_string(),
-            if idx == selected {
-                bold()
-            } else {
-                text_style()
-            },
-        ),
+        Span::styled(text.to_string(), body),
     ])
 }
 
@@ -3342,7 +4047,7 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
-        BROWSER_USE_CLOUD => "Browser Use cloud key",
+        BROWSER_USE_CLOUD => "Browser Use Cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "Credential",
     }
@@ -3401,6 +4106,101 @@ fn truncate(value: &str, max: usize) -> String {
     let mut out = value.chars().take(max - 3).collect::<String>();
     out.push_str("...");
     out
+}
+
+fn feedback_lines(app: &App) -> Vec<Line<'static>> {
+    let state = &app.feedback;
+    match state.step {
+        FeedbackStep::Category => {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                "  Choose a category:",
+                text_style(),
+            )));
+            lines.push(Line::from(""));
+            for (i, cat) in FeedbackCategory::ALL.iter().enumerate() {
+                let number = format!("{}. ", i + 1);
+                let label = cat.label();
+                let desc = cat.description();
+                let is_selected = i == state.category_index;
+                let row_style = if is_selected { accent() } else { text_style() };
+                let prefix_style = if is_selected { accent() } else { muted() };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {number}"), prefix_style),
+                    Span::styled(label.to_string(), row_style),
+                    Span::styled(format!(" — {desc}"), muted()),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  1-5 or ↑↓ to select, Enter to continue",
+                dim(),
+            )));
+            lines
+        }
+        FeedbackStep::Description => {
+            let category = FeedbackCategory::ALL
+                .get(state.category_index)
+                .copied()
+                .unwrap_or(FeedbackCategory::Other);
+            let label = format!("  Tell us more ({})", category.label());
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(Span::styled(label, text_style())));
+            lines.push(Line::from(""));
+            let input = state.description.clone();
+            let display = if input.is_empty() {
+                Line::from(Span::styled("  (optional)", dim()))
+            } else {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(input, text_style()),
+                    Span::styled("█", accent()),
+                ])
+            };
+            lines.push(display);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Type your message, Enter to continue, Esc to go back",
+                dim(),
+            )));
+            lines
+        }
+        FeedbackStep::UploadLogs => {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(Span::styled("  Upload logs?", text_style())));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Shares this session's full transcript and tool activity",
+                muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  (plus app version, OS, model). It may contain page or file",
+                muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  contents \u{2014} skip if anything here is sensitive.",
+                muted(),
+            )));
+            lines.push(Line::from(""));
+            let (yes_style, no_style) = if state.upload_yes {
+                (accent(), muted())
+            } else {
+                (muted(), accent())
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("[ Yes ]", yes_style),
+                Span::raw("   "),
+                Span::styled("[ No ]", no_style),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ↑↓ or y/n to choose, Enter to submit, Esc to go back",
+                dim(),
+            )));
+            lines
+        }
+    }
 }
 
 fn first_line(value: &str) -> String {

@@ -38,4 +38,9 @@ Prefer navigating an existing tab over `new_tab()` unless the task needs a new t
 ```python
 tab = ensure_real_tab()
 goto_url("https://example.com")
+print(page_info())
 ```
+
+`goto_url(url)` and `new_tab(url)` have zero implicit wait: they send the CDP navigation command and then return without waiting for readyState, network idle, selectors, paint, or sleeps.
+If you chain more work in the same script after navigation, explicitly wait or poll before reading/clicking.
+If navigation is the last action before yielding to the model, the LLM call itself may provide enough elapsed time; the next call must still inspect state before assuming the page loaded.

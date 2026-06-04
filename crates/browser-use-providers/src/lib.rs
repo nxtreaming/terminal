@@ -23,6 +23,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
+pub mod openrouter;
+
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";

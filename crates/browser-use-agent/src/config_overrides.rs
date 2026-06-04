@@ -276,6 +276,7 @@ pub struct AgentRunOptions {
     pub max_turns: usize,
     pub max_context_chars: usize,
     pub browser_mode: Option<String>,
+    pub dynamic_browser_mode_from_store: bool,
     pub collaboration_mode: CollaborationModeKind,
     pub include_environment_context: bool,
     pub include_permissions_instructions: bool,
@@ -340,6 +341,7 @@ impl Default for AgentRunOptions {
             max_turns: 80,
             max_context_chars: DEFAULT_MAX_CONTEXT_CHARS,
             browser_mode: None,
+            dynamic_browser_mode_from_store: false,
             collaboration_mode: CollaborationModeKind::Default,
             include_environment_context: true,
             include_permissions_instructions: true,
@@ -379,6 +381,11 @@ impl Default for AgentRunOptions {
 impl AgentRunOptions {
     pub fn with_browser_mode(mut self, mode: impl Into<String>) -> Self {
         self.browser_mode = Some(mode.into());
+        self
+    }
+
+    pub fn with_dynamic_browser_mode_from_store(mut self, dynamic: bool) -> Self {
+        self.dynamic_browser_mode_from_store = dynamic;
         self
     }
 

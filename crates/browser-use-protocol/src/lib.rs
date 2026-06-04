@@ -656,12 +656,17 @@ pub fn failure_from_events(events: &[EventRecord]) -> Option<String> {
     })
 }
 
+fn sanitize_terminal_text(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
+}
+
 pub fn browser_summary_from_events(
     events: &[EventRecord],
     backend: impl Into<String>,
 ) -> BrowserSummary {
+    let backend = backend.into();
     let mut summary = BrowserSummary {
-        backend: backend.into(),
+        backend,
         status: "not connected".to_string(),
         title: None,
         url: None,
@@ -674,14 +679,22 @@ pub fn browser_summary_from_events(
             "browser.connected" | "browser.reconnected" | "browser.target_changed" => {
                 summary.status = "connected".to_string();
                 if let Some(url) = event.payload.get("url").and_then(Value::as_str) {
-                    summary.url = Some(url.to_string());
+                    summary.url = Some(sanitize_terminal_text(url));
                 }
                 if let Some(title) = event.payload.get("title").and_then(Value::as_str) {
-                    summary.title = Some(title.to_string());
+                    summary.title = Some(sanitize_terminal_text(title));
                 }
             }
             "browser.disconnected" => {
                 summary.status = "disconnected".to_string();
+            }
+            "browser.backend_changed" => {
+                summary.status = "not connected".to_string();
+                summary.title = None;
+                summary.url = None;
+                summary.live_url = None;
+                summary.tabs = None;
+                summary.viewport = None;
             }
             "browser.live_url" => {
                 summary.status = "connected".to_string();
@@ -690,18 +703,18 @@ pub fn browser_summary_from_events(
                     .get("live_url")
                     .or_else(|| event.payload.get("url"))
                     .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
+                    .map(sanitize_terminal_text);
             }
             "browser.page" | "browser.state" => {
                 if let Some(status) = event.payload.get("status").and_then(Value::as_str) {
                     summary.status = status.to_string();
                 }
                 if let Some(url) = event.payload.get("url").and_then(Value::as_str) {
-                    summary.url = Some(url.to_string());
+                    summary.url = Some(sanitize_terminal_text(url));
                     summary.status = "connected".to_string();
                 }
                 if let Some(title) = event.payload.get("title").and_then(Value::as_str) {
-                    summary.title = Some(title.to_string());
+                    summary.title = Some(sanitize_terminal_text(title));
                 }
                 if let Some(tabs) = event
                     .payload
@@ -718,7 +731,14 @@ pub fn browser_summary_from_events(
             _ => {}
         }
     }
+    if !browser_backend_supports_live_url(&summary.backend) {
+        summary.live_url = None;
+    }
     summary
+}
+
+fn browser_backend_supports_live_url(backend: &str) -> bool {
+    backend.to_ascii_lowercase().contains("cloud")
 }
 
 pub fn telemetry_summary_from_events(events: &[EventRecord]) -> TelemetrySummary {
@@ -1450,6 +1470,38 @@ mod tests {
     }
 
     #[test]
+    fn browser_summary_strips_control_chars_from_untrusted_strings() {
+        let events = vec![
+            event(
+                1,
+                "browser.live_url",
+                json!({ "live_url": "https://live.example.com/?wss=ws\x1b]0;pwned\x07x" }),
+            ),
+            event(
+                2,
+                "browser.page",
+                json!({
+                    "url": "https://evil.test/\x1b[2J",
+                    "title": "hi\x1bthere\u{009c}",
+                }),
+            ),
+        ];
+        let summary = browser_summary_from_events(&events, "browser use cloud");
+        assert_eq!(
+            summary.live_url.as_deref(),
+            Some("https://live.example.com/?wss=ws]0;pwnedx")
+        );
+        assert_eq!(summary.url.as_deref(), Some("https://evil.test/[2J"));
+        assert_eq!(summary.title.as_deref(), Some("hithere"));
+        // No control characters survive in any displayed field
+        for field in [&summary.live_url, &summary.url, &summary.title] {
+            if let Some(value) = field {
+                assert!(!value.chars().any(|ch| ch.is_control()));
+            }
+        }
+    }
+
+    #[test]
     fn startup_warnings_and_instruction_sources_are_extracted_from_events() {
         let events = vec![
             event(
@@ -1581,6 +1633,26 @@ mod tests {
             browser.live_url.as_deref(),
             Some("https://live.browser-use.com/legacy")
         );
+    }
+
+    #[test]
+    fn browser_backend_change_clears_stale_cloud_live_url() {
+        let events = vec![
+            event(
+                1,
+                "browser.live_url",
+                json!({"live_url": "https://live.browser-use.com/watch"}),
+            ),
+            event(
+                2,
+                "browser.backend_changed",
+                json!({"previous_browser": "Browser Use cloud", "browser": "Local Chrome"}),
+            ),
+        ];
+        let browser = browser_summary_from_events(&events, "Local Chrome");
+        assert_eq!(browser.status, "not connected");
+        assert_eq!(browser.live_url, None);
+        assert_eq!(browser.url, None);
     }
 
     #[test]

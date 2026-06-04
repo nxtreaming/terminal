@@ -216,6 +216,10 @@ impl RuntimeBrowserBackend {
 }
 
 impl BrowserBackend for RuntimeBrowserBackend {
+    fn set_browser_mode(&self, browser_mode: Option<String>) {
+        self.backend.set_browser_mode(browser_mode);
+    }
+
     fn command(
         &self,
         session_id: &str,
@@ -1297,9 +1301,16 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         .with_selected_browser_mode(config.options.browser_mode.clone())
         .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds);
     let browser_tool = match &user_input {
-        Some((store, session_id)) => browser_tool
-            .with_session_id(session_id.as_str().to_string())
-            .with_persistence(store.clone(), session_id.as_str().to_string()),
+        Some((store, session_id)) => {
+            let tool = browser_tool
+                .with_session_id(session_id.as_str().to_string())
+                .with_persistence(store.clone(), session_id.as_str().to_string());
+            if config.options.dynamic_browser_mode_from_store {
+                tool.with_dynamic_browser_mode_from_store(true)
+            } else {
+                tool
+            }
+        }
         None => browser_tool,
     };
     // `browser`: standalone production backend (`browser-use-browser`, internal

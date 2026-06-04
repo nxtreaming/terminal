@@ -55,6 +55,10 @@ pub struct BrowserScriptOutput {
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_observe_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms_since_last_output: Option<u64>,
     pub text: String,
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +227,8 @@ impl Default for BrowserSession {
 
 static BROWSER_SESSIONS: OnceLock<BrowserSessionRegistry> = OnceLock::new();
 static BROWSER_SCRIPT_RUNS: OnceLock<BrowserScriptRunRegistry> = OnceLock::new();
+static BROWSER_SCRIPT_OBSERVING: OnceLock<Mutex<HashMap<String, BrowserScriptObserveMarker>>> =
+    OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct BrowserScriptRun {
@@ -240,6 +246,7 @@ struct BrowserScriptRun {
     frames_dir: PathBuf,
     last_frame_seq: i64,
     started_at_ms: u128,
+    last_output_at_ms: Option<u128>,
     timeout_seconds: u64,
     deadline: Instant,
 }
@@ -283,6 +290,14 @@ impl BrowserScriptRunRegistry {
     fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, HashMap<String, BrowserScriptRun>>> {
         self.runs.lock()
     }
+}
+
+#[derive(Clone)]
+struct BrowserScriptObserveMarker {
+    session_id: String,
+    started_at_ms: u128,
+    last_output_at_ms: Option<u128>,
+    deadline: Instant,
 }
 
 #[derive(Default)]
@@ -416,6 +431,29 @@ fn browser_script_runs() -> &'static BrowserScriptRunRegistry {
     BROWSER_SCRIPT_RUNS.get_or_init(BrowserScriptRunRegistry::new)
 }
 
+fn browser_script_observing() -> &'static Mutex<HashMap<String, BrowserScriptObserveMarker>> {
+    BROWSER_SCRIPT_OBSERVING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn elapsed_ms_since(started_at_ms: u128) -> u64 {
+    unix_time_ms().saturating_sub(started_at_ms) as u64
+}
+
+fn ms_since_optional(timestamp_ms: Option<u128>) -> Option<u64> {
+    timestamp_ms.map(|timestamp_ms| unix_time_ms().saturating_sub(timestamp_ms) as u64)
+}
+
+fn mark_output_seen_if_needed(run: &mut BrowserScriptRun, delta: &BrowserScriptDelta) {
+    if delta.has_content() {
+        run.last_output_at_ms = Some(unix_time_ms());
+    }
+}
+
+fn attach_browser_script_timing(run: &BrowserScriptRun, output: &mut BrowserScriptOutput) {
+    output.elapsed_ms = Some(elapsed_ms_since(run.started_at_ms));
+    output.ms_since_last_output = ms_since_optional(run.last_output_at_ms);
+}
+
 fn active_browser_script_runs_json(session_id: &str) -> Value {
     active_browser_script_runs_json_with_registry(session_id, browser_script_runs())
 }
@@ -424,13 +462,15 @@ fn active_browser_script_runs_json_with_registry(
     session_id: &str,
     registry: &BrowserScriptRunRegistry,
 ) -> Value {
-    let mut runs = registry
-        .lock()
-        .expect("browser_script run registry poisoned");
-    Value::Array(
-        runs.values_mut()
-            .filter(|run| run.session_id == session_id)
-            .map(|run| {
+    let mut active = Vec::new();
+    let mut seen = HashSet::new();
+    {
+        let mut runs = registry
+            .lock()
+            .expect("browser_script run registry poisoned");
+        for run in runs.values_mut().filter(|run| run.session_id == session_id) {
+            seen.insert(run.id.clone());
+            active.push({
                 let child_exited = run.child.try_wait().ok().flatten().is_some();
                 let timed_out = !child_exited && Instant::now() >= run.deadline;
                 let status = if child_exited {
@@ -451,15 +491,54 @@ fn active_browser_script_runs_json_with_registry(
                     ),
                     _ => format!("browser_script action=observe run_id={}", run.id),
                 };
-                json!({
+                let mut item = json!({
                     "run_id": run.id,
                     "status": status,
                     "started_at_ms": run.started_at_ms as u64,
+                    "elapsed_ms": elapsed_ms_since(run.started_at_ms),
                     "next_step": next_step,
-                })
-            })
-            .collect(),
-    )
+                });
+                if let Some(ms_since_last_output) = ms_since_optional(run.last_output_at_ms) {
+                    item["ms_since_last_output"] = json!(ms_since_last_output);
+                }
+                item
+            });
+        }
+    }
+    {
+        let observing = browser_script_observing()
+            .lock()
+            .expect("browser_script observing registry poisoned");
+        for (run_id, marker) in observing
+            .iter()
+            .filter(|(_, marker)| marker.session_id == session_id)
+        {
+            if seen.contains(run_id) {
+                continue;
+            }
+            let status = if Instant::now() >= marker.deadline {
+                "observing_timed_out"
+            } else {
+                "observing"
+            };
+            let mut item = json!({
+                "run_id": run_id,
+                "status": status,
+                "started_at_ms": marker.started_at_ms as u64,
+                "elapsed_ms": elapsed_ms_since(marker.started_at_ms),
+                "observe_in_progress": true,
+                "next_step": format!(
+                    "wait for the in-flight browser_script observe for run_id={} to return before observing again",
+                    run_id
+                ),
+            });
+            if let Some(ms_since_last_output) = ms_since_optional(marker.last_output_at_ms) {
+                item["ms_since_last_output"] = json!(ms_since_last_output);
+            }
+            active.push(item);
+        }
+    }
+    Value::Array(active)
 }
 
 fn active_browser_script_next_step(active_scripts: &Value) -> Option<String> {
@@ -712,6 +791,7 @@ pub fn start_browser_script_with_registries(
         }
         if Instant::now() >= initial_deadline {
             let mut delta = drain_browser_script_delta(&mut run).unwrap_or_default();
+            mark_output_seen_if_needed(&mut run, &delta);
             let text = if delta.text.trim().is_empty() {
                 format!(
                     "browser_script is still running.\nrun_id: {}\nNext: call browser_script with action=\"observe\" and run_id=\"{}\".",
@@ -739,6 +819,7 @@ pub fn start_browser_script_with_registries(
                 ..Default::default()
             };
             attach_inline_window_stitch(&mut run, &mut output);
+            attach_browser_script_timing(&run, &mut output);
             script_registry
                 .lock()
                 .expect("browser_script run registry poisoned")
@@ -782,32 +863,70 @@ pub fn observe_browser_script_with_registry(
         bail!("browser_script run {run_id} belongs to a different session ({owner})");
     }
 
+    browser_script_observing()
+        .lock()
+        .expect("browser_script observing registry poisoned")
+        .insert(
+            run.id.clone(),
+            BrowserScriptObserveMarker {
+                session_id: run.session_id.clone(),
+                started_at_ms: run.started_at_ms,
+                last_output_at_ms: run.last_output_at_ms,
+                deadline: run.deadline,
+            },
+        );
+
     let timeout = Duration::from_millis(observe_timeout_ms.max(1));
     let observe_deadline = Instant::now() + timeout;
     loop {
         if run.child.try_wait()?.is_some() {
-            return finish_browser_script_run(run, false);
+            let run_id = run.id.clone();
+            let result = finish_browser_script_run(run, false);
+            browser_script_observing()
+                .lock()
+                .expect("browser_script observing registry poisoned")
+                .remove(&run_id);
+            return result;
         }
         if Instant::now() >= run.deadline {
-            return finish_browser_script_run(run, true);
+            let run_id = run.id.clone();
+            let result = finish_browser_script_run(run, true);
+            browser_script_observing()
+                .lock()
+                .expect("browser_script observing registry poisoned")
+                .remove(&run_id);
+            return result;
         }
         let delta = drain_browser_script_delta(&mut run).unwrap_or_default();
         if delta.has_content() {
+            mark_output_seen_if_needed(&mut run, &delta);
             let mut output = browser_script_running_output(&run, Some(delta), observe_timeout_ms);
             attach_inline_window_stitch(&mut run, &mut output);
+            attach_browser_script_timing(&run, &mut output);
+            let run_id = run.id.clone();
             registry
                 .lock()
                 .expect("browser_script run registry poisoned")
-                .insert(run.id.clone(), run);
+                .insert(run_id.clone(), run);
+            browser_script_observing()
+                .lock()
+                .expect("browser_script observing registry poisoned")
+                .remove(&run_id);
             return Ok(output);
         }
         if Instant::now() >= observe_deadline {
             let mut output = browser_script_running_output(&run, None, observe_timeout_ms);
             attach_inline_window_stitch(&mut run, &mut output);
+            attach_browser_script_timing(&run, &mut output);
+            let run_id = run.id.clone();
             registry
                 .lock()
                 .expect("browser_script run registry poisoned")
-                .insert(run.id.clone(), run);
+                .insert(run_id.clone(), run);
+            browser_script_observing()
+                .lock()
+                .expect("browser_script observing registry poisoned")
+                .remove(&run_id);
             return Ok(output);
         }
         thread::sleep(Duration::from_millis(50));
@@ -918,6 +1037,7 @@ fn spawn_browser_script_with_session_registry(
         frames_dir,
         last_frame_seq: -1,
         started_at_ms: unix_time_ms(),
+        last_output_at_ms: None,
         timeout_seconds: timeout_seconds.max(1),
         deadline: Instant::now() + Duration::from_secs(timeout_seconds.max(1)),
     })
@@ -950,16 +1070,17 @@ fn finish_browser_script_run(
     let stdout = join_reader(run.stdout_reader.take());
     let stderr = join_reader(run.stderr_reader.take());
     let mut delta = drain_browser_script_delta(&mut run).unwrap_or_default();
+    mark_output_seen_if_needed(&mut run, &delta);
 
     if timed_out {
         let error = format!(
             "browser_script timed out after {} seconds",
             run.timeout_seconds
         );
-        return Ok(BrowserScriptOutput {
+        let mut output = BrowserScriptOutput {
             ok: false,
             status: Some("failed".to_string()),
-            run_id: Some(run.id),
+            run_id: Some(run.id.clone()),
             text: std::mem::take(&mut delta.text),
             diagnosis: Some(browser_script_failure_diagnosis(
                 &run.session_id,
@@ -973,7 +1094,9 @@ fn finish_browser_script_run(
             images: std::mem::take(&mut delta.images),
             browser_events: std::mem::take(&mut delta.browser_events),
             ..Default::default()
-        });
+        };
+        attach_browser_script_timing(&run, &mut output);
+        return Ok(output);
     }
 
     let marker = "__BROWSER_SCRIPT_RESULT__";
@@ -988,10 +1111,10 @@ fn finish_browser_script_run(
         } else {
             stderr
         };
-        return Ok(BrowserScriptOutput {
+        let mut output = BrowserScriptOutput {
             ok: false,
             status: Some("failed".to_string()),
-            run_id: Some(run.id),
+            run_id: Some(run.id.clone()),
             text: if delta.text.trim().is_empty() {
                 truncate_text(&stdout, SCRIPT_MAX_OUTPUT_CHARS)
             } else {
@@ -1009,7 +1132,12 @@ fn finish_browser_script_run(
             images: std::mem::take(&mut delta.images),
             browser_events: std::mem::take(&mut delta.browser_events),
             ..Default::default()
-        });
+        };
+        if !output.text.trim().is_empty() && run.last_output_at_ms.is_none() {
+            run.last_output_at_ms = Some(unix_time_ms());
+        }
+        attach_browser_script_timing(&run, &mut output);
+        return Ok(output);
     };
     let mut response: BrowserScriptOutput =
         serde_json::from_str(result_line).context("parse browser_script result")?;
@@ -1066,7 +1194,11 @@ fn finish_browser_script_run(
         ));
     }
     response.status = Some(if response.ok { "finished" } else { "failed" }.to_string());
-    response.run_id = Some(run.id);
+    response.run_id = Some(run.id.clone());
+    if !response.text.trim().is_empty() && run.last_output_at_ms.is_none() {
+        run.last_output_at_ms = Some(unix_time_ms());
+    }
+    attach_browser_script_timing(&run, &mut response);
     Ok(response)
 }
 
@@ -1079,6 +1211,7 @@ fn finish_cancelled_browser_script_run(mut run: BrowserScriptRun) -> Result<Brow
     let _ = join_reader(run.stdout_reader.take());
     let _ = join_reader(run.stderr_reader.take());
     let mut delta = drain_browser_script_delta(&mut run).unwrap_or_default();
+    mark_output_seen_if_needed(&mut run, &delta);
     let text = if delta.text.trim().is_empty() {
         "browser_script cancelled. Partial images/artifacts are preserved above.".to_string()
     } else {
@@ -1087,10 +1220,10 @@ fn finish_cancelled_browser_script_run(mut run: BrowserScriptRun) -> Result<Brow
             delta.text.trim_end()
         )
     };
-    Ok(BrowserScriptOutput {
+    let mut output = BrowserScriptOutput {
         ok: true,
         status: Some("cancelled".to_string()),
-        run_id: Some(run.id),
+        run_id: Some(run.id.clone()),
         text,
         outputs: std::mem::take(&mut delta.outputs),
         summary: std::mem::take(&mut delta.summary),
@@ -1098,7 +1231,9 @@ fn finish_cancelled_browser_script_run(mut run: BrowserScriptRun) -> Result<Brow
         images: std::mem::take(&mut delta.images),
         browser_events: std::mem::take(&mut delta.browser_events),
         ..Default::default()
-    })
+    };
+    attach_browser_script_timing(&run, &mut output);
+    Ok(output)
 }
 
 #[derive(Debug, Default)]
@@ -1211,9 +1346,13 @@ fn browser_script_running_output(
         output.images = std::mem::take(&mut delta.images);
         output.browser_events = std::mem::take(&mut delta.browser_events);
     } else {
+        let elapsed_ms = elapsed_ms_since(run.started_at_ms);
+        let last_output = ms_since_optional(run.last_output_at_ms)
+            .map(|ms| format!("Last output was {ms} ms ago."))
+            .unwrap_or_else(|| "No script output has been observed yet.".to_string());
         output.text = format!(
-            "browser_script is still running.\nNo new output in the last {} ms.\nrun_id: {}\nNext: observe this run again.",
-            no_new_wait_ms, run.id
+            "browser_script is still running.\nNo new output in the last {no_new_wait_ms} ms.\nScript has been running for {elapsed_ms} ms. {last_output}\nrun_id: {}\nNext: observe this run again.",
+            run.id
         );
     }
     output
@@ -1741,6 +1880,8 @@ fn dispatch_script_runtime(
             Ok(json!({
                 "status": output.status.unwrap_or_else(|| "cancelled".to_string()),
                 "run_id": output.run_id,
+                "elapsed_ms": output.elapsed_ms,
+                "ms_since_last_output": output.ms_since_last_output,
                 "text": output.text,
                 "outputs": output.outputs,
                 "summary": output.summary,
@@ -1900,10 +2041,10 @@ fn sync_profile_cookies(argv: &[String], command_options: &BrowserCommandOptions
     if !browser_use_api_key_configured(command_options) {
         return Ok(json!({
             "status": "needs-auth",
-            "provider": "Browser Use cloud",
+            "provider": "Browser Use Cloud",
             "missing": "BROWSER_USE_API_KEY",
             "instructions": [
-                "Open /auth, choose Browser Use cloud, and save a Browser Use API key.",
+                "Open /auth, choose Browser Use Cloud, and save a Browser Use API key.",
                 "Alternatively export BROWSER_USE_API_KEY before launching Browser Use Terminal."
             ],
             "next_step": "/auth"
@@ -1994,10 +2135,10 @@ fn sync_profile_cookies(argv: &[String], command_options: &BrowserCommandOptions
     })();
     let stop_result = stop_cloud_browser_with_options(&remote_browser_id, command_options);
     if let Err(error) = sync_result {
-        return Err(error.context("set cookies in Browser Use cloud browser"));
+        return Err(error.context("set cookies in Browser Use Cloud browser"));
     }
     if let Err(error) = stop_result {
-        return Err(error.context("stop Browser Use cloud browser after cookie sync"));
+        return Err(error.context("stop Browser Use Cloud browser after cookie sync"));
     }
 
     Ok(json!({
@@ -2020,7 +2161,7 @@ fn sync_profile_cookies(argv: &[String], command_options: &BrowserCommandOptions
         "synced_cookie_count": cookies.len(),
         "domain_count": domain_count,
         "cookie_summary": cookie_summary,
-        "next_step": "Use browser remote start --profile-id <cloud_profile.id> to start a Browser Use cloud browser with these cookies."
+        "next_step": "Use browser remote start --profile-id <cloud_profile.id> to start a Browser Use Cloud browser with these cookies."
     }))
 }
 
@@ -2243,6 +2384,11 @@ impl BrowserSession {
         ) && self.mode == BrowserMode::Local
         {
             Some("browser local setup")
+        } else if self.connection.is_none()
+            && self.mode == BrowserMode::Local
+            && self.owner == BrowserOwner::External
+        {
+            Some("Run browser connect local explicitly when you are ready to reconnect to external local Chrome")
         } else if self.connection.is_none() {
             Some("browser recover reconnect-websocket")
         } else if self.current_target_id.is_some() && self.current_session_id.is_none() {
@@ -2526,7 +2672,7 @@ impl BrowserSession {
             .get("liveUrl")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        self.browser_name = Some("Browser Use cloud".to_string());
+        self.browser_name = Some("Browser Use Cloud".to_string());
         Ok(json!({
             "status": "connected",
             "remote_browser": browser,
@@ -2539,7 +2685,7 @@ impl BrowserSession {
         if !(self.owner == BrowserOwner::Rust && self.mode == BrowserMode::RemoteCloud) {
             return Ok(json!({
                 "stopped": false,
-                "reason": "current browser is not a Rust-owned Browser Use cloud browser",
+                "reason": "current browser is not a Rust-owned Browser Use Cloud browser",
             }));
         }
         let Some(id) = self.remote_browser_id.clone() else {
@@ -2783,7 +2929,7 @@ impl BrowserSession {
         checks.push(json!({
             "name": "Browser Use API key",
             "ok": std::env::var("BROWSER_USE_API_KEY").is_ok_and(|value| !value.trim().is_empty()),
-            "detail": "Only required for Browser Use cloud browsers and cloud profiles",
+            "detail": "Only required for Browser Use Cloud browsers and cloud profiles",
         }));
         if let Some(endpoint) = self.endpoint.as_ref() {
             let endpoint_probe = probe_endpoint(endpoint);
@@ -3521,6 +3667,10 @@ fn classify_browser_error(message: &str) -> &'static str {
         || (lower.contains("cdp ") && lower.contains(" timed out"))
     {
         "cdp-read-timeout"
+    } else if is_cdp_command_error(message) {
+        "cdp-command-error"
+    } else if lower.contains("browser is not connected") {
+        "browser-disconnected"
     } else if lower.contains("connection refused")
         || lower.contains("couldn't connect to server")
         || lower.contains("unable to connect")
@@ -3542,6 +3692,8 @@ fn classify_browser_script_failure(message: &str) -> &'static str {
         "browser-script-timeout"
     } else if lower.contains("browser_script did not emit a result") {
         "browser-script-no-result"
+    } else if is_cdp_command_error(message) {
+        "cdp-command-error"
     } else if lower.contains("read cdp")
         || lower.contains("send cdp")
         || (lower.contains("cdp ") && lower.contains(" timed out"))
@@ -3645,6 +3797,23 @@ fn browser_issue_diagnosis(
             browser_connected,
             page_usable,
         ),
+        "cdp-command-error" => (
+            if page_usable {
+                "The CDP command failed, but the browser page should still be reusable."
+            } else if browser_connected {
+                "The CDP command failed; browser is connected but page state needs checking."
+            } else {
+                "The CDP command failed and browser state needs checking."
+            },
+            "Chrome rejected a CDP command or helper-generated CDP parameters; this is a command/script error, not a dropped websocket.",
+            if page_usable {
+                "Fix the Python/browser_script code and rerun; keep using the same page state.".to_string()
+            } else {
+                fallback_next_step()
+            },
+            browser_connected,
+            page_usable,
+        ),
         "session-gone" => (
             if browser_connected {
                 "Browser is connected, but the current page session is stale."
@@ -3681,6 +3850,13 @@ fn browser_issue_diagnosis(
             "Chrome rejected browser control.",
             "The browser endpoint returned a permission or 403 error for CDP control.",
             status_next_step.unwrap_or("Run browser local setup, then reconnect.").to_string(),
+            false,
+            false,
+        ),
+        "browser-disconnected" => (
+            "Browser is not currently connected.",
+            "The browser runtime has no active CDP connection for this session.",
+            fallback_next_step(),
             false,
             false,
         ),
@@ -3731,6 +3907,22 @@ fn browser_issue_diagnosis(
 
 fn should_drop_browser_connection(error_kind: &str) -> bool {
     matches!(error_kind, "browser-closed" | "websocket-dropped")
+}
+
+fn is_cdp_command_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let has_cdp_failure =
+        lower.contains("cdp failed") || (lower.contains("cdp ") && lower.contains(" failed:"));
+    let has_protocol_error = lower.contains("\"code\":-32602")
+        || lower.contains("\"code\": -32602")
+        || lower.contains("\"code\":-32601")
+        || lower.contains("\"code\": -32601")
+        || lower.contains("\"code\":-32000")
+        || lower.contains("\"code\": -32000")
+        || lower.contains("invalid parameters")
+        || lower.contains("method not found")
+        || lower.contains("exception thrown");
+    has_cdp_failure && has_protocol_error
 }
 
 fn is_stale_session_error(message: &str) -> bool {
@@ -7681,6 +7873,23 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_external_local_chrome_requires_explicit_reconnect() {
+        let mut session = BrowserSession::default();
+        session.mode = BrowserMode::Local;
+        session.owner = BrowserOwner::External;
+        session.endpoint = Some(Endpoint {
+            kind: "devtools-active-port".to_string(),
+            http_url: Some("http://127.0.0.1:9222".to_string()),
+            ws_url: "ws://127.0.0.1:9222/devtools/browser/example".to_string(),
+            candidate_id: Some("local-1".to_string()),
+        });
+
+        let status = session.status_json();
+        assert_eq!(status["connection"], "disconnected");
+        assert!(status["next_step"].as_str().unwrap().contains("explicitly"));
+    }
+
+    #[test]
     fn local_setup_waits_for_user_confirmation_before_retry() {
         let status = local_setup_user_action_response(None);
         assert_eq!(status["status"], "needs-user-action");
@@ -7765,6 +7974,29 @@ mod tests {
     }
 
     #[test]
+    fn cdp_protocol_errors_are_command_errors_not_websocket_drops() {
+        let invalid_params = r#"CDP failed: {"code":-32602,"message":"Invalid parameters"}"#;
+        assert_eq!(classify_browser_error(invalid_params), "cdp-command-error");
+        assert_eq!(
+            classify_browser_script_failure(invalid_params),
+            "cdp-command-error"
+        );
+        assert!(!should_drop_browser_connection(classify_browser_error(
+            invalid_params
+        )));
+
+        let runtime_exception =
+            r#"CDP Runtime.evaluate failed: {"code":-32000,"message":"Exception thrown"}"#;
+        assert_eq!(
+            classify_browser_error(runtime_exception),
+            "cdp-command-error"
+        );
+        assert!(!should_drop_browser_connection(classify_browser_error(
+            runtime_exception
+        )));
+    }
+
+    #[test]
     fn cdp_read_timeout_diagnosis_keeps_page_reusable() {
         let diagnosis = browser_issue_diagnosis("cdp-read-timeout", true, true, None);
         assert!(diagnosis.browser_usable);
@@ -7792,8 +8024,13 @@ mod tests {
         let message = r#"RuntimeError: CDP Runtime.evaluate failed: {"code":-32000,"message":"Exception thrown"}"#;
         assert_eq!(
             classify_browser_script_failure(message),
-            "browser-script-error"
+            "cdp-command-error"
         );
+        let diagnosis =
+            browser_issue_diagnosis(classify_browser_script_failure(message), true, true, None);
+        assert!(diagnosis.browser_usable);
+        assert!(diagnosis.page_usable);
+        assert!(diagnosis.next_step.contains("Fix the Python"));
     }
 
     #[test]
@@ -8215,6 +8452,47 @@ print("time shadow ok")
     }
 
     #[test]
+    fn browser_script_navigation_helpers_do_not_auto_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-navigation-no-auto-wait",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+
+def cdp(method, session_id=None, **params):
+    calls.append((method, params))
+    if method == "Page.navigate":
+        return {"frameId": "frame-1"}
+    if method == "Target.createTarget":
+        return {"targetId": "target-1"}
+    raise AssertionError(method)
+
+def wait_for_load(*args, **kwargs):
+    raise AssertionError("navigation helpers should not wait implicitly")
+
+def _current_target_url():
+    return "https://already-open.test"
+
+def switch_tab(target):
+    calls.append(("switch_tab", {"target": target}))
+    return "session-1"
+
+goto_url("https://example.test/one")
+new_tab("https://example.test/two")
+assert [call[0] for call in calls].count("Page.navigate") == 2, calls
+print("navigation helpers do not auto wait")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("navigation helpers do not auto wait"));
+    }
+
+    #[test]
     fn browser_script_js_return_detection_ignores_nested_callbacks() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -8234,6 +8512,81 @@ print("return detection ok")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("return detection ok"));
+    }
+
+    #[test]
+    fn browser_script_js_serializes_function_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-js-args",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+events = []
+
+def _bridge(message):
+    events.append(message)
+    assert message["kind"] == "cdp", message
+    assert message["method"] == "Runtime.evaluate", message
+    params = message["params"]
+    expression = params["expression"]
+    assert "const fn =" in expression, expression
+    assert "return await fn(...args)" in expression, expression
+    assert '"hello"' in expression, expression
+    assert '"nested": [1, 2]' in expression, expression
+    assert params["returnByValue"] is True, params
+    return {"result": {"value": "ok"}}
+
+result = js("(x, payload) => payload.nested[0] + x", "hello", {"nested": [1, 2]})
+assert result == "ok", result
+assert len(events) == 1, events
+print("js args ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("js args ok"));
+    }
+
+    #[test]
+    fn browser_script_js_rejects_invalid_options_before_cdp() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-js-invalid-options",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+events = []
+
+def _bridge(message):
+    events.append(message)
+    return {}
+
+try:
+    js("document.title", returnByValue={"bad": True})
+except TypeError as exc:
+    assert "returnByValue" in str(exc), exc
+else:
+    raise AssertionError("expected TypeError")
+
+try:
+    js("(x) => x", float("nan"))
+except TypeError as exc:
+    assert "JSON-serializable" in str(exc), exc
+else:
+    raise AssertionError("expected TypeError")
+
+assert events == [], events
+print("js invalid options guard ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("js invalid options guard ok"));
     }
 
     #[test]
@@ -8702,6 +9055,7 @@ print("http_get parity ok")
         assert_eq!(output.status.as_deref(), Some("finished"));
         assert!(output.text.contains("fast result"));
         assert!(output.run_id.is_some());
+        assert!(output.elapsed_ms.is_some());
     }
 
     #[test]
@@ -8799,6 +9153,12 @@ print("http_get parity ok")
         assert!(observed.ok);
         assert_eq!(observed.status.as_deref(), Some("running"));
         assert!(observed.text.contains("No new output"));
+        assert!(observed.text.contains("Script has been running"));
+        assert!(observed
+            .text
+            .contains("No script output has been observed yet"));
+        assert!(observed.elapsed_ms.is_some());
+        assert!(observed.ms_since_last_output.is_none());
 
         let _ = cancel_browser_script(session_id, run_id);
     }
@@ -8912,8 +9272,55 @@ print("finished")
             status["active_scripts"][0]["run_id"],
             started.run_id.as_deref().unwrap()
         );
+        assert!(status["active_scripts"][0]["elapsed_ms"].is_number());
 
         let _ = cancel_browser_script(session_id, started.run_id.as_deref().unwrap());
+    }
+
+    #[test]
+    fn browser_status_lists_observing_script_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "script-status-observing-runs";
+        let started = start_browser_script(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import time\ntime.sleep(2.0)",
+            5,
+        )
+        .unwrap();
+        assert_eq!(started.status.as_deref(), Some("running"));
+        let run_id = started.run_id.clone().unwrap();
+        let observe_session_id = session_id.to_string();
+        let observe_run_id = run_id.clone();
+        let handle = thread::spawn(move || {
+            observe_browser_script(&observe_session_id, &observe_run_id, 700)
+        });
+
+        let mut last_status = Value::Null;
+        let mut saw_observing = false;
+        for _ in 0..30 {
+            thread::sleep(Duration::from_millis(25));
+            let status = run_browser_command(session_id, temp.path(), temp.path(), "status --json")
+                .unwrap()
+                .content;
+            last_status = status.clone();
+            saw_observing = status["active_scripts"].as_array().is_some_and(|scripts| {
+                scripts.iter().any(|script| {
+                    script["run_id"] == run_id
+                        && script["status"] == "observing"
+                        && script["elapsed_ms"].is_number()
+                })
+            });
+            if saw_observing {
+                break;
+            }
+        }
+
+        assert!(saw_observing, "last status: {last_status}");
+        let observed = handle.join().unwrap().unwrap();
+        assert_eq!(observed.status.as_deref(), Some("running"));
+        let _ = cancel_browser_script(session_id, &run_id);
     }
 
     #[test]

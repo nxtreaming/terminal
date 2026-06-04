@@ -3,6 +3,7 @@ pub(crate) enum PaletteAction {
     NewTask,
     PreviousWork,
     ChangeBrowser,
+    Context,
     Goal,
     ChooseModel,
     Authenticate,
@@ -10,6 +11,7 @@ pub(crate) enum PaletteAction {
     Reload,
     Update,
     Exit,
+    Feedback,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -19,7 +21,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const VISIBLE_ITEMS: [PaletteItem; 6] = [
+const VISIBLE_ITEMS: [PaletteItem; 8] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -36,6 +38,11 @@ const VISIBLE_ITEMS: [PaletteItem; 6] = [
         action: PaletteAction::ChangeBrowser,
     },
     PaletteItem {
+        command: "/context",
+        description: "inspect context window attribution",
+        action: PaletteAction::Context,
+    },
+    PaletteItem {
         command: "/model",
         description: "choose model and provider",
         action: PaletteAction::ChooseModel,
@@ -49,6 +56,11 @@ const VISIBLE_ITEMS: [PaletteItem; 6] = [
         command: "/sync-cookies",
         description: "sync local cookies",
         action: PaletteAction::SyncCookies,
+    },
+    PaletteItem {
+        command: "/feedback",
+        description: "report a bug or share feedback",
+        action: PaletteAction::Feedback,
     },
 ];
 
@@ -118,5 +130,10 @@ mod tests {
     #[test]
     fn goal_is_available_from_palette() {
         assert_eq!(selected_action("/goal", 0), Some(PaletteAction::Goal));
+    }
+
+    #[test]
+    fn context_is_available_from_palette() {
+        assert_eq!(selected_action("/context", 0), Some(PaletteAction::Context));
     }
 }

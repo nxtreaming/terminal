@@ -17,6 +17,8 @@ struct Profile {
     base_url: &'static str,
     /// Whether the provider needs no auth (e.g. a local Ollama server).
     no_auth: bool,
+    /// Whether this provider's chat endpoint accepts image content parts.
+    supports_image_content: bool,
 }
 
 /// The static table of known OpenAI-compatible providers.
@@ -25,21 +27,25 @@ const PROFILES: &[Profile] = &[
         id: "ollama",
         base_url: "http://localhost:11434/v1",
         no_auth: true,
+        supports_image_content: true,
     },
     Profile {
         id: "openrouter",
         base_url: "https://openrouter.ai/api/v1",
         no_auth: false,
+        supports_image_content: true,
     },
     Profile {
         id: "deepseek",
         base_url: "https://api.deepseek.com/v1",
         no_auth: false,
+        supports_image_content: false,
     },
     Profile {
         id: "fireworks",
         base_url: "https://api.fireworks.ai/inference/v1",
         no_auth: false,
+        supports_image_content: true,
     },
 ];
 
@@ -58,6 +64,7 @@ pub struct OpenAiCompatible {
     provider_id: String,
     base_url: String,
     api_key: Option<String>,
+    supports_image_content: bool,
 }
 
 impl OpenAiCompatible {
@@ -74,6 +81,7 @@ impl OpenAiCompatible {
             provider_id: provider_id.into(),
             base_url: base_url.into(),
             api_key: Some(api_key.into()),
+            supports_image_content: true,
         }
     }
 
@@ -94,6 +102,7 @@ impl OpenAiCompatible {
             provider_id: profile.id.to_string(),
             base_url: profile.base_url.to_string(),
             api_key,
+            supports_image_content: profile.supports_image_content,
         })
     }
 
@@ -107,23 +116,34 @@ impl OpenAiCompatible {
     /// The `model` names the deployment to target; it travels with each
     /// [`LlmRequest`](crate::schema::LlmRequest) issued against the route.
     pub fn chat(&self, model: impl Into<String>) -> Route {
-        let _model = model.into();
+        let model = model.into();
         let auth = match &self.api_key {
             Some(key) => Auth::bearer(key.clone()),
             None => Auth::None,
         };
+        let protocol = if self.supports_image_content && !is_deepseek_v4_model(&model) {
+            OpenAiChatProtocol::new()
+        } else {
+            OpenAiChatProtocol::without_image_content()
+        };
         Route::new(
-            Box::new(OpenAiChatProtocol::new()),
+            Box::new(protocol),
             Endpoint::new(self.base_url.clone(), "/chat/completions"),
             auth,
         )
     }
 }
 
+fn is_deepseek_v4_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase().replace('_', "-");
+    normalized.contains("deepseek")
+        && (normalized.contains("v4-pro") || normalized.contains("v4-flash"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{LlmRequest, Message};
+    use crate::schema::{ContentPart, LlmRequest, Message, MessageRole};
 
     fn header(route: &Route, name: &str) -> Option<String> {
         route
@@ -217,5 +237,69 @@ mod tests {
 
         assert_eq!(body["model"], "deepseek-chat");
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn deepseek_provider_omits_image_content_parts() {
+        let provider =
+            OpenAiCompatible::provider("deepseek", "ds-key").expect("deepseek is a known provider");
+        let route = provider.chat("deepseek-v4-flash");
+        let mut request = LlmRequest::new("deepseek-v4-flash", "deepseek");
+        request.messages.push(Message::new(
+            MessageRole::User,
+            vec![
+                ContentPart::text("look"),
+                ContentPart::Media {
+                    mime_type: "image/png".into(),
+                    data: Some("AAAA".into()),
+                    url: None,
+                    detail: Some("high".into()),
+                },
+            ],
+        ));
+        request.messages.push(Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: "call_browser".into(),
+                content: vec![ContentPart::Media {
+                    mime_type: "image/png".into(),
+                    data: Some("BBBB".into()),
+                    url: None,
+                    detail: Some("high".into()),
+                }],
+                is_error: false,
+            }],
+        ));
+
+        let body = route.protocol.build_body(&request).expect("body builds");
+        let serialized = serde_json::to_string(&body).expect("body serializes");
+
+        assert!(!serialized.contains("image_url"));
+        assert!(serialized.contains("image omitted"));
+        assert!(serialized
+            .contains("omitted because this model endpoint does not accept image content"));
+    }
+
+    #[test]
+    fn deepseek_v4_model_ids_omit_images_even_for_generic_provider() {
+        let provider =
+            OpenAiCompatible::configure("custom", "https://llm.internal.example/v1", "secret-key");
+        let route = provider.chat("deepseek/deepseek-v4-pro");
+        let mut request = LlmRequest::new("deepseek/deepseek-v4-pro", "custom");
+        request.messages.push(Message::new(
+            MessageRole::User,
+            vec![ContentPart::Media {
+                mime_type: "image/png".into(),
+                data: Some("AAAA".into()),
+                url: None,
+                detail: None,
+            }],
+        ));
+
+        let body = route.protocol.build_body(&request).expect("body builds");
+        let serialized = serde_json::to_string(&body).expect("body serializes");
+
+        assert!(!serialized.contains("image_url"));
+        assert!(serialized.contains("image omitted"));
     }
 }

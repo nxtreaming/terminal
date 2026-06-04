@@ -32,7 +32,9 @@ use browser_use_agent::context::{
     typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
 };
 use browser_use_agent::events::{EventSink, PendingEvent};
-use browser_use_agent::history::{MessageHistoryConfig, MessageHistoryPersistence};
+use browser_use_agent::history::{
+    browser_use_terminal_home_dir, MessageHistoryConfig, MessageHistoryPersistence,
+};
 use browser_use_agent::infra::{install_process_crypto_provider, UnifiedExecShutdownCleanup};
 use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_agent::subagents::cleanup_agent_runtime_state_for_agent_subtree;
@@ -103,6 +105,10 @@ mod theme;
 mod transcript;
 mod welcome;
 
+use browser_use_providers::openrouter::{
+    fetch_provider_models, load_cached_provider_models, save_cached_provider_models, ModelSource,
+    ProviderCredential, ProviderModel,
+};
 use composer::Composer;
 use palette::PaletteAction;
 use render::{
@@ -114,12 +120,13 @@ use runtime::{
     spawn_tui_agent_run, submit_runtime_user_input,
 };
 use settings::{
-    browser_use_cloud_env_key_present, display_and_provider_model_for_input,
-    display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
-    model_choices_for_config, provider_model_for_display, AgentBackend, ModelChoice,
-    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
+    browser_use_cloud_env_key_present, bundled_openai_model_ids, bundled_openrouter_model_ids,
+    display_and_provider_model_for_input, display_model_for_provider_model, fallback_model_choices,
+    is_claude_code_account, model_choices_for_config, provider_model_choices,
+    provider_model_for_display, AgentBackend, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES,
+    ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES,
+    BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
+    BROWSER_USE_CLOUD_API_KEY_SETTING, RECOMMENDED_MODELS,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -151,6 +158,8 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
+pub(crate) const FEEDBACK_THANKS_FRAME_MS: u64 = 250;
+const FEEDBACK_THANKS_AUTO_DISMISS: Duration = Duration::from_millis(2500);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
@@ -164,6 +173,8 @@ const SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT: &str = "session.followup.interr
 pub(crate) const SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT: &str = "session.followup.cancelled";
 const SESSION_MAILBOX_CONTINUATION_STARTED_EVENT: &str = "session.mailbox_continuation.started";
 const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
+const SESSION_STOPPED_REASON: &str = "stopped from terminal";
+pub(crate) const SESSION_PAUSED_REASON: &str = "session paused";
 pub(crate) const FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL: &str = "after_next_tool_call";
 const FOLLOWUP_DELIVERY_AFTER_CURRENT_TURN: &str = "after_current_turn";
 pub(crate) const PENDING_FOLLOWUP_INTERRUPT_REASON: &str = "pending follow-up interrupt";
@@ -228,15 +239,21 @@ enum Surface {
     Account,
     ApiKey,
     Telemetry,
+    Provider,
+    OpenAiAuth,
     Model,
+    ModelSearch,
     Mode,
     Browser,
     BrowserSelect,
     CookieSync,
+    Context,
     Goal,
     History,
     Messages,
     Developer,
+    Feedback,
+    FeedbackThanks,
 }
 
 impl Surface {
@@ -246,15 +263,20 @@ impl Surface {
             Self::Account
                 | Self::ApiKey
                 | Self::Telemetry
+                | Self::Provider
+                | Self::OpenAiAuth
                 | Self::Model
+                | Self::ModelSearch
                 | Self::Mode
                 | Self::Browser
                 | Self::BrowserSelect
                 | Self::CookieSync
+                | Self::Context
                 | Self::Goal
                 | Self::History
                 | Self::Messages
                 | Self::Developer
+                | Self::Feedback
         )
     }
 
@@ -268,12 +290,39 @@ impl Surface {
     /// of these is active the composer must not also be rendered underneath —
     /// the popup itself is the input field, with its own cursor.
     fn is_text_input_popup(self) -> bool {
-        matches!(self, Self::ApiKey | Self::Telemetry)
+        matches!(self, Self::ApiKey | Self::Telemetry | Self::ModelSearch)
     }
 
     fn uses_main_view(self) -> bool {
         self == Self::Main || self.is_bottom_pane()
     }
+}
+
+/// An entry in the model-search list: a non-selectable section header or a
+/// selectable model id.
+enum ModelSearchEntry {
+    Header(String),
+    Item(String),
+}
+
+/// A row on the provider screen. `submenu` rows (OpenAI) open a sub-dialogue of
+/// auth methods; other rows connect their `account` directly.
+struct ProviderRow {
+    label: String,
+    account: &'static str,
+    submenu: bool,
+}
+
+/// The OpenAI auth methods shown in the sub-dialogue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAiAuthMethod {
+    Codex,
+    ApiKey,
+}
+
+struct OpenAiAuthRow {
+    label: String,
+    method: OpenAiAuthMethod,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -284,6 +333,7 @@ enum ScreenArg {
     Model,
     Mode,
     Browser,
+    Context,
     History,
     Developer,
 }
@@ -297,6 +347,7 @@ impl From<ScreenArg> for Surface {
             ScreenArg::Model => Self::Model,
             ScreenArg::Mode => Self::Mode,
             ScreenArg::Browser => Self::Browser,
+            ScreenArg::Context => Self::Context,
             ScreenArg::History => Self::History,
             ScreenArg::Developer => Self::Developer,
         }
@@ -423,6 +474,103 @@ impl Default for CookieSyncState {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Feedback questionnaire state
+
+const FEEDBACK_INGEST_URL: &str = "https://feedback-ingest-production.up.railway.app";
+const FEEDBACK_INSTALL_ID_SETTING: &str = "install.id";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedbackStep {
+    Category,
+    Description,
+    UploadLogs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedbackCategory {
+    Bug,
+    BadResult,
+    GoodResult,
+    SafetyCheck,
+    Other,
+}
+
+impl FeedbackCategory {
+    const ALL: [FeedbackCategory; 5] = [
+        FeedbackCategory::Bug,
+        FeedbackCategory::BadResult,
+        FeedbackCategory::GoodResult,
+        FeedbackCategory::SafetyCheck,
+        FeedbackCategory::Other,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            FeedbackCategory::Bug => "bug",
+            FeedbackCategory::BadResult => "bad result",
+            FeedbackCategory::GoodResult => "good result",
+            FeedbackCategory::SafetyCheck => "safety check",
+            FeedbackCategory::Other => "other",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            FeedbackCategory::Bug => "Crash, error message, hang, or broken UI/behavior.",
+            FeedbackCategory::BadResult => {
+                "Output was off-target, incorrect, incomplete, or unhelpful."
+            }
+            FeedbackCategory::GoodResult => {
+                "Helpful, correct, high-quality, or delightful result worth celebrating."
+            }
+            FeedbackCategory::SafetyCheck => {
+                "Benign usage blocked due to safety checks or refusals."
+            }
+            FeedbackCategory::Other => {
+                "Slowness, feature suggestion, UX feedback, or anything else."
+            }
+        }
+    }
+
+    fn api_value(self) -> &'static str {
+        match self {
+            FeedbackCategory::Bug => "bug",
+            FeedbackCategory::BadResult => "bad_result",
+            FeedbackCategory::GoodResult => "good_result",
+            FeedbackCategory::SafetyCheck => "safety_check",
+            FeedbackCategory::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FeedbackState {
+    step: FeedbackStep,
+    category_index: usize,
+    description: String,
+    upload_yes: bool,
+}
+
+impl Default for FeedbackState {
+    fn default() -> Self {
+        Self {
+            step: FeedbackStep::Category,
+            category_index: 0,
+            description: String::new(),
+            upload_yes: true,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FeedbackSubmitResult {
+    Ok,
+    Err(String),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AppCommand {
     StartTask(String),
@@ -454,10 +602,14 @@ enum AppCommand {
     Reload,
     Update,
     SaveAccount(String),
-    SaveModel(usize),
+    SelectProvider(&'static str),
+    SelectRecommended(usize),
+    OpenModelSearch,
+    SaveCustomModel(String),
     SaveBrowser(usize),
     SaveAuth(String),
     SaveTelemetry(String),
+    OpenFeedback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -569,7 +721,18 @@ pub(crate) fn event_payload_text(event: &EventRecord) -> Option<String> {
 
 fn event_is_pre_output_after_submission(event: &EventRecord, target_seq: i64) -> bool {
     match event.event_type.as_str() {
-        "model.turn.request" | "model.thinking_delta" | "session.status" => true,
+        "model.turn.request"
+        | "model.thinking_delta"
+        | "session.status"
+        | "agent.created"
+        | "agent.resumed"
+        | "agent.input.accepted"
+        | "agent.input.consumed"
+        | "agent.started"
+        | "agent.queued"
+        | "agent.run.started"
+        | "agent.continuation_started"
+        | "agent.turn.started" => true,
         "workspace.context"
         | "model.switch_context"
         | "model.personality_context"
@@ -907,6 +1070,9 @@ struct App {
     /// changed — never on every keystroke.
     last_followup_check_session: Option<String>,
     modal_background: Option<ModalBackgroundSnapshot>,
+    /// On-screen placement of the live-view URL, recorded during render and
+    /// painted as an OSC-8 hyperlink right after the frame is flushed.
+    live_link_overlay: std::cell::RefCell<Option<render::LiveLinkOverlay>>,
     args: Args,
     selected_session_id: Option<String>,
     composer: Composer,
@@ -920,10 +1086,25 @@ struct App {
     provider_model: String,
     model_provider_id: Option<String>,
     model_choices: Vec<ModelChoice>,
+    /// Provider/account chosen on the provider screen; scopes the model search to
+    /// that provider's models.
+    selected_provider: Option<&'static str>,
+    /// Live model ids for the typeahead of the currently-selected provider,
+    /// seeded from the per-source cache and refreshed in the background.
+    provider_models: Vec<ProviderModel>,
+    /// Receiver for an in-flight background provider model-list fetch. The
+    /// payload carries the `ModelSource` it was fetched for so a result that
+    /// arrives after the user switched providers can be discarded rather than
+    /// attributed to (and cached under) the wrong provider.
+    provider_fetch: Option<mpsc::Receiver<(ModelSource, Vec<ProviderModel>)>>,
     collaboration_mode: CollaborationModeKind,
     browser: String,
     api_key_account: Option<String>,
-    pending_model_after_auth: Option<usize>,
+    pending_model_after_auth: Option<ModelChoice>,
+    /// Set when auth was started from the `/model` provider flow, so it opens the
+    /// provider's searchable model list once connected (vs first-run setup, which
+    /// auto-picks a default).
+    pending_model_search_after_auth: bool,
     setup_pending_account: Option<String>,
     setup_result: Option<SetupResult>,
     claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
@@ -965,6 +1146,9 @@ struct App {
     pending_auth_resume: Option<String>,
     pending_initial_goal: Option<String>,
     pending_goal_replacement: Option<PendingGoalReplacement>,
+    feedback: FeedbackState,
+    feedback_rx: Option<tokio::sync::mpsc::Receiver<FeedbackSubmitResult>>,
+    feedback_thanks_started: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -1650,6 +1834,37 @@ fn model_provider_id_for_backend(backend: AgentBackend) -> &'static str {
     backend.as_setting()
 }
 
+/// Resolve a runtime account string to its `'static` constant, so it can be
+/// stored in `selected_provider: Option<&'static str>`.
+fn account_static(account: &str) -> Option<&'static str> {
+    [
+        ACCOUNT_CODEX,
+        ACCOUNT_OPENAI,
+        ACCOUNT_ANTHROPIC,
+        ACCOUNT_OPENROUTER,
+        ACCOUNT_DEEPSEEK,
+    ]
+    .into_iter()
+    .find(|known| *known == account)
+}
+
+/// The model-list source for a provider account (for the dynamic `/models` fetch).
+fn model_source_for_account(account: &str) -> Option<ModelSource> {
+    Some(if account == ACCOUNT_CODEX {
+        ModelSource::Codex
+    } else if account == ACCOUNT_OPENAI {
+        ModelSource::OpenAi
+    } else if account == ACCOUNT_ANTHROPIC {
+        ModelSource::Anthropic
+    } else if account == ACCOUNT_OPENROUTER {
+        ModelSource::OpenRouter
+    } else if account == ACCOUNT_DEEPSEEK {
+        ModelSource::DeepSeek
+    } else {
+        return None;
+    })
+}
+
 fn default_provider_model_for_backend(
     backend: AgentBackend,
     current_dir: &Path,
@@ -1874,6 +2089,7 @@ impl App {
             transcript_filtered_cache: transcript::FilteredEventCache::default(),
             last_followup_check_session: None,
             modal_background: None,
+            live_link_overlay: std::cell::RefCell::new(None),
             args,
             selected_session_id,
             composer: Composer::default(),
@@ -1887,10 +2103,14 @@ impl App {
             provider_model,
             model_provider_id,
             model_choices,
+            selected_provider: None,
+            provider_models: Vec::new(),
+            provider_fetch: None,
             collaboration_mode,
             browser,
             api_key_account: None,
             pending_model_after_auth: None,
+            pending_model_search_after_auth: false,
             setup_pending_account: None,
             setup_result: None,
             claude_code_oauth: None,
@@ -1916,6 +2136,9 @@ impl App {
             pending_auth_resume: None,
             pending_initial_goal: None,
             pending_goal_replacement: None,
+            feedback: FeedbackState::default(),
+            feedback_rx: None,
+            feedback_thanks_started: None,
         };
         app.refresh_cached_projection();
         if resumed_from_reexec {
@@ -2211,6 +2434,23 @@ impl App {
 
     fn cached_events_for_session(&self, session_id: &str) -> &[EventRecord] {
         self.state_cache.events_for_session(session_id)
+    }
+
+    pub(crate) fn selected_session_is_paused(&self) -> bool {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return false;
+        };
+        self.cached_events_for_session(session_id)
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "session.cancelled")
+            .is_some_and(|event| {
+                event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SESSION_PAUSED_REASON)
+            })
     }
 
     fn goal_response_for_session(&self, session_id: &str) -> serde_json::Value {
@@ -2972,11 +3212,573 @@ impl App {
     fn open_surface(&mut self, surface: Surface) {
         self.close_slash_palette();
         self.surface = surface;
-        self.selected_row = 0;
+        // Open the model picker on the currently active model
+        self.selected_row = match surface {
+            Surface::Provider => self.current_provider_screen_index().unwrap_or(0),
+            Surface::Model => self.current_model_surface_index().unwrap_or(0),
+            Surface::ModelSearch => self.current_model_search_index().unwrap_or(0),
+            Surface::OpenAiAuth => self
+                .current_openai_method()
+                .and_then(|method| {
+                    self.openai_auth_rows()
+                        .iter()
+                        .position(|row| row.method == method)
+                })
+                .unwrap_or(0),
+            _ => 0,
+        };
         self.history_filter.clear();
         if surface != Surface::Browser {
             self.browser_notice = None;
         }
+    }
+
+    /// The model rows shown on the model screen: scoped to the selected provider,
+    /// or every model when no provider is selected (e.g. direct/legacy opens).
+    fn model_surface_choices(&self) -> Vec<ModelChoice> {
+        match self.selected_provider {
+            Some(account) => provider_model_choices(account, &self.model_choices)
+                .into_iter()
+                .cloned()
+                .collect(),
+            None => self.model_choices.clone(),
+        }
+    }
+
+    /// Whether the model screen shows the trailing "enter a custom model" row,
+    /// which only applies to OpenRouter (a passthrough that serves any model id).
+    fn model_surface_has_custom_row(&self) -> bool {
+        self.selected_provider == Some(ACCOUNT_OPENROUTER)
+    }
+
+    fn model_surface_row_count(&self) -> usize {
+        self.model_surface_choices().len() + usize::from(self.model_surface_has_custom_row())
+    }
+
+    /// Index into the model-screen rows of the currently-active model, matched the
+    /// same way the picker marks the current row (display name + account). `None`
+    /// when no model is configured or it isn't in the scoped list.
+    fn current_model_surface_index(&self) -> Option<usize> {
+        if !self.model_configured {
+            return None;
+        }
+        self.model_surface_choices()
+            .iter()
+            .position(|choice| self.model == choice.display && self.account == choice.account)
+    }
+
+    /// The provider/auth rows shown beneath the recommended quick-picks. OpenAI
+    /// splits into "sign in" (OAuth) and "API key"; the "Codex login (detected)"
+    /// row appears only when an external codex login is present.
+    fn provider_rows(&self) -> Vec<ProviderRow> {
+        vec![
+            ProviderRow {
+                label: "OpenAI".to_string(),
+                account: ACCOUNT_CODEX,
+                submenu: true,
+            },
+            ProviderRow {
+                label: "Anthropic · API key".to_string(),
+                account: ACCOUNT_ANTHROPIC,
+                submenu: false,
+            },
+            ProviderRow {
+                label: "OpenRouter · API key".to_string(),
+                account: ACCOUNT_OPENROUTER,
+                submenu: false,
+            },
+            ProviderRow {
+                label: "DeepSeek · API key".to_string(),
+                account: ACCOUNT_DEEPSEEK,
+                submenu: false,
+            },
+        ]
+    }
+
+    /// Whether a provider row is the one currently in use (for the highlight).
+    fn provider_row_is_current(&self, row: &ProviderRow) -> bool {
+        if !self.model_configured {
+            return false;
+        }
+        if row.submenu {
+            self.account == ACCOUNT_CODEX || self.account == ACCOUNT_OPENAI
+        } else {
+            self.account == row.account
+        }
+    }
+
+    /// Index of the recommended quick-pick that matches the active model, if any.
+    fn current_recommended_index(&self) -> Option<usize> {
+        if !self.model_configured {
+            return None;
+        }
+        RECOMMENDED_MODELS.iter().position(|rec| {
+            self.account == rec.account && self.provider_model == rec.provider_model
+        })
+    }
+
+    /// Row to start the cursor on when opening the provider screen: the active
+    /// model's recommended row (top) if it's a top pick, else its provider row
+    /// (bottom), so the current selection is visible and pre-highlighted.
+    fn current_provider_screen_index(&self) -> Option<usize> {
+        if let Some(idx) = self.current_recommended_index() {
+            return Some(idx);
+        }
+        if !self.model_configured {
+            return None;
+        }
+        let base = RECOMMENDED_MODELS.len();
+        self.provider_rows()
+            .iter()
+            .position(|row| self.provider_row_is_current(row))
+            .map(|pos| base + pos)
+    }
+
+    /// The active model id, but only when it belongs to the provider currently
+    /// being searched — so the model search can mark/preselect it.
+    fn current_search_model_id(&self) -> Option<&str> {
+        if !self.model_configured {
+            return None;
+        }
+        let provider = self.selected_provider?;
+        if self.account != provider {
+            return None;
+        }
+        Some(self.provider_model.as_str())
+    }
+
+    /// Row index of the active model within the model-search list, if present.
+    fn current_model_search_index(&self) -> Option<usize> {
+        let current = self.current_search_model_id()?.to_string();
+        self.model_search_rows()
+            .iter()
+            .position(|id| *id == current)
+    }
+
+    /// Provider screen selection: a recommended quick-pick (top rows) or a
+    /// provider row (lower rows). OpenAI opens its auth sub-dialogue.
+    fn provider_surface_select(&mut self) -> Result<()> {
+        let rec_count = RECOMMENDED_MODELS.len();
+        if self.selected_row < rec_count {
+            self.dispatch(AppCommand::SelectRecommended(self.selected_row))?;
+            return Ok(());
+        }
+        let rows = self.provider_rows();
+        if let Some(row) = rows.get(self.selected_row - rec_count) {
+            if row.submenu {
+                self.open_surface(Surface::OpenAiAuth);
+            } else {
+                let account = row.account;
+                self.dispatch(AppCommand::SelectProvider(account))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The OpenAI auth-method rows: Sign in (OAuth), Codex (only when an external
+    /// login is detected), and API key.
+    fn openai_auth_rows(&self) -> Vec<OpenAiAuthRow> {
+        let mut rows = Vec::new();
+        if self.has_external_codex_login() {
+            rows.push(OpenAiAuthRow {
+                label: "Use detected Codex login".to_string(),
+                method: OpenAiAuthMethod::Codex,
+            });
+        }
+        rows.push(OpenAiAuthRow {
+            label: "Use an API key".to_string(),
+            method: OpenAiAuthMethod::ApiKey,
+        });
+        rows
+    }
+
+    /// The OpenAI auth method currently in use (highlighted in the sub-dialogue).
+    fn current_openai_method(&self) -> Option<OpenAiAuthMethod> {
+        if !self.model_configured {
+            return None;
+        }
+        if self.account == ACCOUNT_OPENAI {
+            return Some(OpenAiAuthMethod::ApiKey);
+        }
+        if self.account == ACCOUNT_CODEX {
+            return Some(OpenAiAuthMethod::Codex);
+        }
+        None
+    }
+
+    /// OpenAI sub-dialogue Enter: route the chosen method through auth-first.
+    fn openai_auth_select(&mut self) -> Result<()> {
+        let rows = self.openai_auth_rows();
+        let Some(method) = rows.get(self.selected_row).map(|row| row.method) else {
+            return Ok(());
+        };
+        match method {
+            OpenAiAuthMethod::ApiKey => self.select_provider(ACCOUNT_OPENAI),
+            OpenAiAuthMethod::Codex => self.select_provider(ACCOUNT_CODEX),
+        }
+    }
+
+    /// Auth-first: connect the provider, then open its searchable model list. If
+    /// the provider isn't connected, run its auth flow first; the model search
+    /// opens after auth completes (`advance_after_auth`).
+    fn select_provider(&mut self, account: &'static str) -> Result<()> {
+        self.selected_provider = Some(account);
+        if self.account_ready(account)? {
+            self.open_provider_model_search(account)
+        } else {
+            self.pending_model_after_auth = None;
+            self.pending_model_search_after_auth = true;
+            self.start_auth_flow(account.to_string())
+        }
+    }
+
+    /// Apply a recommended quick-pick directly: build its choice and save it,
+    /// auto-authenticating first if the provider isn't connected yet.
+    fn select_recommended(&mut self, index: usize) -> Result<()> {
+        let Some(rec) = RECOMMENDED_MODELS.get(index) else {
+            return Ok(());
+        };
+        self.selected_provider = Some(rec.account);
+        let choice = settings::model_choice_for(rec.account, rec.provider_model, rec.display);
+        self.save_model_with_choice(choice)
+    }
+
+    /// Model screen Enter (legacy catalog surface, still exercised by tests):
+    /// save the highlighted model, or open the search via the custom row.
+    fn model_surface_select(&mut self) -> Result<()> {
+        let choices = self.model_surface_choices();
+        if self.model_surface_has_custom_row() && self.selected_row == choices.len() {
+            self.dispatch(AppCommand::OpenModelSearch)?;
+        } else if let Some(choice) = choices.get(self.selected_row).cloned() {
+            self.save_model_with_choice(choice)?;
+        }
+        Ok(())
+    }
+
+    /// Open the searchable, dynamically-fetched model list for a connected
+    /// provider: seed from the per-source cache and refresh in the background.
+    fn open_provider_model_search(&mut self, account: &str) -> Result<()> {
+        self.selected_provider = account_static(account);
+        self.composer.clear();
+        self.provider_models.clear();
+        self.provider_fetch = None;
+        self.seed_provider_models(account);
+        self.start_provider_fetch(account);
+        self.open_surface(Surface::ModelSearch);
+        Ok(())
+    }
+
+    fn open_model_search(&mut self) -> Result<()> {
+        let account = self.selected_provider.unwrap_or(ACCOUNT_OPENROUTER);
+        self.open_provider_model_search(account)
+    }
+
+    /// Seed the typeahead from curated provider ids or the per-source disk cache
+    /// so it shows instantly.
+    fn seed_provider_models(&mut self, account: &str) {
+        if account == ACCOUNT_CODEX || account == ACCOUNT_OPENAI {
+            self.provider_models = bundled_openai_model_ids()
+                .into_iter()
+                .map(|id| ProviderModel {
+                    id,
+                    name: None,
+                    vision: false,
+                    supports_tools: None,
+                })
+                .collect();
+            return;
+        }
+        let Some(source) = model_source_for_account(account) else {
+            return;
+        };
+        if let Some(dir) = browser_use_terminal_home_dir() {
+            if let Some((models, _fresh)) = load_cached_provider_models(&dir, source) {
+                if !models.is_empty() {
+                    self.provider_models = models;
+                    return;
+                }
+            }
+        }
+        let fallback_ids = if account == ACCOUNT_OPENROUTER {
+            bundled_openrouter_model_ids()
+        } else {
+            Vec::new()
+        };
+        if !fallback_ids.is_empty() {
+            self.provider_models = fallback_ids
+                .into_iter()
+                .map(|id| ProviderModel {
+                    id,
+                    name: None,
+                    vision: false,
+                    supports_tools: None,
+                })
+                .collect();
+        }
+    }
+
+    fn start_provider_fetch(&mut self, account: &str) {
+        if self.provider_fetch.is_some() {
+            return;
+        }
+        if account == ACCOUNT_CODEX || account == ACCOUNT_OPENAI {
+            return;
+        }
+        let Some(source) = model_source_for_account(account) else {
+            return;
+        };
+        let credential = self.get_provider_credential(account);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(models) = fetch_provider_models(source, credential) {
+                let _ = tx.send((source, models));
+            }
+        });
+        self.provider_fetch = Some(rx);
+    }
+
+    /// Resolve the credential used to authenticate a provider's `/models` request.
+    fn get_provider_credential(&self, account: &str) -> ProviderCredential {
+        if account == ACCOUNT_CODEX {
+            return self.codex_credential();
+        }
+        if account == ACCOUNT_OPENROUTER {
+            return ProviderCredential::None; // OpenRouter's model list is public.
+        }
+        let (key_setting, env_names): (&str, &[&str]) = if account == ACCOUNT_OPENAI {
+            (
+                "auth.openai.api_key",
+                &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+            )
+        } else if account == ACCOUNT_ANTHROPIC {
+            (
+                "auth.anthropic.api_key",
+                &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+            )
+        } else if account == ACCOUNT_DEEPSEEK {
+            (
+                "auth.deepseek.api_key",
+                &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
+            )
+        } else {
+            return ProviderCredential::None;
+        };
+        match self.resolved_secret(key_setting, env_names) {
+            Some(key) => ProviderCredential::ApiKey(key),
+            None => ProviderCredential::None,
+        }
+    }
+
+    fn codex_credential(&self) -> ProviderCredential {
+        let store_token = self
+            .store
+            .get_setting("auth.codex.access_token")
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        let store_account = self
+            .store
+            .get_setting("auth.codex.account_id")
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        if let (Some(access_token), Some(account_id)) = (store_token, store_account) {
+            return ProviderCredential::Oauth {
+                access_token,
+                account_id,
+            };
+        }
+        if let Ok(auth) = load_codex_auth() {
+            return ProviderCredential::Oauth {
+                access_token: auth.access_token,
+                account_id: auth.account_id,
+            };
+        }
+        ProviderCredential::None
+    }
+
+    /// Read a secret from the store, falling back to env vars.
+    fn resolved_secret(&self, setting_key: &str, env_names: &[&str]) -> Option<String> {
+        if let Some(value) = self
+            .store
+            .get_setting(setting_key)
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(value);
+        }
+        env_names.iter().find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+    }
+
+    /// Pump a finished background provider fetch into state + per-source cache.
+    fn drain_provider_fetch(&mut self) -> Result<bool> {
+        let Some(rx) = self.provider_fetch.as_ref() else {
+            return Ok(false);
+        };
+        match rx.try_recv() {
+            Ok((source, models)) => {
+                self.provider_fetch = None;
+                // Discard a result whose source no longer matches the selected
+                // provider — the user switched away while it was in flight, so
+                // applying it would show (and cache) the wrong provider's models.
+                if self.selected_provider.and_then(model_source_for_account) != Some(source) {
+                    return Ok(false);
+                }
+                if models.is_empty() {
+                    return Ok(false);
+                }
+                if let Some(dir) = browser_use_terminal_home_dir() {
+                    let _ = save_cached_provider_models(&dir, source, &models);
+                }
+                self.provider_models = models;
+                Ok(self.surface == Surface::ModelSearch)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(false),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.provider_fetch = None;
+                Ok(false)
+            }
+        }
+    }
+
+    /// The model-search list as ordered entries (section headers + selectable
+    /// model rows). While searching it's a flat filtered list; with an empty
+    /// query it leads with a "recommended" section, then the rest alphabetized
+    /// and grouped by provider (the vendor prefix before `/`).
+    /// Models the agent can actually run: drop ones we KNOW lack tool support
+    /// (this agent requires tool calling). Every tool-capable model is browsable,
+    /// across all providers; any model id can also be typed in directly.
+    fn usable_provider_models(&self) -> Vec<&ProviderModel> {
+        self.provider_models
+            .iter()
+            .filter(|model| model.supports_tools != Some(false))
+            .collect()
+    }
+
+    /// Whether a model in the current list accepts image input (vision).
+    fn provider_model_is_vision(&self, id: &str) -> bool {
+        self.provider_models
+            .iter()
+            .any(|model| model.id == id && model.vision)
+    }
+
+    fn model_search_has_filter_input(&self) -> bool {
+        !matches!(
+            self.selected_provider,
+            Some(ACCOUNT_CODEX) | Some(ACCOUNT_OPENAI)
+        )
+    }
+
+    fn model_search_entries(&self) -> Vec<ModelSearchEntry> {
+        let typed = if self.model_search_has_filter_input() {
+            self.composer.input().trim().to_string()
+        } else {
+            String::new()
+        };
+        let query = typed.to_ascii_lowercase();
+        let usable = self.usable_provider_models();
+
+        if !query.is_empty() {
+            let mut entries = Vec::new();
+            let exact = usable.iter().any(|model| model.id == typed);
+            if !exact && self.model_search_has_filter_input() {
+                // Offer the raw typed id so any valid model can be submitted.
+                entries.push(ModelSearchEntry::Item(typed.clone()));
+            }
+            for model in &usable {
+                if model.id.to_ascii_lowercase().contains(&query) {
+                    entries.push(ModelSearchEntry::Item(model.id.clone()));
+                }
+            }
+            return entries;
+        }
+
+        let recommended = self.recommended_search_ids();
+        let mut entries = Vec::new();
+        if !recommended.is_empty() {
+            entries.push(ModelSearchEntry::Header("recommended".to_string()));
+            for id in &recommended {
+                entries.push(ModelSearchEntry::Item(id.clone()));
+            }
+        }
+        // Group the remaining models by provider prefix, alphabetically; ids
+        // within a group keep the provider/fallback order.
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for model in &usable {
+            if recommended.contains(&model.id) {
+                continue;
+            }
+            let group = model
+                .id
+                .split_once('/')
+                .map(|(prefix, _)| prefix.to_string())
+                .unwrap_or_else(|| "models".to_string());
+            groups.entry(group).or_default().push(model.id.clone());
+        }
+        for (group, ids) in groups {
+            entries.push(ModelSearchEntry::Header(group));
+            for id in ids {
+                entries.push(ModelSearchEntry::Item(id));
+            }
+        }
+        entries
+    }
+
+    /// Curated "top" model ids for the recommended section of the current
+    /// provider's search (only the usable ids present in the fetched list).
+    fn recommended_search_ids(&self) -> Vec<String> {
+        if self.selected_provider != Some(ACCOUNT_OPENROUTER) {
+            return Vec::new();
+        }
+        let available: std::collections::HashSet<&str> = self
+            .usable_provider_models()
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        bundled_openrouter_model_ids()
+            .into_iter()
+            .filter(|id| available.contains(id.as_str()))
+            .collect()
+    }
+
+    /// The flat list of selectable model ids, in rendered order (headers excluded).
+    fn model_search_rows(&self) -> Vec<String> {
+        self.model_search_entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                ModelSearchEntry::Item(id) => Some(id),
+                ModelSearchEntry::Header(_) => None,
+            })
+            .collect()
+    }
+
+    fn model_search_row_count(&self) -> usize {
+        self.model_search_rows().len()
+    }
+
+    /// Model-search Enter: save the highlighted suggestion / typed id.
+    fn model_search_select(&mut self) -> Result<()> {
+        let rows = self.model_search_rows();
+        if let Some(id) = rows.get(self.selected_row).cloned() {
+            self.dispatch(AppCommand::SaveCustomModel(id))?;
+        }
+        Ok(())
+    }
+
+    fn save_provider_model(&mut self, model_id: String) -> Result<()> {
+        let id = model_id.trim();
+        if id.is_empty() {
+            return Ok(());
+        }
+        let account = self.selected_provider.unwrap_or(ACCOUNT_OPENROUTER);
+        self.composer.clear();
+        self.save_model_with_choice(settings::model_choice_for(account, id, id))
     }
 
     fn close_surface(&mut self) {
@@ -3077,8 +3879,11 @@ impl App {
     /// Sets `pending_auth_resume` so the next successful auth automatically
     /// starts the agent for this session.
     fn inject_no_key_nudge(&mut self, submission: UserSubmission) -> Result<()> {
+        // The agent runs out of (and saves files into) the per-session tmp dir,
+        // not wherever the process was launched. `cwd` here is only used to
+        // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
-        let session = self.store.create_session(None, &cwd)?;
+        let session = self.store.create_session_in_artifact_root(None)?;
         // Record the user's task as the standard input event (preserved for retry).
         let input_record = self.store.append_event(
             &session.id,
@@ -3217,7 +4022,7 @@ impl App {
                 self.native_history.reset_with_clear();
                 self.close_surface();
             }
-            AppCommand::ChangeModel => self.open_surface(Surface::Model),
+            AppCommand::ChangeModel => self.open_surface(Surface::Provider),
             AppCommand::SetCollaborationMode(mode) => {
                 let mode = match mode {
                     CollaborationModeKind::Default | CollaborationModeKind::Plan => {
@@ -3241,10 +4046,17 @@ impl App {
             AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
             AppCommand::SaveAccount(account) => self.save_account(account)?,
-            AppCommand::SaveModel(index) => self.save_model(index)?,
+            AppCommand::SelectProvider(account) => self.select_provider(account)?,
+            AppCommand::SelectRecommended(index) => self.select_recommended(index)?,
+            AppCommand::OpenModelSearch => self.open_model_search()?,
+            AppCommand::SaveCustomModel(model_id) => self.save_provider_model(model_id)?,
             AppCommand::SaveBrowser(index) => self.save_browser(index)?,
             AppCommand::SaveAuth(secret) => self.save_auth(secret)?,
             AppCommand::SaveTelemetry(secret) => self.save_telemetry(secret)?,
+            AppCommand::OpenFeedback => {
+                self.feedback = FeedbackState::default();
+                self.open_surface(Surface::Feedback);
+            }
         }
         self.drain_store_notifications()?;
         Ok(())
@@ -3255,8 +4067,11 @@ impl App {
         if !self.ensure_agent_ready_for_selection(&selection)? {
             return Ok(());
         }
+        // The agent runs out of (and saves files into) the per-session tmp dir,
+        // not wherever the process was launched. `cwd` here is only used to
+        // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
-        let session = self.store.create_session(None, &cwd)?;
+        let session = self.store.create_session_in_artifact_root(None)?;
         self.append_session_model_selection(&session.id, &selection)?;
         let options = self.configured_agent_options()?;
         self.append_workspace_context_event_blocking(&session.id, &options)?;
@@ -3533,6 +4348,14 @@ impl App {
     }
 
     fn cancel_current_task(&mut self) -> Result<bool> {
+        self.cancel_current_task_with_reason(SESSION_STOPPED_REASON)
+    }
+
+    fn pause_current_task(&mut self) -> Result<bool> {
+        self.cancel_current_task_with_reason(SESSION_PAUSED_REASON)
+    }
+
+    fn cancel_current_task_with_reason(&mut self, reason: &'static str) -> Result<bool> {
         let Some(id) = self.selected_session_id.clone() else {
             return Ok(false);
         };
@@ -3544,13 +4367,16 @@ impl App {
         if cancelled_live_run {
             return Ok(true);
         }
-        self.store.request_cancel(&id, "stopped from terminal")?;
+        self.store.request_cancel(&id, reason)?;
         cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |session_id| {
             usize::from(cancel_agent_run(&self.args.state_dir, session_id))
         })?;
         if !cancelled_live_run {
-            self.status_notice =
-                Some("Marked task stopped; no live runtime handle was found.".to_string());
+            self.status_notice = if reason == SESSION_PAUSED_REASON {
+                Some("Marked conversation paused; no live runtime handle was found.".to_string())
+            } else {
+                Some("Marked task stopped; no live runtime handle was found.".to_string())
+            };
         }
         Ok(true)
     }
@@ -3789,7 +4615,10 @@ impl App {
         if self.reclaim_latest_queued_followup()? {
             return Ok(());
         }
-        if self.cancel_current_task()? {
+        if self.reclaim_latest_submitted_message_before_output()? {
+            return Ok(());
+        }
+        if self.pause_current_task()? {
             self.escape_stop_until = None;
             self.quit_hint_until = None;
             self.close_surface();
@@ -3798,9 +4627,6 @@ impl App {
         if self.escape_stop_is_pending() {
             self.open_message_actions()?;
             self.quit_hint_until = None;
-            return Ok(());
-        }
-        if self.reclaim_latest_submitted_message_before_output()? {
             return Ok(());
         }
         self.escape_stop_until =
@@ -3832,10 +4658,18 @@ impl App {
         if quit_requested {
             return Ok(true);
         }
+        if self.surface == Surface::FeedbackThanks {
+            self.surface = Surface::Main;
+            self.feedback_thanks_started = None;
+            return Ok(false);
+        }
         if self.prompt_history.search.is_some() {
             self.handle_prompt_history_search_key(key)?;
             self.drain_store_notifications()?;
             return Ok(false);
+        }
+        if self.surface == Surface::Feedback {
+            return self.handle_feedback_key(key);
         }
         if self.surface == Surface::Main && !self.is_slash_palette_active() {
             match key {
@@ -3953,6 +4787,21 @@ impl App {
             } if self.surface == Surface::Telemetry => {
                 self.escape_stop_until = None;
                 self.cancel_secret_entry();
+            }
+            // Model search: Esc goes back to the provider screen.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::ModelSearch => {
+                self.escape_stop_until = None;
+                self.composer.clear();
+                self.open_surface(Surface::Provider);
+            }
+            // OpenAI auth sub-dialogue: Esc goes back to the provider list.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::OpenAiAuth => {
+                self.escape_stop_until = None;
+                self.open_surface(Surface::Provider);
             }
             KeyEvent {
                 code: KeyCode::Esc, ..
@@ -4113,7 +4962,9 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.submit()?,
-            _ if matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
+            _ if (matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
+                || (self.surface == Surface::ModelSearch
+                    && self.model_search_has_filter_input()))
                 && self.handle_api_key_key(key) => {}
             // A leading `/` opens the slash palette popup. Once the composer
             // has text, slash is regular prompt input.
@@ -4475,12 +5326,10 @@ impl App {
                 }
                 _ => self.cancel_secret_entry(),
             },
-            Surface::Model => {
-                let model_index = self
-                    .selected_row
-                    .min(self.model_choices.len().saturating_sub(1));
-                self.dispatch(AppCommand::SaveModel(model_index))?;
-            }
+            Surface::Provider => self.provider_surface_select()?,
+            Surface::OpenAiAuth => self.openai_auth_select()?,
+            Surface::Model => self.model_surface_select()?,
+            Surface::ModelSearch => self.model_search_select()?,
             Surface::Mode => {
                 self.close_surface();
                 self.dispatch(AppCommand::SetCollaborationMode(
@@ -4496,12 +5345,21 @@ impl App {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
-            Surface::Goal => self.close_surface(),
+            Surface::Context | Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
                 0 => self.dispatch(AppCommand::ConfigureTelemetry)?,
                 _ => self.close_surface(),
             },
+            Surface::Feedback => {
+                // Feedback key handling is done in handle_feedback_key; Enter
+                // here is a no-op (the early return in handle_key prevents
+                // reaching execute_surface_selection while Feedback is active).
+            }
+            Surface::FeedbackThanks => {
+                self.surface = Surface::Main;
+                self.feedback_thanks_started = None;
+            }
             Surface::Main => {
                 self.close_surface();
             }
@@ -4510,10 +5368,14 @@ impl App {
     }
 
     fn execute_first_run_setup_selection(&mut self) -> Result<()> {
-        let idx = self
-            .selected_row
-            .min(ACCOUNT_CHOICES.len().saturating_sub(1));
-        let account = ACCOUNT_CHOICES[idx].to_string();
+        let choices = self.setup_account_choices()?;
+        let Some(account) = choices
+            .get(self.selected_row.min(choices.len().saturating_sub(1)))
+            .copied()
+        else {
+            return Ok(());
+        };
+        let account = account.to_string();
         self.setup_pending_account = Some(account);
         self.setup_result = None;
         self.open_surface(Surface::SetupConfirm);
@@ -4635,8 +5497,12 @@ impl App {
         self.setup_result = None;
         self.setup_pending_account = None;
         self.account = account;
-        if let Some(index) = self.pending_model_after_auth.take() {
-            return self.save_model(index);
+        if let Some(choice) = self.pending_model_after_auth.take() {
+            return self.save_model_with_choice(choice);
+        }
+        if !self.setup_complete {
+            let account = self.account.clone();
+            return self.open_provider_model_search(&account);
         }
         self.advance_after_auth()
     }
@@ -4721,7 +5587,12 @@ impl App {
     }
 
     fn execute_cancelled_selection(&mut self) -> Result<()> {
-        match self.selected_row.min(2) {
+        let max_row = if self.selected_session_is_paused() {
+            1
+        } else {
+            2
+        };
+        match self.selected_row.min(max_row) {
             0 => {}
             1 => self.dispatch(AppCommand::NewTask)?,
             _ => self.dispatch(AppCommand::OpenHistory)?,
@@ -4733,6 +5604,7 @@ impl App {
         match action {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
+            PaletteAction::Context => self.open_surface(Surface::Context),
             PaletteAction::Goal => self.show_current_goal()?,
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
@@ -4741,6 +5613,7 @@ impl App {
             PaletteAction::Reload => self.dispatch(AppCommand::Reload)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
             PaletteAction::Exit => return Ok(true),
+            PaletteAction::Feedback => self.dispatch(AppCommand::OpenFeedback)?,
         }
         Ok(false)
     }
@@ -4772,6 +5645,221 @@ impl App {
         }
         Ok(())
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Feedback
+
+    fn or_create_install_id(&mut self) -> Result<String> {
+        if let Some(id) = self.store.get_setting(FEEDBACK_INSTALL_ID_SETTING)? {
+            return Ok(id);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        self.store.set_setting(FEEDBACK_INSTALL_ID_SETTING, &id)?;
+        Ok(id)
+    }
+
+    fn handle_feedback_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match self.feedback.step {
+            FeedbackStep::Category => {
+                let count = FeedbackCategory::ALL.len();
+                match key.code {
+                    KeyCode::Up => {
+                        if self.feedback.category_index > 0 {
+                            self.feedback.category_index -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if self.feedback.category_index + 1 < count {
+                            self.feedback.category_index += 1;
+                        }
+                    }
+                    KeyCode::Char('1') => self.feedback.category_index = 0,
+                    KeyCode::Char('2') => self.feedback.category_index = 1,
+                    KeyCode::Char('3') => self.feedback.category_index = 2,
+                    KeyCode::Char('4') => self.feedback.category_index = 3,
+                    KeyCode::Char('5') => self.feedback.category_index = 4,
+                    KeyCode::Enter => {
+                        self.feedback.step = FeedbackStep::Description;
+                    }
+                    KeyCode::Esc => {
+                        self.close_surface();
+                    }
+                    _ => {}
+                }
+            }
+            FeedbackStep::Description => match key.code {
+                KeyCode::Enter => {
+                    // The "Upload logs?" step only makes sense when there's a
+                    // session whose event log we could attach. On the home
+                    // screen (no selected session) there are no logs to share,
+                    // so submit the feedback directly without that step.
+                    if self.selected_session_id.is_some() {
+                        self.feedback.step = FeedbackStep::UploadLogs;
+                    } else {
+                        self.feedback.upload_yes = false;
+                        self.submit_feedback()?;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.feedback.description.pop();
+                }
+                KeyCode::Esc => {
+                    self.feedback.step = FeedbackStep::Category;
+                }
+                KeyCode::Char(ch)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.feedback.description.push(ch);
+                }
+                _ => {}
+            },
+            FeedbackStep::UploadLogs => match key.code {
+                KeyCode::Up | KeyCode::Left => {
+                    self.feedback.upload_yes = true;
+                }
+                KeyCode::Down | KeyCode::Right => {
+                    self.feedback.upload_yes = false;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.feedback.upload_yes = true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.feedback.upload_yes = false;
+                }
+                KeyCode::Enter => {
+                    self.submit_feedback()?;
+                }
+                KeyCode::Esc => {
+                    self.feedback.step = FeedbackStep::Description;
+                }
+                _ => {}
+            },
+        }
+        Ok(false)
+    }
+
+    fn submit_feedback(&mut self) -> Result<()> {
+        let category = FeedbackCategory::ALL
+            .get(self.feedback.category_index)
+            .copied()
+            .unwrap_or(FeedbackCategory::Other);
+        let description = if self.feedback.description.trim().is_empty() {
+            None
+        } else {
+            Some(self.feedback.description.trim().to_string())
+        };
+        let include_logs = self.feedback.upload_yes;
+        let session_id = self.selected_session_id.clone();
+        let session_events: Option<serde_json::Value> = if include_logs {
+            session_id.as_deref().map(|id| {
+                let events = self.cached_events_for_session(id);
+                serde_json::to_value(events).unwrap_or(serde_json::Value::Null)
+            })
+        } else {
+            None
+        };
+        let app_version = env!("CARGO_PKG_VERSION").to_string();
+        let os = std::env::consts::OS.to_string();
+        // Only attach a model when the feedback is about an actual session.
+        // Home-screen feedback has no run context, so leave it null instead of
+        // recording the default selection.
+        let model = if session_id.is_some() {
+            let sel = self.current_model_selection();
+            if sel.provider_model.is_empty() {
+                None
+            } else {
+                Some(sel.provider_model)
+            }
+        } else {
+            None
+        };
+        let install_id = self.or_create_install_id().unwrap_or_default();
+
+        let base_url =
+            std::env::var("BUT_FEEDBACK_URL").unwrap_or_else(|_| FEEDBACK_INGEST_URL.to_string());
+        let url = format!("{base_url}/feedback");
+
+        let payload = serde_json::json!({
+            "category": category.api_value(),
+            "description": description,
+            "include_logs": include_logs,
+            "session_id": session_id,
+            "session_events": session_events,
+            "app_version": app_version,
+            "os": os,
+            "model": model,
+            "install_id": install_id,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        self.feedback_rx = Some(rx);
+
+        // The TUI event loop is not running inside a Tokio runtime, so we can't
+        // `tokio::spawn` here (that panics with "no reactor running"). Run the
+        // POST on a dedicated OS thread with its own current-thread runtime and
+        // report the result back over the channel.
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = tx.blocking_send(FeedbackSubmitResult::Err(error.to_string()));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let result = async {
+                    let client = reqwest::Client::new();
+                    client
+                        .post(&url)
+                        .json(&payload)
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .error_for_status()
+                        .map_err(|e| e.to_string())?;
+                    Ok::<(), String>(())
+                }
+                .await;
+                let outcome = match result {
+                    Ok(()) => FeedbackSubmitResult::Ok,
+                    Err(e) => FeedbackSubmitResult::Err(e),
+                };
+                let _ = tx.send(outcome).await;
+            });
+        });
+
+        self.surface = Surface::FeedbackThanks;
+        self.feedback_thanks_started = Some(Instant::now());
+        Ok(())
+    }
+
+    fn drain_feedback_notifications(&mut self) -> Result<bool> {
+        let Some(rx) = self.feedback_rx.as_mut() else {
+            return Ok(false);
+        };
+        match rx.try_recv() {
+            Ok(FeedbackSubmitResult::Ok) => {
+                self.feedback_rx = None;
+                Ok(true)
+            }
+            Ok(FeedbackSubmitResult::Err(e)) => {
+                self.status_notice = Some(format!("Feedback send failed: {e}"));
+                self.feedback_rx = None;
+                Ok(true)
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(false),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.feedback_rx = None;
+                Ok(false)
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
 
     fn request_reexec(&mut self) -> Result<()> {
         // Close the slash palette and any other overlay BEFORE the exec so
@@ -4818,6 +5906,14 @@ impl App {
     }
 
     fn advance_after_auth(&mut self) -> Result<()> {
+        // The /model provider flow connects first, then lets the user choose from
+        // the provider's live model list. First-run setup keeps auto-picking a
+        // default so onboarding stays one step.
+        if self.pending_model_search_after_auth {
+            self.pending_model_search_after_auth = false;
+            let account = self.account.clone();
+            return self.open_provider_model_search(&account);
+        }
         if let Some(index) = self.default_model_for_account(&self.account) {
             return self.save_model(index);
         }
@@ -4833,6 +5929,13 @@ impl App {
             .cloned()
             .or_else(|| fallback_model_choices().into_iter().next())
             .context("no model choices available")?;
+        self.save_model_with_choice(choice)
+    }
+
+    /// Apply a concrete model choice (a catalog row, a provider-scoped row, or a
+    /// synthetic free-text OpenRouter model) — persisting it and routing through
+    /// auth if the provider isn't ready yet.
+    fn save_model_with_choice(&mut self, choice: ModelChoice) -> Result<()> {
         self.model = choice.display.clone();
         self.account = choice.account.to_string();
         self.provider_model = choice.provider_model.clone();
@@ -4841,13 +5944,13 @@ impl App {
         self.model_configured = true;
         self.track_model_selected();
         if self.account == ACCOUNT_CODEX && !self.has_codex_login()? {
-            self.pending_model_after_auth = Some(index);
+            self.pending_model_after_auth = Some(choice);
             self.start_codex_device_login(self.account.clone())?;
             return Ok(());
         }
         self.persist_runtime_settings()?;
         if !self.account_ready(&self.account)? {
-            self.pending_model_after_auth = Some(index);
+            self.pending_model_after_auth = Some(choice);
             self.start_auth_flow(self.account.clone())?;
             return Ok(());
         }
@@ -4858,10 +5961,10 @@ impl App {
             }
             self.complete_setup()?;
             self.persist_runtime_settings()?;
-            self.status_notice = None;
-        } else {
-            self.status_notice = Some(format!("Model set to {}.", self.model));
         }
+        // No top "Model set to X" notice — the active model already shows in the
+        // composer status line at the bottom.
+        self.status_notice = None;
         if let Some(session_id) = self.selected_session_id.as_deref() {
             if self
                 .store
@@ -5321,12 +6424,14 @@ impl App {
         let choice = BROWSER_CHOICES
             .get(index.min(BROWSER_CHOICES.len().saturating_sub(1)))
             .unwrap_or(&BROWSER_CHOICES[0]);
+        let previous_browser = self.browser.clone();
         self.browser = (*choice).to_string();
         self.track_browser_selected();
         self.persist_runtime_settings()?;
+        self.append_browser_backend_change_if_needed(&previous_browser)?;
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             self.status_notice = Some(
-                "Browser Use cloud key is required before cloud browser tasks can run.".to_string(),
+                "Browser Use Cloud key is required before cloud browser tasks can run.".to_string(),
             );
             self.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
             return Ok(());
@@ -5340,6 +6445,24 @@ impl App {
         } else {
             self.close_surface();
         }
+        Ok(())
+    }
+
+    fn append_browser_backend_change_if_needed(&mut self, previous_browser: &str) -> Result<()> {
+        if previous_browser == self.browser {
+            return Ok(());
+        }
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Ok(());
+        };
+        self.store.append_event(
+            session_id,
+            "browser.backend_changed",
+            serde_json::json!({
+                "previous_browser": previous_browser,
+                "browser": self.browser,
+            }),
+        )?;
         Ok(())
     }
 
@@ -5358,8 +6481,10 @@ impl App {
             self.store
                 .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, secret.trim())?;
             if !return_to_cookie_sync {
+                let previous_browser = self.browser.clone();
                 self.browser = BROWSER_USE_CLOUD.to_string();
                 self.persist_runtime_settings()?;
+                self.append_browser_backend_change_if_needed(&previous_browser)?;
             }
             self.api_key_account = None;
             self.pending_cookie_sync_after_auth = false;
@@ -5367,7 +6492,7 @@ impl App {
                 self.open_cookie_sync()?;
                 return Ok(());
             }
-            self.status_notice = Some("Saved Browser Use cloud key.".to_string());
+            self.status_notice = Some("Saved Browser Use Cloud key.".to_string());
             if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
                 self.complete_setup()?;
                 self.close_surface();
@@ -5391,8 +6516,8 @@ impl App {
             return Ok(());
         }
         self.status_notice = Some(format!("Saved {}.", auth_secret_label(&account)));
-        if let Some(index) = self.pending_model_after_auth.take() {
-            return self.save_model(index);
+        if let Some(choice) = self.pending_model_after_auth.take() {
+            return self.save_model_with_choice(choice);
         }
         self.advance_after_auth()
     }
@@ -5527,9 +6652,31 @@ impl App {
         Ok(())
     }
 
+    /// Whether a codex login exists OUTSIDE our own OAuth store keys (an external
+    /// `~/.codex/auth.json`, managed auth, or env). Drives the "Codex login
+    /// detected" provider row so it appears only for a pre-existing login.
+    fn has_external_codex_login(&self) -> bool {
+        load_codex_managed_auth().is_ok() || load_codex_auth().is_ok() || codex_env_auth_present()
+    }
+
+    fn setup_account_choices(&self) -> Result<Vec<&'static str>> {
+        let mut choices = Vec::new();
+        if self.account_ready(ACCOUNT_CODEX)? {
+            choices.push(ACCOUNT_CODEX);
+        }
+        choices.extend([
+            ACCOUNT_OPENAI,
+            ACCOUNT_ANTHROPIC,
+            ACCOUNT_OPENROUTER,
+            ACCOUNT_DEEPSEEK,
+        ]);
+        Ok(choices)
+    }
+
     fn cancel_auth_entry(&mut self) {
         self.api_key_account = None;
         self.pending_model_after_auth = None;
+        self.pending_model_search_after_auth = false;
         self.pending_cookie_sync_after_auth = false;
         if !self.setup_complete {
             self.setup_pending_account = None;
@@ -5570,7 +6717,9 @@ impl App {
     }
 
     fn setup_row_count(&self) -> usize {
-        ACCOUNT_CHOICES.len()
+        self.setup_account_choices()
+            .map(|choices| choices.len())
+            .unwrap_or_else(|_| ACCOUNT_CHOICES.len().saturating_sub(1))
     }
 
     fn cookie_sync_row_count(&self) -> usize {
@@ -5831,15 +6980,20 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
-            Surface::Model => self.model_choices.len(),
-            Surface::Mode => 1,
+            Surface::Provider => RECOMMENDED_MODELS.len() + self.provider_rows().len(),
+            Surface::OpenAiAuth => self.openai_auth_rows().len(),
+            Surface::Model => self.model_surface_row_count(),
+            Surface::ModelSearch => self.model_search_row_count(),
+            Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::CookieSync => self.cookie_sync_row_count(),
-            Surface::Goal => 0,
+            Surface::Context | Surface::Goal => 0,
             Surface::History => self.history_visible_indices()?.len(),
             Surface::Messages => self.message_action_rows().len(),
             Surface::Developer => 1,
+            Surface::Feedback => 0,
+            Surface::FeedbackThanks => 0,
         })
     }
 
@@ -5931,6 +7085,7 @@ impl App {
         let state = self.workbench_state()?;
         Ok(match self.product_state(&state) {
             ProductState::Failed => 4,
+            ProductState::Cancelled if self.selected_session_is_paused() => 0,
             ProductState::Cancelled => 3,
             _ => 0,
         })
@@ -5977,6 +7132,10 @@ impl App {
 
     fn tick_live_spinner(&mut self) {
         self.live_spinner_frame = self.live_spinner_frame.wrapping_add(1);
+    }
+
+    fn should_animate_feedback_thanks(&self) -> bool {
+        self.surface == Surface::FeedbackThanks
     }
 
     #[cfg(test)]
@@ -6111,7 +7270,7 @@ impl App {
     fn browser_notice(&self) -> Result<Option<String>> {
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             Ok(Some(
-                "Browser Use cloud key is missing. Set BROWSER_USE_API_KEY or choose Local Chrome."
+                "Browser Use Cloud key is missing. Set BROWSER_USE_API_KEY or choose Local Chrome."
                     .to_string(),
             ))
         } else {
@@ -6318,7 +7477,7 @@ fn cookie_sync_success_message(value: &serde_json::Value) -> String {
         .get("cloud_profile")
         .and_then(|profile| profile.get("name"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("Browser Use cloud profile");
+        .unwrap_or("Browser Use Cloud profile");
     let synced_count = value
         .get("synced_cookie_count")
         .and_then(serde_json::Value::as_u64)
@@ -6403,7 +7562,7 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
-        BROWSER_USE_CLOUD => "Browser Use cloud key",
+        BROWSER_USE_CLOUD => "Browser Use Cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "credential",
     }
@@ -7010,6 +8169,8 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_codex_login_notifications()?;
             draw_needed |= app.drain_clipboard_paste_notifications()?;
             draw_needed |= app.drain_cookie_sync_notifications()?;
+            draw_needed |= app.drain_provider_fetch()?;
+            draw_needed |= app.drain_feedback_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -7047,6 +8208,9 @@ fn run_terminal(mut app: App) -> Result<()> {
             if app.is_home_examples_active() {
                 poll_interval = poll_interval.min(TYPEWRITER_TICK_INTERVAL);
             }
+            if app.should_animate_feedback_thanks() {
+                poll_interval = poll_interval.min(Duration::from_millis(FEEDBACK_THANKS_FRAME_MS));
+            }
             if !event::poll(poll_interval)? {
                 // Animate the welcome-screen logo by advancing the anim and
                 // triggering a redraw every ~70ms while the welcome surface
@@ -7072,6 +8236,17 @@ fn run_terminal(mut app: App) -> Result<()> {
                         draw_needed = true;
                     }
                     last_typewriter_tick = Instant::now();
+                }
+                // Handle FeedbackThanks animation and auto-dismiss.
+                if app.should_animate_feedback_thanks() {
+                    if app
+                        .feedback_thanks_started
+                        .is_some_and(|t| t.elapsed() >= FEEDBACK_THANKS_AUTO_DISMISS)
+                    {
+                        app.surface = Surface::Main;
+                        app.feedback_thanks_started = None;
+                    }
+                    draw_needed = true;
                 }
                 continue;
             }
@@ -7208,6 +8383,7 @@ impl TerminalDriver {
         }
         maybe_emit_native_transcript(&mut self.terminal, app)?;
         self.terminal.draw(|frame| render(frame, app))?;
+        draw_live_link_overlay(self.terminal.backend_mut(), app)?;
         if let Some(overlay) = manual_overlay.as_ref() {
             draw_manual_modal_overlay(self.terminal.backend_mut(), overlay)?;
         }
@@ -7350,6 +8526,52 @@ fn clear_manual_modal_overlay_rect(
         }
     }
     queue!(target, ResetColor, SetAttribute(Attribute::Reset))?;
+    target.flush()?;
+    Ok(())
+}
+
+/// OSC-8 hyperlink wrapper: `<open>text<close>`. The visible glyphs in `text`
+/// are reprinted between the open/close so the terminal tags exactly those
+/// cells with `url` as the click target.
+///
+/// `url`/`text` originate from an untrusted browser-provided live URL
+fn live_link_osc8(url: &str, text: &str) -> String {
+    let url = strip_terminal_controls(url);
+    let text = strip_terminal_controls(text);
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
+/// Remove control characters that could inject terminal escape sequences.
+fn strip_terminal_controls(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+/// Paint the live-view URL as a clickable OSC-8 hyperlink directly onto the
+/// terminal after the frame has been flushed. ratatui drew the visible
+/// (truncated) text already; here we reprint just those glyphs wrapped in the
+/// hyperlink escapes so the full URL becomes the click target. Done post-draw
+/// to avoid corrupting ratatui's cell-width diff (see `LiveLinkOverlay`).
+fn draw_live_link_overlay(target: &mut CrosstermBackend<io::Stdout>, app: &App) -> Result<()> {
+    let overlay = app.live_link_overlay.borrow();
+    let Some(link) = overlay.as_ref() else {
+        return Ok(());
+    };
+    if link.text.is_empty() {
+        return Ok(());
+    }
+    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((0, 0));
+    if link.row >= term_h || link.col >= term_w {
+        return Ok(());
+    }
+    queue!(
+        target,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(ratatui_color_to_crossterm(link.fg)),
+        MoveTo(link.col, link.row),
+        Print(live_link_osc8(&link.url, &link.text)),
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+    )?;
     target.flush()?;
     Ok(())
 }
@@ -8779,7 +10001,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn single_escape_stops_active_task_without_double_escape() -> Result<()> {
+    fn single_escape_pauses_active_task_without_double_escape() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, temp.path())?;
@@ -8803,6 +10025,14 @@ mod redesign_tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.cancel_requested"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.cancelled"
+                && event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SESSION_PAUSED_REASON)
+        }));
         assert_eq!(
             app.store
                 .load_session(&session.id)?
@@ -8811,6 +10041,50 @@ mod redesign_tests {
         );
         assert!(app.escape_stop_until.is_none());
         assert_ne!(app.surface, Surface::Messages);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Conversation paused"));
+        assert!(screen.contains(
+            "What should the model do differently? If something went wrong, please use /feedback :)"
+        ));
+        assert!(!screen.contains("Conversation paused -"));
+        assert!(!screen.contains("Session paused"));
+        assert!(!screen.contains("Previous work"));
+        assert!(!screen.contains("Start a new task"));
+        Ok(())
+    }
+
+    #[test]
+    fn paused_detection_uses_latest_cancel_event() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep working"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.cancelled",
+            serde_json::json!({"reason": SESSION_PAUSED_REASON}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        assert!(app.selected_session_is_paused());
+        assert_eq!(app.main_selection_count()?, 0);
+
+        app.store.append_event(
+            &session.id,
+            "session.cancelled",
+            serde_json::json!({"reason": SESSION_STOPPED_REASON}),
+        )?;
+        app.refresh_state_cache_from_store()?;
+
+        assert!(!app.selected_session_is_paused());
+        assert_eq!(app.main_selection_count()?, 3);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Previous work"), "{screen}");
         Ok(())
     }
 
@@ -9268,10 +10542,14 @@ mod redesign_tests {
     fn surface_heading_for_test(surface: Surface) -> &'static str {
         match surface {
             Surface::Account => "Authenticate",
+            Surface::Provider => "Model",
+            Surface::OpenAiAuth => "Model",
             Surface::Model => "Model",
+            Surface::ModelSearch => "Model",
             Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
             Surface::CookieSync => "Cookie Sync",
+            Surface::Context => "Context",
             Surface::Goal => "Goal",
             Surface::History => "History",
             Surface::Messages => "Messages",
@@ -9279,6 +10557,7 @@ mod redesign_tests {
             Surface::ApiKey => "API key",
             Surface::Telemetry => "Laminar",
             Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
+            Surface::Feedback | Surface::FeedbackThanks => "Feedback",
             Surface::Main => "",
         }
     }
@@ -9550,7 +10829,14 @@ mod redesign_tests {
         assert!(screen.contains("Choose a provider below."));
         assert!(screen.contains("PROVIDERS"));
         assert!(!screen.contains("CHOOSE PROVIDER"));
-        assert!(screen.contains("Codex login"));
+        if app
+            .setup_account_choices()?
+            .contains(&settings::ACCOUNT_CODEX)
+        {
+            assert!(screen.contains("Continue with Codex login"));
+        } else {
+            assert!(!screen.contains("Codex login"));
+        }
         assert!(!screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
         assert!(screen.contains("click me!"));
@@ -9574,16 +10860,17 @@ mod redesign_tests {
             .set_setting("auth.codex.account_id", "codex-test-account")?;
 
         // Up/Down navigate the provider rows and wrap around the edges.
+        let setup_count = app.setup_row_count();
         assert_eq!(app.selected_row, 0);
-        for _ in 0..ACCOUNT_CHOICES.len() - 1 {
+        for _ in 0..setup_count - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
-        assert_eq!(app.selected_row, ACCOUNT_CHOICES.len() - 1);
+        assert_eq!(app.selected_row, setup_count - 1);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert_eq!(app.selected_row, 0);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
-        assert_eq!(app.selected_row, ACCOUNT_CHOICES.len() - 1);
-        for _ in 0..ACCOUNT_CHOICES.len() - 1 {
+        assert_eq!(app.selected_row, setup_count - 1);
+        for _ in 0..setup_count - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
         }
         assert_eq!(app.selected_row, 0);
@@ -9593,7 +10880,7 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Use Codex login?"));
+        assert!(screen.contains("Continue with Codex login?"));
         assert!(!app.setup_complete);
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
@@ -9603,10 +10890,16 @@ mod redesign_tests {
         assert!(!app.setup_complete);
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
+
+        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
         assert_eq!(app.account, "Codex login");
-        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert!(app.status_notice.is_none());
         let screen = render_dump(&mut app)?;
@@ -9690,13 +10983,13 @@ mod redesign_tests {
 
             let _screen = render_dump(&mut app)?;
             // NOTE: the ready/welcome screen no longer carries the
-            // "Browser Use cloud needs key" warning. That warning still
+            // "Browser Use Cloud needs key" warning. That warning still
             // shows on the BrowserSelect surface (asserted below); the
             // welcome screen redesign needs a follow-up surface for it.
 
             app.open_surface(Surface::BrowserSelect);
             let screen = render_dump(&mut app)?;
-            assert!(screen.contains("Browser Use cloud . needs key"));
+            assert!(screen.contains("Browser Use Cloud . needs key"));
             Ok(())
         })();
         if let Some(value) = saved {
@@ -9759,6 +11052,87 @@ mod redesign_tests {
                 Some(session_id.as_str()),
                 "pending_auth_resume should point to the nudge session"
             );
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn switching_to_cloud_without_key_records_backend_change_before_auth() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let session = app.store.create_session(None, std::env::current_dir()?)?;
+            app.store.append_event(
+                &session.id,
+                "browser.state",
+                serde_json::json!({"url": "https://example.com", "title": "Example"}),
+            )?;
+            app.selected_session_id = Some(session.id.clone());
+            app.open_surface(Surface::BrowserSelect);
+            app.selected_row = BROWSER_CHOICES
+                .iter()
+                .position(|browser| *browser == BROWSER_USE_CLOUD)
+                .context("cloud browser choice")?;
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::ApiKey);
+            assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
+
+            let events = app.store.events_for_session(&session.id)?;
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == "browser.backend_changed"));
+            let state = app.workbench_state()?;
+            assert_eq!(state.browser.backend, BROWSER_USE_CLOUD);
+            assert_eq!(state.browser.url, None);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn saving_cloud_key_records_backend_change_when_it_selects_cloud() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let session = app.store.create_session(None, std::env::current_dir()?)?;
+            app.store.append_event(
+                &session.id,
+                "browser.state",
+                serde_json::json!({"url": "https://example.com", "title": "Example"}),
+            )?;
+            app.selected_session_id = Some(session.id.clone());
+
+            app.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
+            app.set_input("bu-test-key".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+            let events = app.store.events_for_session(&session.id)?;
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == "browser.backend_changed"));
+            let state = app.workbench_state()?;
+            assert_eq!(state.browser.backend, BROWSER_USE_CLOUD);
+            assert_eq!(state.browser.url, None);
             Ok(())
         })();
         if let Some(value) = saved {
@@ -10153,8 +11527,11 @@ mod redesign_tests {
         assert!(completed_screen.contains("inspect top alignment"));
         assert!(!completed_screen.contains("• answer"));
         assert!(!completed_screen.contains("• done"));
-        // Footer status bar surfaces the active model and a context-fill bar.
-        assert!(completed_screen.contains("24.5k/60k"));
+        // Legacy model.usage still contributes cost, but it no longer fabricates
+        // a 60k context meter before Codex-style token_count metadata exists.
+        assert!(completed_screen.contains("$0.0731"));
+        assert!(!completed_screen.contains("24.5k/60k"));
+        assert!(!completed_screen.contains("context left"));
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
         let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
         assert!(composer_row > result_row);
@@ -10187,11 +11564,11 @@ mod redesign_tests {
             serde_json::json!({
                 "info": {
                     "last_token_usage": {
-                        "input_tokens": 0,
+                        "input_tokens": 12345,
                         "cached_input_tokens": 0,
-                        "output_tokens": 0,
-                        "reasoning_output_tokens": 0,
-                        "total_tokens": 12345
+                        "output_tokens": 4000,
+                        "reasoning_output_tokens": 1000,
+                        "total_tokens": 17345
                     },
                     "total_token_usage": {
                         "input_tokens": 20,
@@ -10220,8 +11597,278 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
 
         assert!(screen.contains("12.3k/100k"));
+        assert!(!screen.contains("17.3k/100k"));
         assert!(!screen.contains("999/60k"));
         assert!(screen.contains("$0.0123"));
+        Ok(())
+    }
+
+    #[test]
+    fn context_surface_shows_current_window_attribution() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect context usage"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": {"code": "return document.body.innerText"}
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.output",
+            serde_json::json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "output": "visible page content ".repeat(500)
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Context attribution is visible."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 14000,
+                        "cached_input_tokens": 8000,
+                        "output_tokens": 500,
+                        "reasoning_output_tokens": 500,
+                        "total_tokens": 15000
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 42000,
+                        "cached_input_tokens": 2000,
+                        "output_tokens": 2000,
+                        "reasoning_output_tokens": 1000,
+                        "total_tokens": 47000
+                    },
+                    "model_context_window": 128000
+                },
+                "rate_limits": null,
+                "turn_idx": 0
+            }),
+        )?;
+
+        // The agent records the real system prompt + per-tool schema sizes here;
+        // they never appear as message events, so this is what lets the view
+        // attribute the window without an "Unattributed" bucket.
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({
+                "model": "gpt-5.5",
+                "provider": "openai",
+                "turn_idx": 0,
+                "attempt": 0,
+                "composition": {
+                    "system_prompt_tokens": 6400,
+                    "tools": [
+                        {"name": "browser_script", "tokens": 2100},
+                        {"name": "python", "tokens": 1300},
+                        {"name": "shell", "tokens": 900}
+                    ]
+                }
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("Context"));
+        // Real window headline from the provider.
+        assert!(screen.contains("128k"));
+        // With the composition recorded, system prompt + tools are split out.
+        assert!(screen.contains("System prompt"));
+        assert!(screen.contains("Tool definitions"));
+        // Conversation categories still attributed from message events.
+        assert!(screen.contains("Tool outputs"));
+        // No mystery bucket and no raw message-text labels.
+        assert!(!screen.contains("Unattributed"));
+        assert!(!screen.contains("base instructions"));
+        Ok(())
+    }
+
+    #[test]
+    fn context_surface_respects_latest_zero_input_tokens() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect context usage"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 50000, "total_tokens": 50500 },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 0
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 0, "total_tokens": 0 },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 1
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("0/128k"));
+        assert!(screen.contains("No context yet."));
+        assert!(!screen.contains("50k/128k"));
+        assert!(!screen.contains("User messages"));
+        Ok(())
+    }
+
+    // Without a recorded composition (older sessions), the rest of the window is
+    // shown as a single "System prompt + tools" row so the breakdown still
+    // covers the whole window — nothing hidden behind a disclaimer.
+    #[test]
+    fn context_surface_shows_system_and_tools_when_not_recorded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "summarize the page"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": {"code": "return document.body.innerText"}
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.output",
+            serde_json::json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "output": "visible page content ".repeat(400)
+            }),
+        )?;
+        // Real window is much larger than the ~5k of conversation; the rest is
+        // the system prompt + tool schemas this old session never recorded.
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 50000, "total_tokens": 50500 },
+                    "model_context_window": 258400
+                },
+                "turn_idx": 0
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let screen = render_dump(&mut app)?;
+
+        // The bulk of the window is shown, not hidden behind a disclaimer.
+        assert!(screen.contains("System prompt + tools"));
+        assert!(screen.contains("Tool outputs"));
+        assert!(!screen.contains("not recorded"));
+        assert!(!screen.contains("Unattributed"));
+        Ok(())
+    }
+
+    // The usage bar must actually paint each category in its own color (the
+    // text dump can't show this), so inspect the rendered buffer cells.
+    #[test]
+    fn context_surface_colors_bar_segments_by_category() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "summarize the page"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": {"code": "return document.body.innerText"}
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.output",
+            serde_json::json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "output": "visible page content ".repeat(300)
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": { "input_tokens": 40000, "total_tokens": 40500 },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 0
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({
+                "composition": {
+                    "system_prompt_tokens": 6400,
+                    "tools": [{"name": "browser_script", "tokens": 2100}]
+                }
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let colors = render::render_filled_block_colors(&mut app)?;
+
+        // Each category's segment + swatch is painted in its own palette color.
+        assert!(colors.contains(&crate::theme::context_category_color("System prompt")));
+        assert!(colors.contains(&crate::theme::context_category_color("Tool definitions")));
+        assert!(colors.contains(&crate::theme::context_category_color("Tool outputs")));
+        // Distinct colors, not one flat fill.
+        assert!(colors.len() >= 3);
         Ok(())
     }
 
@@ -10399,6 +12046,10 @@ mod redesign_tests {
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
         assert!(!screen.lines().any(|line| line.contains("/mode ")));
+        assert!(!app
+            .slash_palette_items()
+            .iter()
+            .any(|item| item.command == "/mode"));
         assert!(!screen.contains("/plan"));
         assert!(screen.contains("/model"));
         assert!(!screen.contains("/auth"));
@@ -11027,7 +12678,11 @@ wire_api = "responses"
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.open_surface(Surface::Setup);
-        app.selected_row = 1;
+        app.selected_row = app
+            .setup_account_choices()?
+            .iter()
+            .position(|account| *account == settings::ACCOUNT_OPENAI)
+            .context("OpenAI setup row")?;
 
         let screen = render_dump(&mut app)?;
         assert!(!screen.contains("Claude Code subscription"));
@@ -11049,7 +12704,11 @@ wire_api = "responses"
         );
 
         app.open_surface(Surface::Setup);
-        app.selected_row = 3;
+        app.selected_row = app
+            .setup_account_choices()?
+            .iter()
+            .position(|account| *account == settings::ACCOUNT_OPENROUTER)
+            .context("OpenRouter setup row")?;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
         assert_eq!(
@@ -11158,13 +12817,33 @@ wire_api = "responses"
         );
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Connected with Codex auth."));
-        assert!(screen.contains("A default model will be selected automatically."));
+        assert!(screen.contains("Continue to choose a model."));
+        assert!(screen.contains("> Choose model"));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_CODEX);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
+        assert_eq!(
+            app.model_search_rows(),
+            vec![
+                "gpt-5.5",
+                "gpt-5.5-pro",
+                "gpt-5.4",
+                "gpt-5.4-pro",
+                "gpt-5.4-nano",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+            ]
+        );
+        assert!(!app.model_search_has_filter_input());
+
+        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
-        assert_eq!(app.account, settings::ACCOUNT_CODEX);
-        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         Ok(())
     }
 
@@ -11183,7 +12862,7 @@ wire_api = "responses"
                 .iter()
                 .position(|choice| {
                     choice.account == settings::ACCOUNT_ANTHROPIC
-                        && choice.provider_model == "claude-opus-4-7"
+                        && choice.provider_model == "claude-opus-4-8"
                 })
                 .context("Anthropic Opus model row")?;
             app.selected_row = opus_index;
@@ -11195,7 +12874,12 @@ wire_api = "responses"
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::ApiKey);
-            assert_eq!(app.pending_model_after_auth, Some(opus_index));
+            assert_eq!(
+                app.pending_model_after_auth
+                    .as_ref()
+                    .map(|choice| choice.provider_model.as_str()),
+                Some("claude-opus-4-8")
+            );
             assert_eq!(
                 app.api_key_account.as_deref(),
                 Some(settings::ACCOUNT_ANTHROPIC)
@@ -11205,8 +12889,8 @@ wire_api = "responses"
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::Main);
             assert_eq!(app.account, settings::ACCOUNT_ANTHROPIC);
-            assert_eq!(app.model, "Claude Opus 4.7");
-            assert_eq!(app.provider_model, "claude-opus-4-7");
+            assert_eq!(app.model, "Claude Opus 4.8");
+            assert_eq!(app.provider_model, "claude-opus-4-8");
             Ok(())
         })();
         if let Some(value) = saved_anthropic {
@@ -11219,10 +12903,294 @@ wire_api = "responses"
     }
 
     #[test]
+    fn change_model_opens_provider_first_screen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        assert_eq!(app.surface, Surface::Provider);
+        // Row count = recommended quick-picks + the computed provider rows (the
+        // "Codex login (detected)" row is machine-dependent, so compare to the
+        // computed list rather than a fixed number).
+        assert_eq!(
+            app.selectable_row_count()?,
+            RECOMMENDED_MODELS.len() + app.provider_rows().len()
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("recommended"), "{screen}");
+        assert!(screen.contains("providers"), "{screen}");
+        assert!(screen.contains(RECOMMENDED_MODELS[0].display), "{screen}");
+        assert!(screen.contains("OpenAI"), "{screen}");
+        assert!(screen.contains("Anthropic · API key"), "{screen}");
+        assert!(screen.contains("OpenRouter · API key"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_rows_collapse_openai_into_a_submenu() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = ready_app(&temp)?;
+        let rows = app.provider_rows();
+        // OpenAI is a single row that opens the auth sub-dialogue.
+        let openai = rows
+            .iter()
+            .find(|row| row.label == "OpenAI")
+            .expect("OpenAI row");
+        assert!(openai.submenu);
+        assert_eq!(openai.account, settings::ACCOUNT_CODEX);
+        // No split "OpenAI · sign in" / "OpenAI · API key" rows anymore.
+        assert!(!rows.iter().any(|row| row.label.contains("OpenAI ·")));
+        // Other providers are single non-submenu rows; Anthropic stays BYOK-only.
+        assert!(rows
+            .iter()
+            .any(|row| row.label == "Anthropic · API key"
+                && row.account == settings::ACCOUNT_ANTHROPIC));
+        assert!(!rows
+            .iter()
+            .any(|row| row.label.contains("Anthropic · sign in")));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_screen_cursor_starts_on_current_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        // Current model is a recommended pick → cursor + current land on its
+        // recommended row (top).
+        app.model_configured = true;
+        app.account = RECOMMENDED_MODELS[1].account.to_string();
+        app.provider_model = RECOMMENDED_MODELS[1].provider_model.to_string();
+        assert_eq!(app.current_recommended_index(), Some(1));
+        app.open_surface(Surface::Provider);
+        assert_eq!(app.selected_row, 1);
+
+        // Current model is NOT a recommended pick → cursor + current land on the
+        // matching provider row (bottom).
+        app.account = settings::ACCOUNT_OPENROUTER.to_string();
+        app.provider_model = "vendor/custom-model".to_string();
+        assert_eq!(app.current_recommended_index(), None);
+        let or_row = app
+            .provider_rows()
+            .iter()
+            .position(|row| row.account == settings::ACCOUNT_OPENROUTER)
+            .context("openrouter provider row")?;
+        app.open_surface(Surface::Provider);
+        assert_eq!(app.selected_row, RECOMMENDED_MODELS.len() + or_row);
+        Ok(())
+    }
+
+    #[test]
+    fn openai_row_opens_auth_submenu_with_methods() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        // OAuth sign-in is gone; OpenAI connects via API key (or a detected Codex
+        // login). The API-key method is always offered.
+        let methods: Vec<OpenAiAuthMethod> = app
+            .openai_auth_rows()
+            .iter()
+            .map(|row| row.method)
+            .collect();
+        assert!(methods.contains(&OpenAiAuthMethod::ApiKey));
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Use an API key"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn recommended_quick_pick_applies_model_when_connected() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        // Use the OpenRouter recommended (deterministic auth: a stored key).
+        let idx = RECOMMENDED_MODELS
+            .iter()
+            .position(|rec| rec.account == settings::ACCOUNT_OPENROUTER)
+            .context("openrouter recommended")?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "sk-or-test")?;
+        app.select_recommended(idx)?;
+        assert_eq!(app.provider_model, RECOMMENDED_MODELS[idx].provider_model);
+        assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_selection_is_auth_first_then_searches_models() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        // Without a key, selecting OpenRouter asks for the key first (auth-first).
+        app.select_provider(settings::ACCOUNT_OPENROUTER)?;
+        assert_eq!(app.surface, Surface::ApiKey);
+        // With a key, it goes straight to the searchable model list.
+        app.store
+            .set_setting("auth.openrouter.api_key", "sk-or-test")?;
+        app.select_provider(settings::ACCOUNT_OPENROUTER)?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENROUTER));
+        // Typeahead filters the seeded ids; the raw query is offered too.
+        app.composer.set_input("kimi".to_string());
+        let rows = app.model_search_rows();
+        assert!(rows.iter().any(|id| id.contains("kimi")));
+        app.composer.set_input("vendor/brand-new-model".to_string());
+        let rows = app.model_search_rows();
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("vendor/brand-new-model")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_provider_search_uses_curated_model_set() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-test")?;
+
+        app.select_provider(settings::ACCOUNT_OPENAI)?;
+
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
+        assert!(!app.model_search_has_filter_input());
+        assert_eq!(
+            app.model_search_rows(),
+            vec![
+                "gpt-5.5",
+                "gpt-5.5-pro",
+                "gpt-5.4",
+                "gpt-5.4-pro",
+                "gpt-5.4-nano",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+            ]
+        );
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))?);
+        assert!(app.composer.input().is_empty());
+        assert!(!app
+            .model_search_rows()
+            .iter()
+            .any(|id| id == "not-a-real-openai-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn non_openai_searchable_providers_allow_typed_model_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.selected_provider = Some(settings::ACCOUNT_ANTHROPIC);
+        app.composer.set_input("claude-custom-local".to_string());
+
+        assert!(app.model_search_has_filter_input());
+        assert_eq!(
+            app.model_search_rows().first().map(String::as_str),
+            Some("claude-custom-local")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_curated_model_list_scrolls_without_phantom_search_header() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-test")?;
+        app.select_provider(settings::ACCOUNT_OPENAI)?;
+        app.args.height = 10;
+        app.selected_row = app.model_search_row_count().saturating_sub(1);
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("gpt-5.3-codex"));
+        assert!(
+            !screen.contains("gpt-5.5\n"),
+            "top OpenAI row should scroll away instead of being pinned as a hidden search header:\n{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_search_is_uncapped_recommended_then_grouped_by_provider() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.selected_provider = Some(settings::ACCOUNT_OPENROUTER);
+        // A long list across several vendors, plus a bundled "recommended"
+        // id, a tool-less model, and an obscure-vendor model.
+        let model = |id: &str, vision: bool, tools: Option<bool>| ProviderModel {
+            id: id.to_string(),
+            name: None,
+            vision,
+            supports_tools: tools,
+        };
+        let mut models: Vec<ProviderModel> = (0..40)
+            .map(|i| model(&format!("deepseek/model-{i:02}"), false, Some(true)))
+            .collect();
+        models.push(model("qwen/vision-x", true, Some(true))); // vision
+        models.push(model("moonshotai/kimi-k2.5", false, Some(true))); // recommended
+        models.push(model("deepseek/notools", false, Some(false))); // hidden: no tools
+        models.push(model("aion-labs/aion-2.0", false, Some(true))); // obscure vendor, still browsable
+        app.provider_models = models;
+
+        let rows = app.model_search_rows();
+        assert!(rows.len() >= 43);
+        // Only tool-less models are hidden; every tool-capable vendor is browsable.
+        assert!(!rows.iter().any(|id| id == "deepseek/notools"));
+        assert!(rows.iter().any(|id| id == "aion-labs/aion-2.0"));
+        // The hidden tool-less model can still be typed in directly (free-text).
+        app.composer.set_input("deepseek/notools".to_string());
+        assert!(app
+            .model_search_rows()
+            .iter()
+            .any(|id| id == "deepseek/notools"));
+        app.composer.set_input(String::new());
+        // Vision is detectable per-model.
+        assert!(app.provider_model_is_vision("qwen/vision-x"));
+        assert!(!app.provider_model_is_vision("deepseek/model-00"));
+
+        let entries = app.model_search_entries();
+        // Recommended section leads, and includes the bundled id.
+        assert!(matches!(&entries[0], ModelSearchEntry::Header(h) if h == "recommended"));
+        assert!(entries
+            .iter()
+            .any(|e| matches!(e, ModelSearchEntry::Item(id) if id == "moonshotai/kimi-k2.5")));
+        // Provider group headers appear, alphabetically (deepseek before qwen).
+        let headers: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| match e {
+                ModelSearchEntry::Header(h) => Some(h.as_str()),
+                _ => None,
+            })
+            .collect();
+        let ds = headers.iter().position(|h| *h == "deepseek");
+        let qw = headers.iter().position(|h| *h == "qwen");
+        assert!(ds.is_some() && qw.is_some() && ds < qw, "{headers:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn save_provider_model_persists_raw_id_for_selected_provider() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "sk-or-test")?;
+        app.selected_provider = Some(settings::ACCOUNT_OPENROUTER);
+        app.save_provider_model("vendor/custom-xl".to_string())?;
+        assert_eq!(app.provider_model, "vendor/custom-xl");
+        assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
+        assert_eq!(app.agent_backend, settings::AgentBackend::Openrouter);
+        Ok(())
+    }
+
+    #[test]
     fn setup_api_key_flow_keeps_key_entry_in_modal_then_confirms_saved() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
-        app.selected_row = 1;
+        app.selected_row = app
+            .setup_account_choices()?
+            .iter()
+            .position(|account| *account == settings::ACCOUNT_OPENAI)
+            .context("OpenAI setup row")?;
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
@@ -11249,10 +13217,16 @@ wire_api = "responses"
         );
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
+
+        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
-        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
-        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         Ok(())
     }
 
@@ -11274,7 +13248,8 @@ wire_api = "responses"
 
         let first_run_temp = tempfile::tempdir()?;
         let mut first_run_app = App::new(args(&first_run_temp))?;
-        assert_nav(&mut first_run_app, ACCOUNT_CHOICES.len())?;
+        let first_run_setup_count = first_run_app.setup_row_count();
+        assert_nav(&mut first_run_app, first_run_setup_count)?;
 
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -11289,9 +13264,10 @@ wire_api = "responses"
         ] {
             app.open_surface(surface);
             let count = match surface {
-                Surface::Setup | Surface::Account => ACCOUNT_CHOICES.len(),
+                Surface::Setup => app.setup_row_count(),
+                Surface::Account => ACCOUNT_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
-                Surface::Mode => 1,
+                Surface::Mode => 2,
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
                 Surface::CookieSync => app.cookie_sync_row_count(),
                 _ => unreachable!(),
@@ -11418,6 +13394,8 @@ wire_api = "responses"
     fn browser_live_url_is_visible_in_browser_panel() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store.set_setting("browser", BROWSER_USE_CLOUD)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
             &session.id,
@@ -11435,6 +13413,49 @@ wire_api = "responses"
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("live view"));
         assert!(screen.contains("https://live.browser-use.com/?wss=example"));
+        Ok(())
+    }
+
+    #[test]
+    fn switching_from_cloud_to_local_clears_live_url_source() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store.set_setting("browser", BROWSER_USE_CLOUD)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Done"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+
+        let local_index = BROWSER_CHOICES
+            .iter()
+            .position(|choice| *choice == BROWSER_LOCAL_CHROME)
+            .context("local browser choice")?;
+        app.save_browser(local_index)?;
+        let state = app.workbench_state()?;
+        assert_eq!(state.browser.backend, BROWSER_LOCAL_CHROME);
+        assert_eq!(state.browser.live_url, None);
+
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "browser.backend_changed"));
+        let screen = render_dump(&mut app)?;
+        assert!(!screen.contains("live https://live.browser-use.com"));
+        assert!(!screen.contains("source https://live.browser-use.com"));
         Ok(())
     }
 
@@ -12438,6 +14459,35 @@ wire_api = "responses"
     }
 
     #[test]
+    fn live_link_osc8_binds_full_url_to_truncated_text() {
+        // The visible text is truncated, but the OSC-8 target is the full URL
+        // (including the CDP endpoint that the status line couldn't fit).
+        let full = "https://live.browser-use.com/?wss=wss%3A%2F%2Fcdp";
+        let shown = "https://live.browser-...";
+        assert_eq!(
+            live_link_osc8(full, shown),
+            format!("\x1b]8;;{full}\x1b\\{shown}\x1b]8;;\x1b\\")
+        );
+    }
+
+    #[test]
+    fn live_link_osc8_strips_control_chars_to_prevent_escape_injection() {
+        // A crafted live URL with ESC/BEL must not break out of the OSC-8
+        // sequence and inject terminal escapes.
+        let out = live_link_osc8("https://x.test/\x1b]0;pwned\x07?a=1", "https://x...\x1b[2J");
+        assert_eq!(
+            out.matches('\x1b').count(),
+            4,
+            "expected only framing ESCs, got {out:?}"
+        );
+        assert!(!out.contains('\x07'), "BEL must be stripped: {out:?}");
+        assert_eq!(
+            out,
+            "\x1b]8;;https://x.test/]0;pwned?a=1\x1b\\https://x...[2J\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
     fn wrapped_native_links_use_the_full_url_for_each_visible_fragment() {
         let lines = vec![
             Line::from(ratatui::text::Span::styled(
@@ -13332,8 +15382,9 @@ wire_api = "responses"
 
         let screen = render_dump(&mut app)?;
         let composer_row = row_containing(&screen, "Ask a follow-up");
-        let status_row = row_containing(&screen, "/60k");
+        let status_row = row_containing(&screen, "$0.0412");
         assert!(status_row >= composer_row + 2);
+        assert!(!screen.contains("/60k"));
         assert!(!screen.contains("describe this repo"));
         assert!(!screen.contains("go say hi to aitor"));
         assert!(!screen.contains("It is a Rust browser-agent workbench."));
@@ -14311,6 +16362,7 @@ wire_api = "responses"
             Surface::Browser,
             Surface::BrowserSelect,
             Surface::CookieSync,
+            Surface::Context,
             Surface::Account,
         ] {
             app.open_surface(surface);
@@ -15126,11 +17178,11 @@ wire_api = "responses"
     }
 
     #[test]
-    fn escape_once_stops_initial_prompt_without_reclaiming_running_task() -> Result<()> {
+    fn escape_once_reclaims_initial_prompt_before_output() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
-        app.store.append_event(
+        let submitted = app.store.append_event(
             &session.id,
             "session.input",
             serde_json::json!({"text": "whats up"}),
@@ -15150,11 +17202,8 @@ wire_api = "responses"
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
 
-        assert!(app.composer.input().is_empty());
-        assert_eq!(
-            app.selected_session_id.as_deref(),
-            Some(session.id.as_str())
-        );
+        assert_eq!(app.composer.input(), "whats up");
+        assert_eq!(app.selected_session_id, None);
         assert!(!app.escape_stop_is_pending());
         assert_eq!(app.surface, Surface::Main);
         assert_eq!(
@@ -15164,12 +17213,13 @@ wire_api = "responses"
             Some(SessionStatus::Cancelled)
         );
         let events = app.store.events_for_session(&session.id)?;
-        assert!(events
-            .iter()
-            .any(|event| event.event_type == "session.cancel_requested"));
-        assert!(!events
-            .iter()
-            .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_ROLLBACK_EVENT
+                && event.payload["action"] == "take_back"
+                && event.payload["source"] == "tui_escape"
+                && event.payload["target_seq"] == submitted.seq
+                && event.payload["num_turns"] == 1
+        }));
         let visible_submissions =
             browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
                 .into_iter()
@@ -15181,12 +17231,53 @@ wire_api = "responses"
                 })
                 .filter_map(event_payload_text)
                 .collect::<Vec<_>>();
-        assert_eq!(visible_submissions, vec!["whats up"]);
+        assert!(visible_submissions.is_empty());
         Ok(())
     }
 
     #[test]
-    fn escape_once_stops_followup_without_reclaiming_running_task() -> Result<()> {
+    fn escape_reclaim_treats_runtime_lifecycle_as_pre_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        let submitted = app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "take this back"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "agent.resumed",
+            serde_json::json!({
+                "agent_id": session.id,
+                "root_id": session.id,
+                "payload": {
+                    "agent_path": "/root",
+                    "materialized_from_replay": true,
+                    "role": "default",
+                },
+            }),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert_eq!(app.composer.input(), "take this back");
+        assert!(app
+            .store
+            .events_for_session(&session.id)?
+            .iter()
+            .any(|event| {
+                event.event_type == SESSION_ROLLBACK_EVENT
+                    && event.payload["action"] == "take_back"
+                    && event.payload["target_seq"] == submitted.seq
+            }));
+        Ok(())
+    }
+
+    #[test]
+    fn escape_once_reclaims_followup_before_output_without_clearing_history() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -15215,19 +17306,13 @@ wire_api = "responses"
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
 
-        assert!(app.composer.input().is_empty());
+        assert_eq!(app.composer.input(), "revise this");
         assert_eq!(
             app.selected_session_id.as_deref(),
             Some(session.id.as_str())
         );
         assert!(!app.escape_stop_is_pending());
         let events = app.store.events_for_session(&session.id)?;
-        assert!(events
-            .iter()
-            .any(|event| event.event_type == "session.cancel_requested"));
-        assert!(!events
-            .iter()
-            .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
         let visible_submissions =
             browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
                 .into_iter()
@@ -15239,12 +17324,12 @@ wire_api = "responses"
                 })
                 .filter_map(event_payload_text)
                 .collect::<Vec<_>>();
-        assert_eq!(visible_submissions, vec!["initial task", "revise this"]);
+        assert_eq!(visible_submissions, vec!["initial task"]);
         Ok(())
     }
 
     #[test]
-    fn escape_once_does_not_reclaim_after_streamed_output() -> Result<()> {
+    fn escape_once_pauses_after_streamed_output() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -15272,6 +17357,29 @@ wire_api = "responses"
         assert!(!events
             .iter()
             .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.cancelled"
+                && event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SESSION_PAUSED_REASON)
+        }));
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Cancelled)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Conversation paused"));
+        assert!(screen.contains(
+            "What should the model do differently? If something went wrong, please use /feedback :)"
+        ));
+        assert!(!screen.contains("Conversation paused -"));
+        assert!(!screen.contains("Session paused"));
+        assert!(!screen.contains("Previous work"));
+        assert!(!screen.contains("Start a new task"));
         Ok(())
     }
 
@@ -15313,7 +17421,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn escape_stops_running_task_without_opening_message_selector() -> Result<()> {
+    fn ctrl_c_stops_running_task() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let running = app.store.create_session(None, std::env::current_dir()?)?;
@@ -15329,17 +17437,24 @@ wire_api = "responses"
         )?;
         app.selected_session_id = Some(running.id.clone());
 
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
-        assert!(!app.escape_stop_is_pending());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL))?);
         assert_eq!(
             app.store
                 .load_session(&running.id)?
                 .map(|session| session.status),
             Some(SessionStatus::Cancelled)
         );
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.cancelled"
+                && event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SESSION_STOPPED_REASON)
+        }));
+        assert_eq!(app.surface, Surface::Main);
         let screen = render_dump(&mut app)?;
-        assert!(!screen.contains("esc again to edit messages"));
-        assert_ne!(app.surface, Surface::Messages);
         assert_eq!(app.surface, Surface::Main);
         assert!(screen.contains("stopped"));
         Ok(())

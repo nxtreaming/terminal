@@ -3152,7 +3152,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
         AuthCommand::Status => {
             print_api_key_status(
                 store,
-                "Browser Use cloud key",
+                "Browser Use Cloud key",
                 BROWSER_USE_CLOUD_API_KEY_SETTING,
                 &["BROWSER_USE_API_KEY"],
             )?;
@@ -3262,7 +3262,7 @@ fn auth_login(
                 read_required_secret(api_key, &format!("{} API key", auth_account_label(account)))?;
             let key = api_key_setting(account).context("account does not use an API key")?;
             store.set_setting(key, api_key.trim())?;
-            store.set_setting("browser", "Browser Use cloud")?;
+            store.set_setting("browser", "Browser Use Cloud")?;
             println!("{}: connected (stored)", auth_account_label(account));
             Ok(())
         }
@@ -3728,7 +3728,7 @@ fn auth_account_label(account: AuthAccount) -> &'static str {
     match account {
         AuthAccount::Codex => "Codex login",
         AuthAccount::ClaudeCode => "Claude Code login",
-        AuthAccount::BrowserUseCloud => "Browser Use cloud",
+        AuthAccount::BrowserUseCloud => "Browser Use Cloud",
         AuthAccount::Openai => "OpenAI API key",
         AuthAccount::Anthropic => "Anthropic API key",
         AuthAccount::Openrouter => "OpenRouter API key",
@@ -5463,6 +5463,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         max_turns: config.max_turns,
         max_context_chars: AgentRunOptions::default().max_context_chars,
         browser_mode: Some(config.browser_mode.clone()),
+        dynamic_browser_mode_from_store: AgentRunOptions::default().dynamic_browser_mode_from_store,
         collaboration_mode: AgentRunOptions::default().collaboration_mode,
         include_environment_context: true,
         include_permissions_instructions: true,
