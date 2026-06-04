@@ -133,7 +133,22 @@ def test_agent_stream_yields_runtime_events_and_final_history() -> None:
 async def _test_agent_stream_yields_runtime_events_and_final_history() -> None:
     runtime = FakeRuntime(
         run_delay=0.01,
-        run_result={"history": {"output": "streamed", "success": True}},
+        run_result={
+            "history": {"output": "streamed", "success": True},
+            "final_projected_event": {
+                "kind": "turn_completed",
+                "payload": {"success": True, "result": "streamed"},
+                "snapshot": {
+                    "agents": [
+                        {
+                            "agent_id": "agent-1",
+                            "session_id": "session-2",
+                            "status": "completed",
+                        }
+                    ]
+                },
+            },
+        },
     )
     browser = Browser(_runtime=runtime)  # type: ignore[arg-type]
     agent = Agent("stream?", llm=ChatBrowserUse(model="bu-2-0"), browser=browser)
@@ -142,6 +157,7 @@ async def _test_agent_stream_yields_runtime_events_and_final_history() -> None:
 
     assert events[0]["type"] == "agent.snapshot"
     assert events[1]["kind"] == "thread_status_changed"
+    assert events[-2]["kind"] == "turn_completed"
     assert events[-1]["type"] == "agent.completed"
     assert events[-1]["output"] == "streamed"
     assert events[-1]["history"].final_result() == "streamed"

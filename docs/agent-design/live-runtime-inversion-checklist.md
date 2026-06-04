@@ -293,11 +293,11 @@ BrowserUseRuntime
       - [x] browser status
       - [x] token usage
       - [x] final result/failure
-- [ ] Projection guarantees snapshot-before-live-event ordering.
-- [ ] Projection sends final status before `run_agent` resolves.
+- [x] Projection guarantees snapshot-before-live-event ordering.
+- [x] Projection sends final status before `run_agent` resolves.
 - [ ] TUI consumes projection for active sessions.
-- [ ] SDK consumes projection for `stream()`.
-- [ ] Raw runtime event stream remains opt-in for debugging.
+- [x] SDK consumes projection for `stream()`.
+- [x] Raw runtime event stream remains opt-in for debugging.
 
 ## Work Package 10: TUI Integration
 

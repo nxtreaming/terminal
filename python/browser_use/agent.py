@@ -100,6 +100,7 @@ class Agent:
             yield {"type": "agent.snapshot", "snapshot": snapshot}
             run_task = asyncio.create_task(self.browser.runtime.call("agent.run", params))
             self._active_run_id = self.session_id
+            saw_terminal_projection = False
             try:
                 while True:
                     event_task = asyncio.create_task(queue.get())
@@ -108,7 +109,11 @@ class Agent:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if event_task in done:
-                        yield event_task.result()
+                        event = event_task.result()
+                        saw_terminal_projection = (
+                            saw_terminal_projection or _is_terminal_projected_event(event)
+                        )
+                        yield event
                     else:
                         event_task.cancel()
                     if run_task in done:
@@ -116,14 +121,32 @@ class Agent:
                             task.cancel()
                         result = run_task.result()
                         for event in _drain_queue(queue):
+                            saw_terminal_projection = (
+                                saw_terminal_projection
+                                or _is_terminal_projected_event(event)
+                            )
                             yield event
                         try:
                             event = await asyncio.wait_for(queue.get(), timeout=0.05)
+                            saw_terminal_projection = (
+                                saw_terminal_projection
+                                or _is_terminal_projected_event(event)
+                            )
                             yield event
                             for event in _drain_queue(queue):
+                                saw_terminal_projection = (
+                                    saw_terminal_projection
+                                    or _is_terminal_projected_event(event)
+                                )
                                 yield event
                         except asyncio.TimeoutError:
                             pass
+                        final_projected = (result or {}).get("final_projected_event")
+                        if (
+                            isinstance(final_projected, dict)
+                            and not saw_terminal_projection
+                        ):
+                            yield final_projected
                         history = AgentHistoryList.from_protocol(
                             result or {},
                             output_model_schema=self.output_model_schema,
@@ -220,3 +243,28 @@ def _drain_queue(queue: asyncio.Queue[Dict[str, Any]]) -> List[Dict[str, Any]]:
             drained.append(queue.get_nowait())
         except asyncio.QueueEmpty:
             return drained
+
+
+def _is_terminal_projected_event(event: Dict[str, Any]) -> bool:
+    kind = event.get("kind")
+    if kind in {"turn_completed", "thread_status_changed"}:
+        snapshot = event.get("snapshot")
+        if isinstance(snapshot, dict):
+            agents = snapshot.get("agents")
+            if isinstance(agents, list):
+                for agent in agents:
+                    if not isinstance(agent, dict):
+                        continue
+                    if agent.get("status") in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "closed",
+                    }:
+                        return True
+        payload = event.get("payload")
+        if isinstance(payload, dict) and (
+            "result" in payload or "error" in payload or "success" in payload
+        ):
+            return True
+    return False

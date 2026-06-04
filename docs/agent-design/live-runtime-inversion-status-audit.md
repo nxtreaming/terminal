@@ -75,6 +75,10 @@ BrowserUseRuntime
   projected runtime events separately from raw debug events, and Python
   `Agent.stream()` consumes the projected event queue after yielding an initial
   agent snapshot.
+- SDK JSON-RPC live projected events are reducer-backed. `agent.run` also
+  returns an in-band `final_projected_event` so Python streaming can yield a
+  terminal projection before `agent.completed` even if the background event
+  forwarder races the JSON-RPC response.
 - Projected runtime subscriptions now carry a reducer-backed
   `RuntimeSnapshot`. The reducer materializes child spawn events from their
   payload, keeps parent threads open for child-terminal transcript events,

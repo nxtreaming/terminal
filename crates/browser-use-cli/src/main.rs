@@ -71,7 +71,7 @@ use browser_use_runtime::{
     CompleteAgentRequest, CreateRootAgentRequest, FailAgentRequest, LiveThreadPersistence,
     LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    RuntimeEventProjection, RuntimeHandle, SessionId, SpawnChildRequest, SqliteJournal, StateIndex,
+    RuntimeHandle, RuntimeProjectionState, SessionId, SpawnChildRequest, SqliteJournal, StateIndex,
     SubmitInputRequest,
 };
 #[cfg(test)]
@@ -3820,6 +3820,7 @@ fn sdk_server_stdio(store: &Store) -> Result<()> {
             .name("browser-use-sdk-event-forwarder".to_string())
             .spawn(move || -> Result<()> {
                 let mut rx = runtime.events().subscribe();
+                let mut projection = RuntimeProjectionState::new(runtime.snapshot());
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_time()
                     .build()
@@ -3828,7 +3829,7 @@ fn sdk_server_stdio(store: &Store) -> Result<()> {
                     while !stop.load(Ordering::Relaxed) {
                         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                             Ok(Ok(event)) => {
-                                let projected = RuntimeEventProjection::project(&event);
+                                let projected = projection.apply_event(&event);
                                 let session_id =
                                     event.session_id.as_ref().map(|id| id.as_str().to_string());
                                 let run_id = event
@@ -4127,6 +4128,14 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     let events = context.store.events_for_session(session_id.as_str())?;
     let output = session_result_from_events(&events);
     let error = failure_from_events(&events);
+    let final_projected_event = sdk_final_projected_event(
+        context,
+        &agent_id,
+        &session_id,
+        &events,
+        output.as_deref(),
+        error.as_deref(),
+    )?;
     let event_values = events
         .iter()
         .map(|event| {
@@ -4145,7 +4154,123 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
             "done": true,
             "errors": error.into_iter().collect::<Vec<_>>(),
             "events": event_values,
+        },
+        "final_projected_event": final_projected_event,
+    }))
+}
+
+fn sdk_final_projected_event(
+    context: &SdkServerContext,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+    events: &[browser_use_protocol::EventRecord],
+    output: Option<&str>,
+    error: Option<&str>,
+) -> Result<Value> {
+    let mut snapshot = context.runtime.snapshot();
+    if let Some(agent) = snapshot
+        .agents
+        .iter_mut()
+        .find(|agent| &agent.agent_id == agent_id || &agent.session_id == session_id)
+    {
+        for event in events {
+            match event.event_type.as_str() {
+                "model.stream_delta" => {
+                    if let Some(text) = event
+                        .payload
+                        .get("text")
+                        .or_else(|| event.payload.get("delta"))
+                        .and_then(Value::as_str)
+                    {
+                        agent.live.last_model_delta = Some(text.to_string());
+                    }
+                }
+                "model.thinking_delta" => {
+                    if let Some(text) = event
+                        .payload
+                        .get("text")
+                        .or_else(|| event.payload.get("delta"))
+                        .and_then(Value::as_str)
+                    {
+                        agent.live.last_model_thinking_delta = Some(text.to_string());
+                    }
+                }
+                "token_count" => {
+                    if let Some(info) = event.payload.get("info") {
+                        agent.live.last_token_usage = info.get("last_token_usage").cloned();
+                        agent.live.total_token_usage = info.get("total_token_usage").cloned();
+                        agent.live.model_context_window =
+                            info.get("model_context_window").and_then(Value::as_i64);
+                    }
+                }
+                "session.done" => {
+                    agent.live.final_result = event
+                        .payload
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    agent.live.failure = None;
+                    agent.live.active_items.clear();
+                }
+                "session.failed" | "stream_error" | "model.turn.error" => {
+                    agent.live.failure = event
+                        .payload
+                        .get("error")
+                        .or_else(|| event.payload.get("message"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    agent.live.active_items.clear();
+                }
+                _ => {}
+            }
         }
+        if agent.live.final_result.is_none() {
+            agent.live.final_result = output.map(str::to_string);
+        }
+        if agent.live.failure.is_none() {
+            agent.live.failure = error.map(str::to_string);
+        }
+    }
+    let source_event_id = events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "agent.turn.completed"
+                    | "agent.turn.aborted"
+                    | "session.done"
+                    | "session.failed"
+                    | "session.cancelled"
+            )
+        })
+        .and_then(|event| {
+            event
+                .payload
+                .get("runtime_event_id")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            events.iter().rev().find_map(|event| {
+                event
+                    .payload
+                    .get("runtime_event_id")
+                    .and_then(Value::as_str)
+            })
+        })
+        .unwrap_or_else(|| session_id.as_str());
+    Ok(serde_json::json!({
+        "source_event_id": source_event_id,
+        "kind": if error.is_some() { "thread_status_changed" } else { "turn_completed" },
+        "session_id": session_id.as_str(),
+        "payload": {
+            "runtime_owned": true,
+            "source": "agent.run.final_projection",
+            "success": error.is_none(),
+            "result": output,
+            "error": error,
+        },
+        "snapshot": snapshot,
     }))
 }
 
@@ -6780,6 +6905,15 @@ command = "test-mcp"
         assert_eq!(result["result"]["history"]["success"], true);
         assert_eq!(
             result["result"]["history"]["output"],
+            serde_json::Value::String("Fake result for: inspect".to_string())
+        );
+        assert_eq!(
+            result["result"]["final_projected_event"]["kind"],
+            serde_json::Value::String("turn_completed".to_string())
+        );
+        assert_eq!(
+            result["result"]["final_projected_event"]["snapshot"]["agents"][0]["live"]
+                ["final_result"],
             serde_json::Value::String("Fake result for: inspect".to_string())
         );
         let events = context.store.events_for_session(session_id)?;
