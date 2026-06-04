@@ -2331,13 +2331,13 @@ impl App {
         self.cached_events_for_session(session_id)
             .iter()
             .rev()
-            .any(|event| {
-                event.event_type == "session.cancelled"
-                    && event
-                        .payload
-                        .get("reason")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(SESSION_PAUSED_REASON)
+            .find(|event| event.event_type == "session.cancelled")
+            .is_some_and(|event| {
+                event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SESSION_PAUSED_REASON)
             })
     }
 
@@ -9777,6 +9777,41 @@ mod redesign_tests {
         assert!(!screen.contains("Session paused"));
         assert!(!screen.contains("Previous work"));
         assert!(!screen.contains("Start a new task"));
+        Ok(())
+    }
+
+    #[test]
+    fn paused_detection_uses_latest_cancel_event() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep working"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.cancelled",
+            serde_json::json!({"reason": SESSION_PAUSED_REASON}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        assert!(app.selected_session_is_paused());
+        assert_eq!(app.main_selection_count()?, 0);
+
+        app.store.append_event(
+            &session.id,
+            "session.cancelled",
+            serde_json::json!({"reason": SESSION_STOPPED_REASON}),
+        )?;
+        app.refresh_state_cache_from_store()?;
+
+        assert!(!app.selected_session_is_paused());
+        assert_eq!(app.main_selection_count()?, 3);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Previous work"), "{screen}");
         Ok(())
     }
 
