@@ -2566,6 +2566,19 @@ fn initial_input_source_event_seq(initial_input: &Value) -> Option<i64> {
         })
 }
 
+fn final_result_from_events(events: &[EventRecord]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        if event.event_type != "session.done" {
+            return None;
+        }
+        event
+            .payload
+            .get("result")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
 impl RuntimeHandle {
     pub fn new(runtime: BrowserUseRuntime) -> Self {
         Self {
@@ -2930,13 +2943,19 @@ impl RuntimeHandle {
         if let Some(lease) = browser_lease.as_ref() {
             self.release_browser(lease)?;
         }
+        let final_result = self
+            .inner
+            .persistence
+            .events_for_session(&request.session_id)
+            .ok()
+            .and_then(|events| final_result_from_events(&events));
 
         Ok(RunAgentResponse {
             agent_id,
             session_id: request.session_id,
             run_id: request.run_id,
             final_status: AgentThreadStatus::Completed,
-            final_result: None,
+            final_result,
             usage: None,
             terminal_event_seq: terminal_append.seq,
             output,
@@ -5074,6 +5093,12 @@ mod tests {
                 assert_eq!(live.current_run_id, Some(run_id));
                 assert_eq!(live.accepted_input_count, 1);
                 assert_eq!(live.pending_prompt_input_count, 1);
+                handle_for_run.append_observed_session_event(
+                    session_id_for_run.clone(),
+                    "session.done",
+                    json!({"result": "done"}),
+                    Durability::Barrier,
+                )?;
                 Ok::<_, anyhow::Error>("done".to_string())
             })
             .await?;
@@ -5081,6 +5106,7 @@ mod tests {
         assert_eq!(response.agent_id, *root.agent_id());
         assert_eq!(response.session_id, session_id);
         assert_eq!(response.final_status, AgentThreadStatus::Completed);
+        assert_eq!(response.final_result.as_deref(), Some("done"));
         assert!(response.terminal_event_seq.is_some());
         assert_eq!(response.output, "done");
         assert!(!handle.cancel_run(root.session_id()));
