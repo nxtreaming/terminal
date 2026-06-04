@@ -1645,13 +1645,20 @@ fn live_status_for_session(
 }
 
 fn active_child_session_count(app: &App, root_id: &str) -> usize {
-    app.state_cache
+    let store_count = app
+        .state_cache
         .sessions
         .iter()
         .filter(|session| {
             session.parent_id.as_deref() == Some(root_id) && session.status.is_active()
         })
-        .count()
+        .count();
+    let runtime_count =
+        crate::runtime::runtime_active_child_session_count(&app.args.state_dir, root_id)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+    store_count.max(runtime_count)
 }
 
 fn pending_agent_mailbox_count(app: &App, session_id: &str) -> usize {

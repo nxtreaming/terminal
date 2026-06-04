@@ -25,9 +25,10 @@ use browser_use_agent::session::{
 use browser_use_agent::subagents::{display_agent_path_for_session, session_was_interrupted};
 use browser_use_protocol::{failure_from_events, session_result_from_events, SessionMeta};
 use browser_use_runtime::{
-    spawn_local_runtime_server, AgentId, BrowserUseRuntime, CompleteAgentRequest, FailAgentRequest,
-    LiveThreadPersistence, MailboxDeliveryPhase, MailboxItem, RuntimeHandle, SessionId,
-    SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
+    spawn_local_runtime_server, AgentId, AgentThreadStatus, BrowserUseRuntime,
+    CompleteAgentRequest, FailAgentRequest, LiveThreadPersistence, MailboxDeliveryPhase,
+    MailboxItem, RuntimeHandle, SessionId, SpawnChildRequest, SqliteJournal, StateIndex,
+    SubmitInputRequest,
 };
 use browser_use_store::{Store, StoreNotifier};
 
@@ -88,6 +89,40 @@ pub(crate) fn pending_runtime_trigger_turn_agent_mailbox_count(
         )),
         Err(_) => Ok(None),
     }
+}
+
+pub(crate) fn runtime_active_child_session_count(
+    state_dir: &Path,
+    root_session_id: &str,
+) -> Result<Option<usize>> {
+    let handle = existing_tui_runtime_handle(state_dir)?;
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    Ok(Some(
+        handle
+            .snapshot()
+            .agents
+            .into_iter()
+            .filter(|agent| {
+                agent
+                    .parent_session_id
+                    .as_ref()
+                    .is_some_and(|parent| parent.as_str() == root_session_id)
+                    && runtime_agent_status_is_active(&agent.status)
+            })
+            .count(),
+    ))
+}
+
+fn runtime_agent_status_is_active(status: &AgentThreadStatus) -> bool {
+    matches!(
+        status,
+        AgentThreadStatus::Created
+            | AgentThreadStatus::Queued
+            | AgentThreadStatus::Running
+            | AgentThreadStatus::Cancelling
+    )
 }
 
 pub(crate) fn has_live_runtime_agent(state_dir: &Path, session_id: &str) -> bool {

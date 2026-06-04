@@ -12518,6 +12518,11 @@ wire_api = "responses"
             Some("repo-explorer"),
             Some("explorer"),
         )?;
+        app.store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "stale durable child projection"}),
+        )?;
         app.selected_session_id = Some(parent.id.clone());
         app.refresh_state_cache_from_store()?;
 
@@ -12537,6 +12542,16 @@ wire_api = "responses"
             nickname: Some("repo-explorer".to_string()),
             role: Some("explorer".to_string()),
         })?;
+        assert_eq!(
+            runtime::runtime_active_child_session_count(&app.args.state_dir, &parent.id)?,
+            Some(1)
+        );
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+        assert!(text.contains("Working..."), "{text}");
+        assert!(text.contains("(1 subagent running)"), "{text}");
+
         runtime.send_agent_message(browser_use_runtime::SendAgentMessageRequest {
             author_agent_id: browser_use_runtime::AgentId::from_string(child.id.clone())?,
             target_agent_id: browser_use_runtime::AgentId::from_string(parent.id.clone())?,
@@ -12562,6 +12577,7 @@ wire_api = "responses"
             !app.flush_ready_agent_mailbox_continuation()?,
             "non-triggering child completion mail must not auto-resume an idle parent"
         );
+        app.refresh_state_cache_from_store()?;
         assert_eq!(
             app.store
                 .load_session(&parent.id)?
