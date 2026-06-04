@@ -1,14 +1,17 @@
 # Live Runtime Inversion Implementation Checklist
 
-This is the implementation checklist for finishing the original live-runtime
-rewrite. The current branch is a runtime-backed hybrid. This checklist is for
-the remaining inversion: the runtime owns live agent execution, while SQLite is
-only persistence, replay, and postmortem debugging.
+This is the implementation checklist and completion record for the original
+live-runtime rewrite. The branch has completed the inversion: the runtime owns
+live agent execution, while SQLite is only persistence, replay, and postmortem
+debugging.
 
-## Implementation Status: 2026-06-03
+## Implementation Status: 2026-06-04
 
 The branch is now in the intended runtime-owned shape for the normal TUI, CLI,
-and SDK execution paths:
+and SDK execution paths. `BrowserUseRuntime` is the live authority for accepted
+input, turn status, cancellation, mailbox delivery/wakeups, child status,
+browser leases, tool resources, and runtime projections. SQLite remains the
+write-through journal, durable replay source, and postmortem/debug database.
 
 ```text
 TUI / CLI / Python SDK
@@ -47,7 +50,7 @@ BrowserUseRuntime
 
 Important caveat: transcript reconstruction, session metadata, history views,
 and child bootstrap context still read/write SQLite journal rows because SQLite
-is the durable debug/replay source. Those paths must not schedule live work or
+is the durable debug/replay source. Those paths do not schedule live work or
 wake a parent by themselves. The implemented guard is that live input, mailbox
 wakeups, child completion delivery, cancellation, browser claims, and tool
 resources go through `BrowserUseRuntime`.
@@ -58,7 +61,7 @@ TUI/CLI/SDK runtime paths do not create browser sessions in the global
 `browser-use-browser` registries. The old global registries remain only behind
 compatibility wrapper APIs for non-runtime direct callers.
 
-## Current Hybrid
+## Former Hybrid Removed
 
 ```text
 TUI / CLI / Python SDK
@@ -89,6 +92,12 @@ StoreTurnState + old TurnLoop + provider/tool registry
           v
 Store reads still decide parts of live turn state
 ```
+
+This diagram is retained as the old shape the checklist was written to remove.
+The current code keeps some old public names as wrappers or compatibility
+facades, but those wrappers enter `RuntimeHandle::run_agent` before live work is
+driven. Store reads remain for replayable transcript/history context, not for
+live scheduling or wakeups.
 
 ## Required End State
 
@@ -157,7 +166,7 @@ BrowserUseRuntime
       - `crates/browser-use-tui/src/runtime.rs::spawn_tui_child_agent`
 - [x] Add compile-time or test guards that fail if new live code calls
       store-backed wait/mailbox scheduling.
-- [ ] Keep the existing successful smoke prompt as a regression:
+- [x] Keep the existing successful smoke prompt as a regression:
       `spin up 2 subagents ask them whats the capital of france and compare answers`.
 
 ## Work Package 1: Runtime API Schema
@@ -464,96 +473,134 @@ BrowserUseRuntime
 
 Runtime tests:
 
-- [ ] Runtime creates root agent and journals session.
-- [ ] Runtime starts and completes fake agent.
-- [ ] Runtime cancellation cancels active turn.
-- [ ] Journal replay hydrates completed session.
-- [ ] Journal replay hydrates pending mailbox.
-- [ ] Journal replay marks stale live resources lost/orphaned.
-- [ ] Event bus delivers ordered live events.
-- [ ] Projection serializes snapshot before live events.
-- [ ] Final projected event arrives before request resolves.
-- [ ] Critical journal failure prevents visible success/wakeup.
+- [x] Runtime creates root agent and journals session.
+- [x] Runtime starts and completes fake agent.
+- [x] Runtime cancellation cancels active turn.
+- [x] Journal replay hydrates completed session.
+- [x] Journal replay hydrates pending mailbox.
+- [x] Journal replay marks stale live resources lost/orphaned.
+- [x] Event bus delivers ordered live events.
+- [x] Projection serializes snapshot before live events.
+- [x] Final projected event arrives before request resolves.
+- [x] Critical journal failure prevents visible success/wakeup.
 
 Subagent tests:
 
-- [ ] Spawn creates child `AgentThread`.
-- [ ] Strict capacity rejects immediately.
-- [ ] Explicit queue mode queues visibly.
-- [ ] Child completion enqueues non-triggering parent mailbox item.
-- [ ] `wait_agent` returns immediately when mail is pending.
-- [ ] `wait_agent` wakes on mailbox seq change.
-- [ ] `wait_agent` timeout does not hide child status.
-- [ ] Parent idle wake schedules continuation only for `trigger_turn=true`.
-- [ ] `close_agent` cancels descendants.
-- [ ] `resume_agent` materializes durable child metadata without stale handles.
-- [ ] Full-history fork rejects model/type/reasoning overrides.
+- [x] Spawn creates child `AgentThread`.
+- [x] Strict capacity rejects immediately.
+- [x] Explicit queue mode queues visibly.
+- [x] Child completion enqueues non-triggering parent mailbox item.
+- [x] `wait_agent` returns immediately when mail is pending.
+- [x] `wait_agent` wakes on mailbox seq change.
+- [x] `wait_agent` timeout does not hide child status.
+- [x] Parent idle wake schedules continuation only for `trigger_turn=true`.
+- [x] `close_agent` cancels descendants.
+- [x] `resume_agent` materializes durable child metadata without stale handles.
+- [x] Full-history fork rejects model/type/reasoning overrides.
 
 Tool and browser tests:
 
-- [ ] `exec_command` process survives follow-up in same agent.
-- [ ] `write_stdin` cannot address another agent's process by default.
-- [ ] Agent close kills remaining exec processes.
-- [ ] Foreground exec is cancelled by turn cancel.
-- [ ] Background exec survives turn cancel and remains pollable.
-- [ ] Python worker persists across follow-up.
-- [ ] Python worker closes on agent close.
+- [x] `exec_command` process survives follow-up in same agent.
+- [x] `write_stdin` cannot address another agent's process by default.
+- [x] Agent close kills remaining exec processes.
+- [x] Foreground exec is cancelled by turn cancel.
+- [x] Background exec survives turn cancel and remains pollable.
+- [x] Python worker persists across follow-up.
+- [x] Python worker closes on agent close.
 - [x] Browser script runs are scoped to `BrowserHandle`.
-- [ ] Browser script cancel preserves partial output/artifacts.
-- [ ] Same browser concurrent agents fail fast.
-- [ ] Different browsers run in parallel.
-- [ ] MCP manager shuts down on agent/runtime close.
+- [x] Browser script cancel preserves partial output/artifacts.
+- [x] Same browser concurrent agents fail fast.
+- [x] Different browsers run in parallel.
+- [x] MCP manager shuts down on agent/runtime close.
 
 TUI tests:
 
-- [ ] Subagents stay visible while running.
-- [ ] Queued subagents stay visible.
-- [ ] Wait timeout does not blank live subagent panel.
-- [ ] Child completion appears as status/mail without hiding child.
-- [ ] Trigger-turn follow-up wakes parent and displays continuation.
-- [ ] Rollback updates live projection and history.
-- [ ] Auth-nudge resume routes through runtime.
-- [ ] History overlay still reads old SQLite sessions.
-- [ ] Terminal smoke has no stale redraws or leaked escape sequences.
+- [x] Subagents stay visible while running.
+- [x] Queued subagents stay visible.
+- [x] Wait timeout does not blank live subagent panel.
+- [x] Child completion appears as status/mail without hiding child.
+- [x] Trigger-turn follow-up wakes parent and displays continuation.
+- [x] Rollback updates live projection and history.
+- [x] Auth-nudge resume routes through runtime.
+- [x] History overlay still reads old SQLite sessions.
+- [x] Terminal smoke has no stale redraws or leaked escape sequences.
 
 SDK tests:
 
-- [ ] `Agent(task, llm).run()`.
-- [ ] `Agent.add_new_task()` preserves memory.
-- [ ] Two agents with different browsers run concurrently.
-- [ ] Two agents with same browser fail fast.
-- [ ] `agent.stop()` cancels Rust run.
-- [ ] asyncio cancellation cancels Rust run.
-- [ ] `history.final_result()`.
-- [ ] structured output validation.
+- [x] `Agent(task, llm).run()`.
+- [x] `Agent.add_new_task()` preserves memory.
+- [x] Two agents with different browsers run concurrently.
+- [x] Two agents with same browser fail fast.
+- [x] `agent.stop()` cancels Rust run.
+- [x] asyncio cancellation cancels Rust run.
+- [x] `history.final_result()`.
+- [x] structured output validation.
 
 Live smoke tests:
 
 - [x] `spin up 2 subagents ask them whats the capital of france and compare answers`
 - [x] `spin up 3 subagents research this codebase`
 - [x] spawn 3 subagents under default cap without hitting the false off-by-one limit
-- [ ] spawn many subagents above concurrency limit
+- [x] spawn many subagents above concurrency limit
 - [x] ask parent what happened after children complete
-- [ ] cancel parent with children running
-- [ ] run `browser_script` while subagents run
-- [ ] run background `exec_command`, then poll/interact with `write_stdin`
+- [x] cancel parent with children running
+- [x] run `browser_script` while subagents run
+- [x] run background `exec_command`, then poll/interact with `write_stdin`
+
+Verification evidence:
+
+- `cargo fmt --check` passed.
+- `cargo test` passed.
+- `uv run --with pytest python -m pytest -q` passed with `34 passed`.
+- `/opt/homebrew/bin/timeout -k 15s 1200s scripts/verify-terminal-ui.sh`
+  passed on 2026-06-04. Artifact inspection covered `/tmp/but-design-loop/`
+  deterministic dumps and `tui-terminal-smoke-*.txt`; no leaked escape
+  sequences, stale redraw signatures, duplicate app chrome, or panic text were
+  found.
+- Live GPT-5.5 two-subagent capital smoke passed:
+  `/tmp/but-live-runtime-subagents.rZBMCP`, root
+  `2ea16188-1f4d-4dd1-a291-c6568fa69fee`, `agent_messages=0`, mailbox
+  enqueue/deliver/consume events present.
+- Live GPT-5.5 three-subagent codebase research smoke passed:
+  `/tmp/but-live-runtime-research-fixed.Ss0NHw`, root
+  `4cd84f05-7258-46b5-a983-7981d7acec10`, three spawns, no false
+  off-by-one capacity rejection, `agent_messages=0`.
+- Live GPT-5.5 over-capacity smoke passed:
+  `/tmp/but-live-runtime-overcap.RZbsp8`, root
+  `1af30bda-c016-4adb-8fa4-5974d654822c`, three successful children, three
+  immediate capacity rejections, `agent_messages=0`.
+- Live GPT-5.5 parent-cancel-with-children smoke passed:
+  `/tmp/but-live-runtime-cancel-final.wWpbgk`, root
+  `30ad16d8-5e66-4ddd-ad7a-3494a015c77d`, all descendants ended
+  `cancelled`, cancellation request/abort/cancelled events were journaled for
+  root and children, and no child success mailbox was projected after cancel.
+- Live GPT-5.5 browser-script-plus-subagents smoke passed:
+  `/tmp/but-live-runtime-browser-script-nocdp.cdpzvk`, root
+  `eab5609f-83cf-4ac0-aefa-aa3c549df3f6`, `browser_script.started`,
+  `browser_script.completed`, `browser.claimed`, and `browser.released`
+  journaled with two subagent completions and `agent_messages=0`.
+- Live GPT-5.5 background exec/write smoke passed:
+  `/tmp/but-live-runtime-exec-stdin.norB3L`, root
+  `e0dfdff0-b15c-4872-b3e5-9ae64abbf43a`, `exec_command.begin`,
+  `command.waiting`, `terminal.interaction`, and `exec_command.end` journaled;
+  `write_stdin` delivered `hello\n` and final output contained `got:hello`.
 
 ## Final Definition Of Done
 
-- [ ] The ASCII target architecture above matches the code.
-- [ ] `BrowserUseRuntime` owns live turn execution.
-- [ ] `StoreTurnState` is not the live default.
-- [ ] `run_session_with_config*` is not a parallel live authority.
-- [ ] Store-backed subagent wait/mailbox scheduling is unreachable for live runs.
-- [ ] TUI active state comes from runtime projection.
-- [ ] SDK run/stream/cancel/follow-up goes through runtime.
-- [ ] Browser ownership and script runs are physically owned by
+- [x] The ASCII target architecture above matches the code.
+- [x] `BrowserUseRuntime` owns live turn execution.
+- [x] `StoreTurnState` is not the live default.
+- [x] `run_session_with_config*` is not a parallel live authority.
+- [x] Store-backed subagent wait/mailbox scheduling is unreachable for live runs.
+- [x] TUI active state comes from runtime projection.
+- [x] SDK run/stream/cancel/follow-up goes through runtime.
+- [x] Browser ownership and script runs are physically owned by
       `BrowserManager` end to end.
-- [ ] Tool resources are owned by `AgentThread.ToolResourceBag`.
-- [ ] Replay restores durable state and marks stale live resources lost.
-- [ ] Barrier failure tests prove SQLite never decides wakeups but still protects
+- [x] Tool resources are owned by `AgentThread.ToolResourceBag`.
+- [x] Replay restores durable state and marks stale live resources lost.
+- [x] Barrier failure tests prove SQLite never decides wakeups but still protects
       accepted facts.
-- [ ] All verification commands and live smokes above pass.
+- [x] All verification commands and live smokes above pass.
 
 ## Proposed `set_goal`
 
