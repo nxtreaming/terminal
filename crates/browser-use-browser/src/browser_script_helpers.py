@@ -413,7 +413,11 @@ def current_tab():
         "url": page.get("url", ""),
         "title": page.get("title", ""),
     }
-    for target in cdp("Target.getTargets").get("targetInfos", []):
+    try:
+        targets = cdp("Target.getTargets").get("targetInfos", [])
+    except Exception:
+        targets = []
+    for target in targets:
         if target.get("targetId") == target_id and target.get("browserContextId"):
             tab["browserContextId"] = target.get("browserContextId")
             tab["browser_context_id"] = target.get("browserContextId")

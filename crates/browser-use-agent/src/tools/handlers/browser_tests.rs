@@ -54,6 +54,8 @@ struct FakeBackend {
     commands: Mutex<Vec<String>>,
     local_profiles: Mutex<Option<serde_json::Value>>,
     local_list: Mutex<Option<serde_json::Value>>,
+    active_local_profile_id: Mutex<Option<String>>,
+    browser_page_ready: Mutex<bool>,
     last_session: Mutex<Option<String>>,
     last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
     last_timeout_secs: Mutex<Option<u64>>,
@@ -72,6 +74,14 @@ impl FakeBackend {
 
     fn set_local_list(&self, value: serde_json::Value) {
         *self.local_list.lock().unwrap() = Some(value);
+    }
+
+    fn active_local_profile_id(&self) -> Option<String> {
+        self.active_local_profile_id.lock().unwrap().clone()
+    }
+
+    fn set_browser_page_ready(&self, ready: bool) {
+        *self.browser_page_ready.lock().unwrap() = ready;
     }
 
     fn last_session(&self) -> Option<String> {
@@ -119,7 +129,26 @@ impl FakeBackend {
     }
 
     fn command_output_for(&self, command: &str) -> BrowserCommandOutput {
+        if let Some(profile_id) = command
+            .strip_prefix("browser local open --profile ")
+            .map(unquote_fake_browser_arg)
+        {
+            *self.active_local_profile_id.lock().unwrap() = Some(profile_id);
+            return Self::ok_command();
+        }
+        if command == "browser connect local" {
+            self.set_browser_page_ready(true);
+        }
         let content = match command {
+            "browser status --json" => self.local_status_json(),
+            "browser connect local" => json!({
+                "status": "connected",
+                "browser": self.local_status_json(),
+            }),
+            "browser recover reattach-same-target" => json!({
+                "status": "reattached",
+                "browser": self.local_status_json(),
+            }),
             "browser local profiles --json" => self
                 .local_profiles
                 .lock()
@@ -138,6 +167,26 @@ impl FakeBackend {
             content,
             events: vec![],
         }
+    }
+
+    fn local_status_json(&self) -> serde_json::Value {
+        let page = if *self.browser_page_ready.lock().unwrap() {
+            json!({
+                "target_id": "target-1",
+                "session_id": "session-1",
+            })
+        } else {
+            json!({
+                "target_id": null,
+                "session_id": null,
+            })
+        };
+        json!({
+            "mode": "local",
+            "connection": "connected",
+            "local_profile_id": self.active_local_profile_id(),
+            "page": page,
+        })
     }
 
     fn ok_script(status: Option<&str>, ok: bool) -> BrowserScriptOutput {
@@ -240,6 +289,15 @@ impl BrowserBackend for FakeBackend {
         // Cancel reports a completed-but-not-ok run.
         Ok(self.ok_script_with_images(None, false))
     }
+}
+
+fn unquote_fake_browser_arg(value: &str) -> String {
+    value
+        .trim()
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .unwrap_or_else(|| value.trim())
+        .replace("'\\''", "'")
 }
 
 fn tool_with(backend: Arc<FakeBackend>) -> BrowserTool {
@@ -594,6 +652,103 @@ async fn script_start_routes_to_start_script() {
         out.stdout
     );
     assert_eq!(out.exit_code, 0);
+}
+
+#[tokio::test]
+async fn script_start_switches_to_changed_default_local_profile_before_running() {
+    let backend = Arc::new(FakeBackend::default());
+    *backend.active_local_profile_id.lock().unwrap() = Some("google-chrome:Profile 1".to_string());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Default")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::execute("sess-1", "click('#go')", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.commands(),
+        vec![
+            "browser status --json".to_string(),
+            "browser local open --profile google-chrome:Default".to_string(),
+            "browser connect local".to_string(),
+        ]
+    );
+    assert_eq!(
+        backend.last(),
+        LastCall::StartScript("click('#go')".to_string())
+    );
+}
+
+#[tokio::test]
+async fn script_start_repairs_missing_local_target_before_running() {
+    let backend = Arc::new(FakeBackend::default());
+    *backend.active_local_profile_id.lock().unwrap() = Some("google-chrome:Default".to_string());
+    backend.set_browser_page_ready(false);
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Default")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::execute("sess-1", "click('#go')", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.commands(),
+        vec![
+            "browser status --json".to_string(),
+            "browser local open --profile google-chrome:Default".to_string(),
+            "browser connect local".to_string(),
+        ]
+    );
+    assert_eq!(
+        backend.last(),
+        LastCall::StartScript("click('#go')".to_string())
+    );
+}
+
+#[tokio::test]
+async fn script_start_reuses_ready_matching_local_profile_after_live_probe() {
+    let backend = Arc::new(FakeBackend::default());
+    *backend.active_local_profile_id.lock().unwrap() = Some("google-chrome:Default".to_string());
+    backend.set_browser_page_ready(true);
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Default")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::execute("sess-1", "click('#go')", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.commands(),
+        vec![
+            "browser status --json".to_string(),
+            "browser recover reattach-same-target".to_string(),
+        ]
+    );
+    assert_eq!(
+        backend.last(),
+        LastCall::StartScript("click('#go')".to_string())
+    );
 }
 
 #[tokio::test]

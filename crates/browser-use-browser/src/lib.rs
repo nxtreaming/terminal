@@ -194,6 +194,8 @@ struct BrowserSession {
     last_session_id: Option<String>,
     last_emitted_browser_payload: Option<Value>,
     preferred_target_marker: Option<String>,
+    preferred_profile_id: Option<String>,
+    active_local_profile_id: Option<String>,
     preferred_browser_context_id: Option<String>,
     logs: VecDeque<String>,
 }
@@ -220,6 +222,8 @@ impl Default for BrowserSession {
             last_session_id: None,
             last_emitted_browser_payload: None,
             preferred_target_marker: None,
+            preferred_profile_id: None,
+            active_local_profile_id: None,
             preferred_browser_context_id: None,
             logs: VecDeque::new(),
         }
@@ -1670,6 +1674,7 @@ fn open_local_profile(
             )
         })?;
     session.preferred_target_marker = Some(marker.clone());
+    session.preferred_profile_id = Some(profile.id.clone());
     Ok(json!({
         "status": "ok",
         "opened": true,
@@ -2010,6 +2015,8 @@ impl BrowserSession {
             "owner": self.owner.as_str(),
             "browser": self.browser_name,
             "profile": self.profile,
+            "local_profile_id": self.active_local_profile_id,
+            "profile_context_id": self.preferred_browser_context_id,
             "endpoint": self.endpoint.as_ref().map(|endpoint| json!({
                 "kind": endpoint.kind,
                 "http_url": endpoint.http_url,
@@ -2741,6 +2748,7 @@ impl BrowserSession {
         let preferred_marker = self.preferred_target_marker.clone();
         let mut attached_profile_marker = false;
         let mut attached_browser_context_id = None;
+        let mut attached_profile_id = None;
         let target_id = if let Some(marker) = preferred_marker.as_deref() {
             let deadline = Instant::now() + Duration::from_secs(8);
             let mut target_info = None;
@@ -2758,6 +2766,7 @@ impl BrowserSession {
                 Some(target_info) => {
                     self.preferred_target_marker = None;
                     attached_profile_marker = true;
+                    attached_profile_id = self.preferred_profile_id.take();
                     attached_browser_context_id = target_info
                         .get("browserContextId")
                         .and_then(Value::as_str)
@@ -2795,6 +2804,9 @@ impl BrowserSession {
         self.current_session_id = Some(session_id);
         if attached_profile_marker {
             self.preferred_browser_context_id = attached_browser_context_id;
+            self.active_local_profile_id = attached_profile_id;
+        } else {
+            self.clear_local_profile_context();
         }
         let _ = self.cdp_current("Runtime.enable", json!({}));
         let _ = self.cdp_current("Page.enable", json!({}));
@@ -2802,6 +2814,12 @@ impl BrowserSession {
             let _ = self.cdp_current("Page.navigate", json!({ "url": "about:blank" }));
         }
         Ok(())
+    }
+
+    fn clear_local_profile_context(&mut self) {
+        self.preferred_profile_id = None;
+        self.active_local_profile_id = None;
+        self.preferred_browser_context_id = None;
     }
 
     fn cdp_current(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -7305,6 +7323,20 @@ mod tests {
     }
 
     #[test]
+    fn clearing_local_profile_context_drops_stale_profile_lock() {
+        let mut session = BrowserSession::default();
+        session.preferred_profile_id = Some("google-chrome:Default".to_string());
+        session.active_local_profile_id = Some("google-chrome:Default".to_string());
+        session.preferred_browser_context_id = Some("context-1".to_string());
+
+        session.clear_local_profile_context();
+
+        assert_eq!(session.preferred_profile_id, None);
+        assert_eq!(session.active_local_profile_id, None);
+        assert_eq!(session.preferred_browser_context_id, None);
+    }
+
+    #[test]
     fn disconnected_external_local_chrome_requires_explicit_reconnect() {
         let mut session = BrowserSession::default();
         session.mode = BrowserMode::Local;
@@ -7881,6 +7913,43 @@ print("list_tabs filters to current browser context")
         assert!(output
             .text
             .contains("list_tabs filters to current browser context"));
+    }
+
+    #[test]
+    fn browser_script_current_tab_tolerates_target_list_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-current-tab-target-list-error",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+def cdp(method, session_id=None, **params):
+    if method == "Target.getTargets":
+        raise RuntimeError("target list unavailable")
+    raise AssertionError((method, params))
+
+def _send_meta(meta, **params):
+    assert meta == "current_tab", (meta, params)
+    return {
+        "targetId": "target-1",
+        "sessionId": "session-1",
+        "url": "https://example.test",
+        "title": "Example",
+    }
+
+tab = current_tab()
+assert tab["targetId"] == "target-1", tab
+assert "browserContextId" not in tab, tab
+print("current_tab tolerates target list errors")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("current_tab tolerates target list errors"));
     }
 
     #[test]
