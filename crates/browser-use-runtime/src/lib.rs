@@ -1427,12 +1427,20 @@ impl AgentMailbox {
     }
 
     pub fn has_pending_item_for(&self, target: &AgentTarget) -> Option<MailboxItem> {
+        self.has_pending_item_after(target, 0)
+    }
+
+    pub fn has_pending_item_after(
+        &self,
+        target: &AgentTarget,
+        after_seq: u64,
+    ) -> Option<MailboxItem> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queue
             .iter()
-            .find(|item| target_matches(item, target))
+            .find(|item| item.seq > after_seq && target_matches(item, target))
             .cloned()
     }
 
@@ -1512,16 +1520,17 @@ impl AgentMailbox {
     pub async fn wait_for_item(
         &self,
         target: AgentTarget,
+        after_seq: u64,
         timeout_duration: Duration,
     ) -> Result<WaitAgentOutcome> {
-        if let Some(item) = self.has_pending_item_for(&target) {
+        if let Some(item) = self.has_pending_item_after(&target, after_seq) {
             return Ok(WaitAgentOutcome::Completed(item));
         }
         let mut rx = self.subscribe();
         let wait = async {
             loop {
                 rx.changed().await.map_err(|_| anyhow!("mailbox closed"))?;
-                if let Some(item) = self.has_pending_item_for(&target) {
+                if let Some(item) = self.has_pending_item_after(&target, after_seq) {
                     return Ok(WaitAgentOutcome::Completed(item));
                 }
             }
@@ -1564,6 +1573,7 @@ pub struct AgentLiveStateSnapshot {
     pub pending_mailbox_count: usize,
     pub pending_trigger_turn_count: usize,
     pub last_enqueued_mailbox_seq: u64,
+    pub last_wait_observed_mailbox_seq: u64,
     pub last_delivered_mailbox_seq: u64,
     pub last_consumed_mailbox_seq: u64,
     pub current_run_id: Option<RunId>,
@@ -1803,6 +1813,14 @@ impl AgentLiveState {
         state.last_delivered_mailbox_seq = state.last_delivered_mailbox_seq.max(max_seq);
     }
 
+    fn record_wait_observed_mailbox(&self, item: &MailboxItem) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.last_wait_observed_mailbox_seq = state.last_wait_observed_mailbox_seq.max(item.seq);
+    }
+
     fn record_mailbox_consumed(&self, items: &[MailboxItem]) {
         let max_seq = items.iter().map(|item| item.seq).max().unwrap_or_default();
         let trigger_count = items.iter().filter(|item| item.trigger_turn).count();
@@ -1833,6 +1851,7 @@ impl AgentLiveState {
             .filter(|item| item.trigger_turn)
             .count();
         state.last_enqueued_mailbox_seq = replay.last_enqueued_mailbox_seq;
+        state.last_wait_observed_mailbox_seq = replay.last_wait_observed_mailbox_seq;
         state.last_delivered_mailbox_seq = replay.last_delivered_mailbox_seq;
         state.last_consumed_mailbox_seq = replay.last_consumed_mailbox_seq;
     }
@@ -3443,7 +3462,7 @@ impl BrowserUseRuntime {
             target_path: Some(child.agent_path.clone()),
             content: notification,
             trigger_turn: false,
-            delivery_phase: MailboxDeliveryPhase::NextTurn,
+            delivery_phase: MailboxDeliveryPhase::CurrentTurn,
             payload: json!({
                 "success": success,
                 "author_session_id": child.session_id.as_str(),
@@ -3826,19 +3845,27 @@ impl BrowserUseRuntime {
         started.root_id = Some(parent.root_id.clone());
         self.publish_after_barrier(started)?;
 
-        let outcome = parent.mailbox.wait_for_item(target, timeout).await?;
+        let after_seq = parent.live_state.snapshot().last_wait_observed_mailbox_seq;
+        let outcome = parent
+            .mailbox
+            .wait_for_item(target, after_seq, timeout)
+            .await?;
         let (kind, payload) = match &outcome {
             WaitAgentOutcome::Completed(item) => (
                 RuntimeEventKind::WaitAgentCompleted,
                 json!({
                     "timed_out": false,
                     "mailbox_seq": item.seq,
+                    "after_seq": after_seq,
                     "author_agent_id": item.author_agent_id.as_str(),
                 }),
             ),
             WaitAgentOutcome::TimedOut => (
                 RuntimeEventKind::WaitAgentTimedOut,
-                json!({ "timed_out": true }),
+                json!({
+                    "timed_out": true,
+                    "after_seq": after_seq,
+                }),
             ),
         };
         let mut finished = RuntimeEvent::new(kind, Durability::Barrier)
@@ -3847,6 +3874,9 @@ impl BrowserUseRuntime {
             .with_payload(payload);
         finished.root_id = Some(parent.root_id.clone());
         self.publish_after_barrier(finished)?;
+        if let WaitAgentOutcome::Completed(item) = &outcome {
+            parent.live_state.record_wait_observed_mailbox(item);
+        }
         Ok(outcome)
     }
 
@@ -4303,6 +4333,7 @@ fn lost_live_resources_from_events(events: &[EventRecord]) -> Vec<LiveResourceKe
 struct MaterializedLiveState {
     pending_mailbox_items: Vec<MailboxItem>,
     last_enqueued_mailbox_seq: u64,
+    last_wait_observed_mailbox_seq: u64,
     last_delivered_mailbox_seq: u64,
     last_consumed_mailbox_seq: u64,
     accepted_prompt_input_count: usize,
@@ -4330,6 +4361,17 @@ fn materialized_live_state_from_events(events: &[EventRecord]) -> MaterializedLi
             "mailbox.delivered" => {
                 for seq in mailbox_seqs_from_event(event) {
                     replay.last_delivered_mailbox_seq = replay.last_delivered_mailbox_seq.max(seq);
+                }
+            }
+            "wait_agent.completed" => {
+                if let Some(seq) = event
+                    .payload
+                    .pointer("/payload/mailbox_seq")
+                    .or_else(|| event.payload.get("mailbox_seq"))
+                    .and_then(Value::as_u64)
+                {
+                    replay.last_wait_observed_mailbox_seq =
+                        replay.last_wait_observed_mailbox_seq.max(seq);
                 }
             }
             "mailbox.consumed" => {
@@ -4724,6 +4766,7 @@ mod tests {
         let outcome = mailbox
             .wait_for_item(
                 AgentTarget::AgentId(child.clone()),
+                0,
                 Duration::from_millis(10),
             )
             .await?;
@@ -5652,6 +5695,11 @@ mod tests {
             !pending[0].trigger_turn,
             "child completion must not auto-trigger parent"
         );
+        assert_eq!(
+            pending[0].delivery_phase,
+            MailboxDeliveryPhase::CurrentTurn,
+            "active-turn child completion mail must be deliverable after wait_agent"
+        );
 
         let outcome = handle
             .wait_agent(
@@ -5670,6 +5718,14 @@ mod tests {
             1,
             "wait_agent observes mail but does not drain it"
         );
+        let delivered = handle.drain_agent_mailbox(DrainAgentMailboxRequest {
+            session_id: root.session_id().clone(),
+            delivery_phase: MailboxDeliveryPhase::CurrentTurn,
+        })?;
+        assert_eq!(delivered.mailbox_items.len(), 1);
+        assert!(delivered.mailbox_items[0]
+            .content
+            .contains("<subagent_notification>"));
 
         let root_events = journal.events_for_session(root.session_id())?;
         let root_event_types = root_events
@@ -5684,6 +5740,76 @@ mod tests {
         }));
         assert!(root_event_types.contains(&"mailbox.enqueued"));
         assert!(root_event_types.contains(&"wait_agent.completed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_wait_agent_advances_observed_cursor_without_draining() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: Some("Curie".to_string()),
+            role: Some("explorer".to_string()),
+        })?;
+
+        handle.complete_agent(CompleteAgentRequest {
+            child_agent_id: child.agent_id().clone(),
+            result: "first findings".to_string(),
+        })?;
+
+        let first = handle
+            .wait_agent(root.agent_id(), AgentTarget::Any, Duration::from_millis(20))
+            .await?;
+        let WaitAgentOutcome::Completed(first_item) = first else {
+            panic!("expected first mailbox item");
+        };
+        assert_eq!(first_item.seq, 1);
+        assert_eq!(
+            root.mailbox().pending_items().len(),
+            1,
+            "wait_agent must observe mail without draining content delivery"
+        );
+
+        let repeated = handle
+            .wait_agent(root.agent_id(), AgentTarget::Any, Duration::from_millis(1))
+            .await?;
+        assert_eq!(
+            repeated,
+            WaitAgentOutcome::TimedOut,
+            "a second wait must block for newer mail instead of returning the same seq"
+        );
+        assert_eq!(root.live_state_snapshot().last_wait_observed_mailbox_seq, 1);
+
+        let peer = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "second".to_string(),
+            message: "inspect more".to_string(),
+            nickname: Some("Noether".to_string()),
+            role: Some("explorer".to_string()),
+        })?;
+        handle.complete_agent(CompleteAgentRequest {
+            child_agent_id: peer.agent_id().clone(),
+            result: "second findings".to_string(),
+        })?;
+        let next = handle
+            .wait_agent(root.agent_id(), AgentTarget::Any, Duration::from_millis(20))
+            .await?;
+        let WaitAgentOutcome::Completed(next_item) = next else {
+            panic!("expected newer mailbox item");
+        };
+        assert_eq!(next_item.seq, 2);
         Ok(())
     }
 
@@ -5952,6 +6078,35 @@ mod tests {
             panic!("materialized mail should wake wait_agent immediately");
         };
         assert_eq!(item.seq, 7);
+        assert_eq!(root.live_state_snapshot().last_wait_observed_mailbox_seq, 7);
+        let repeated = handle
+            .wait_agent(root.agent_id(), AgentTarget::Any, Duration::from_millis(1))
+            .await?;
+        assert_eq!(repeated, WaitAgentOutcome::TimedOut);
+
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let handle_after_resume = BrowserUseRuntime::new(persistence, state_index).handle();
+        let resumed_root = handle_after_resume.attach_root_agent(AttachRootAgentRequest {
+            session_id: session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            task: "resume again".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        assert_eq!(
+            resumed_root
+                .live_state_snapshot()
+                .last_wait_observed_mailbox_seq,
+            7
+        );
+        let after_resume = handle_after_resume
+            .wait_agent(
+                resumed_root.agent_id(),
+                AgentTarget::Any,
+                Duration::from_millis(1),
+            )
+            .await?;
+        assert_eq!(after_resume, WaitAgentOutcome::TimedOut);
         Ok(())
     }
 
