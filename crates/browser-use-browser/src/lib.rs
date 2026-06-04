@@ -2811,52 +2811,11 @@ impl BrowserSession {
         let _ = self.cdp_current("Runtime.enable", json!({}));
         let _ = self.cdp_current("Page.enable", json!({}));
         if attached_profile_marker {
-            if let Some(browser_context_id) = attached_browser_context_id {
-                let replacement_target = self
-                    .cdp(
-                        "Target.createTarget",
-                        None,
-                        json!({ "url": "about:blank", "browserContextId": browser_context_id }),
-                    )
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("targetId")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
-                    });
-                if let Some(replacement_target) = replacement_target {
-                    if let Ok(replacement_session) = self.attach_target(&replacement_target) {
-                        let marker_target = self.current_target_id.replace(replacement_target);
-                        self.current_session_id = Some(replacement_session);
-                        if let Some(marker_target) = marker_target {
-                            let _ = self.cdp(
-                                "Target.closeTarget",
-                                None,
-                                json!({ "targetId": marker_target }),
-                            );
-                        }
-                        let current_target = self.current_target_id.clone();
-                        self.close_profile_marker_targets(
-                            Some(&browser_context_id),
-                            current_target.as_deref(),
-                        );
-                        let _ = self.cdp_current("Runtime.enable", json!({}));
-                        let _ = self.cdp_current("Page.enable", json!({}));
-                    } else {
-                        let _ = self.cdp(
-                            "Target.closeTarget",
-                            None,
-                            json!({ "targetId": replacement_target }),
-                        );
-                        let _ = self.cdp_current("Page.navigate", json!({ "url": "about:blank" }));
-                    }
-                } else {
-                    let _ = self.cdp_current("Page.navigate", json!({ "url": "about:blank" }));
-                }
-            } else {
-                let _ = self.cdp_current("Page.navigate", json!({ "url": "about:blank" }));
-            }
+            let current_target = self.current_target_id.clone();
+            self.close_profile_marker_targets(
+                attached_browser_context_id.as_deref(),
+                current_target.as_deref(),
+            );
         }
         Ok(())
     }
@@ -6887,6 +6846,9 @@ fn attach_inline_window_stitch(run: &mut BrowserScriptRun, output: &mut BrowserS
 
 fn is_real_page_target(target: &Value) -> bool {
     if target.get("type").and_then(Value::as_str) != Some("page") {
+        return false;
+    }
+    if is_profile_marker_target(target) {
         return false;
     }
     let url = target.get("url").and_then(Value::as_str).unwrap_or("");

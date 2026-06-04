@@ -494,10 +494,12 @@ def _current_target_browser_context_id():
 
 
 def new_tab(url="about:blank"):
-    # Reuse the current controlled tab when it's blank page
+    # Reuse the current controlled tab when it's just a placeholder
     if url != "about:blank":
         current_url = _current_target_url()
-        if current_url in ("", "about:blank"):
+        if current_url in ("", "about:blank") or (
+            current_url and "browser-use-profile-target" in current_url
+        ):
             goto_url(url)
             return current_tab().get("targetId")
     # Match browser-harness: create blank first, attach, then navigate. Passing
