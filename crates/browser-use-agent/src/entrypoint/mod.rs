@@ -2781,17 +2781,16 @@ fn transient_runtime_for_store_session(
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
         )?;
-        accept_latest_durable_prompt_input(&runtime_handle, &store_guard, session_id)?;
+        accept_latest_durable_prompt_input(&runtime_handle, session_id)?;
     }
     Ok(runtime_handle)
 }
 
 fn accept_latest_durable_prompt_input(
     runtime_handle: &RuntimeHandle,
-    store: &Store,
     session_id: &str,
 ) -> anyhow::Result<()> {
-    let Some(event) = latest_durable_prompt_input_event(store, session_id)? else {
+    let Some(event) = latest_runtime_durable_prompt_input_event(runtime_handle, session_id)? else {
         return Ok(());
     };
     runtime_handle.accept_prompt_input(RuntimeAcceptPromptInputRequest {
@@ -2805,12 +2804,13 @@ fn accept_latest_durable_prompt_input(
     Ok(())
 }
 
-fn latest_durable_prompt_input_event(
-    store: &Store,
+fn latest_runtime_durable_prompt_input_event(
+    runtime_handle: &RuntimeHandle,
     session_id: &str,
 ) -> anyhow::Result<Option<EventRecord>> {
-    Ok(store
-        .events_for_session(session_id)?
+    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+    Ok(runtime_handle
+        .events_for_session(&runtime_session_id)?
         .into_iter()
         .rev()
         .find(|event| {
@@ -3876,6 +3876,44 @@ mod tests {
             !prompt_text.contains("store text must not leak"),
             "runtime-backed prompt history must not fall back to Store when runtime journal reads fail"
         );
+    }
+
+    #[test]
+    fn transient_runtime_accepts_initial_input_from_runtime_journal() {
+        let (dir, store, session_id) = store_with_session();
+        let input_seq = {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    names::SESSION_INPUT,
+                    serde_json::json!({ "text": "runtime accepted input" }),
+                )
+                .expect("append store input")
+                .seq
+        };
+
+        let journal = Arc::new(browser_use_runtime::SqliteJournal::open(dir.path()).unwrap());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime_handle
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+
+        accept_latest_durable_prompt_input(&runtime_handle, &session_id)
+            .expect("accept runtime input");
+
+        let accepted = events(&store, &session_id)
+            .into_iter()
+            .find(|event| event.event_type == "agent.input.accepted")
+            .expect("agent input accepted event");
+        assert_eq!(accepted.payload["payload"]["source_event_seq"], input_seq);
     }
 
     #[tokio::test]
