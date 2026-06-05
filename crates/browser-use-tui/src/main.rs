@@ -9511,7 +9511,9 @@ fn collect_native_hyperlink_segments(
         let fragments = link_span_fragments(line);
         if let Some(first_fragment) = fragments.first() {
             let first_text = first_fragment.text.trim();
-            if pending.is_some() && !starts_new_wrapped_hyperlink(first_text) {
+            if pending.as_ref().is_some_and(|pending| {
+                should_continue_pending_hyperlink(pending, first_text, base_cwd)
+            }) {
                 append_fragments_to_pending(&mut pending, line_idx, fragments);
                 continue;
             }
@@ -9586,6 +9588,35 @@ fn append_fragments_to_pending(
             target: String::new(),
         });
     }
+}
+
+fn should_continue_pending_hyperlink(
+    pending: &PendingNativeHyperlink,
+    next_fragment: &str,
+    base_cwd: Option<&Path>,
+) -> bool {
+    let next_fragment = next_fragment.trim();
+    if next_fragment.is_empty() || starts_new_wrapped_hyperlink(next_fragment) {
+        return false;
+    }
+    if clickable_target_for_link_text(next_fragment, base_cwd).is_none() {
+        return true;
+    }
+    pending_file_path_needs_extension(&pending.target)
+        && native_local_file_extension(next_fragment).is_some()
+}
+
+fn pending_file_path_needs_extension(value: &str) -> bool {
+    let value = value.trim();
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return false;
+    }
+    native_local_file_extension(value).is_none()
+        && (value.starts_with("file://")
+            || value.starts_with('/')
+            || value.starts_with("~/")
+            || value.starts_with("./")
+            || value.starts_with("../"))
 }
 
 fn starts_new_wrapped_hyperlink(value: &str) -> bool {
