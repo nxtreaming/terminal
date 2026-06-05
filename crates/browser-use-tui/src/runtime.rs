@@ -417,7 +417,10 @@ fn maybe_append_local_chrome_cloud_promo(
     if !should_append_local_chrome_cloud_promo(&events, user_turn_seq) {
         return Ok(());
     }
-    increment_local_chrome_cloud_promo_qualified_task_count(store)?;
+    let qualified_count = increment_local_chrome_cloud_promo_qualified_task_count(store)?;
+    if qualified_count % 5 != 1 {
+        return Ok(());
+    }
     store.append_event(
         session_id,
         LOCAL_CHROME_CLOUD_PROMO_EVENT,
@@ -1261,7 +1264,8 @@ mod tests {
     }
 
     #[test]
-    fn local_chrome_cloud_promo_appends_on_every_browser_connected_initial_success() -> Result<()> {
+    fn local_chrome_cloud_promo_appends_on_first_and_every_fifth_browser_connected_initial_success(
+    ) -> Result<()> {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -1274,7 +1278,7 @@ mod tests {
         let result = (|| -> Result<()> {
             let temp = tempfile::tempdir()?;
             let store = Store::open(temp.path())?;
-            for idx in 1..=3 {
+            for idx in 1..=6 {
                 let session = store.create_session(None, std::env::current_dir()?)?;
                 store.append_event(
                     &session.id,
@@ -1308,7 +1312,11 @@ mod tests {
                 let prompted = events
                     .iter()
                     .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT);
-                assert!(prompted, "expected prompt at task {idx}");
+                assert_eq!(
+                    prompted,
+                    idx == 1 || idx == 6,
+                    "unexpected prompt state at task {idx}"
+                );
             }
 
             let profile_session = store.create_session(None, std::env::current_dir()?)?;
@@ -1365,7 +1373,7 @@ mod tests {
                 store
                     .get_setting(LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING)?
                     .as_deref(),
-                Some("3")
+                Some("6")
             );
             Ok(())
         })();

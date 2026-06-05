@@ -4517,7 +4517,7 @@ mod tests {
     #[test]
     fn cloud_promo_notice_body_and_link_are_colored() {
         let lines = notice_lines(
-            "Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]",
+            "[tip] Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]",
             120,
         );
         let spans = lines
@@ -4525,6 +4525,9 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .collect::<Vec<_>>();
 
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "[tip]" && span.style == activity_task()));
         assert!(spans
             .iter()
             .any(|span| span.content.as_ref() == "Cloud" && span.style == activity_task()));

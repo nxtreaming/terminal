@@ -3574,6 +3574,9 @@ fn cloud_home_banner_lines(app: &App, width: u16) -> Option<Vec<Line<'static>>> 
     if width == 0 || app.surface != Surface::Main || app.is_slash_palette_active() {
         return None;
     }
+    if app.browser_use_cloud_key_ready().unwrap_or(true) {
+        return None;
+    }
 
     let wrap_width = (width as usize).saturating_sub(8).clamp(16, 64);
     let words = [

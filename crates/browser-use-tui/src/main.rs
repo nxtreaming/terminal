@@ -159,7 +159,7 @@ You can get one free at cloud.browser-use.com and run this on DeepSeek V4 for \
 free — or add your own key with /auth.";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_EVENT: &str = "session.cloud_promo";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_TEXT: &str =
-    "Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]";
+    "[tip] Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
@@ -11263,7 +11263,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn home_shows_cloud_banner_even_when_key_exists_or_cloud_selected() -> Result<()> {
+    fn home_shows_cloud_banner_only_without_browser_use_key() -> Result<()> {
         let saved = std::env::var("BROWSER_USE_API_KEY").ok();
         const BANNER_START: &str = "Use a Cloud browser";
         const BANNER_CTA: &str = "automatic captcha-solving!";
@@ -11308,14 +11308,26 @@ mod redesign_tests {
                 .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-test")?;
             app.browser = BROWSER_USE_CLOUD.to_string();
             let screen = render_dump(&mut app)?;
-            assert!(screen.contains(BANNER_START));
-            assert!(screen.contains(BANNER_CTA));
-            assert!(screen.contains(BANNER_LINK));
+            assert!(!screen.contains(BANNER_START));
+            assert!(!screen.contains(BANNER_CTA));
+            assert!(!screen.contains(BANNER_LINK));
+
+            app.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "")?;
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", "bu-env-test");
+            }
+            let screen = render_dump(&mut app)?;
+            assert!(!screen.contains(BANNER_START));
+            assert!(!screen.contains(BANNER_CTA));
+            assert!(!screen.contains(BANNER_LINK));
             Ok(())
         })();
-        if let Some(value) = saved {
-            unsafe {
+        unsafe {
+            if let Some(value) = saved {
                 std::env::set_var("BROWSER_USE_API_KEY", value);
+            } else {
+                std::env::remove_var("BROWSER_USE_API_KEY");
             }
         }
         result
@@ -11348,6 +11360,7 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("local task result"));
         assert!(!screen.contains("• tip"));
+        assert!(screen.contains("[tip]"));
         assert!(screen.contains("Use a Cloud browser"));
         assert!(screen.contains("automatic captcha-solving!"));
         assert!(screen.contains("[cloud.browser-use.com]"));
