@@ -1330,13 +1330,18 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         false,
         browser_tool,
     );
-    if let Some((store, session_id)) = &user_input {
-        reg.register::<_, CaptureCurationRequest>(
-            "submit_capture_curation",
-            definitions::submit_capture_curation(),
-            false,
-            CaptureCurationTool::with_store(store.clone(), session_id.as_str().to_string()),
-        );
+    // Temporarily disable the agent-driven GIF curation pipeline. The
+    // deterministic post-run fallback recording remains active.
+    const AGENT_DRIVEN_GIF_CURATION_ENABLED: bool = false;
+    if AGENT_DRIVEN_GIF_CURATION_ENABLED {
+        if let Some((store, session_id)) = &user_input {
+            reg.register::<_, CaptureCurationRequest>(
+                "submit_capture_curation",
+                definitions::submit_capture_curation(),
+                false,
+                CaptureCurationTool::with_store(store.clone(), session_id.as_str().to_string()),
+            );
+        }
     }
     // `python`: backed by the run's single PythonWorker (started eagerly by
     // `resolve_provider`). parallel_safe = false (single interpreter process).
