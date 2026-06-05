@@ -15771,8 +15771,8 @@ wire_api = "responses"
         assert!(text.contains("• explored"));
         assert_eq!(text.matches("• explored").count(), 1, "{text}");
         assert!(text.contains("read README.md, Cargo.toml"));
-        assert!(text.contains("list "));
-        assert!(text.contains("search \"renderer\" (7 matches)"));
+        assert!(text.contains("listed "));
+        assert!(text.contains("searched \"renderer\" (7 matches)"));
         assert!(text.contains("• edit"));
         assert!(text.contains("changed README.md"));
         assert!(text.contains("Repository inspected."));
