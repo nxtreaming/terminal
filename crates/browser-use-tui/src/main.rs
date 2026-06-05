@@ -9599,10 +9599,20 @@ fn should_continue_pending_hyperlink(
     if next_fragment.is_empty() || starts_new_wrapped_hyperlink(next_fragment) {
         return false;
     }
+    if pending_http_url_accepts_file_fragment(&pending.target, next_fragment) {
+        return true;
+    }
     if clickable_target_for_link_text(next_fragment, base_cwd).is_none() {
         return true;
     }
     pending_file_path_needs_extension(&pending.target)
+        && native_local_file_extension(next_fragment).is_some()
+}
+
+fn pending_http_url_accepts_file_fragment(value: &str, next_fragment: &str) -> bool {
+    let value = value.trim();
+    (value.starts_with("http://") || value.starts_with("https://"))
+        && value.ends_with('/')
         && native_local_file_extension(next_fragment).is_some()
 }
 
