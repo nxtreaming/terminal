@@ -1140,6 +1140,44 @@ fn enrich_local_profiles_with_default_profile(
     output
 }
 
+fn enrich_status_with_selected_browser_mode(
+    mut output: BrowserCommandOutput,
+    resolved_command: &str,
+    selected_mode: Option<&str>,
+) -> BrowserCommandOutput {
+    let Ok(words) = browser_command_words(resolved_command) else {
+        return output;
+    };
+    let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+    if !matches!(words.as_slice(), ["browser", "status", ..] | ["status", ..]) {
+        return output;
+    }
+    let Some(selected_mode) = selected_mode
+        .and_then(|mode| normalize_browser_preference_mode(mode).ok())
+        .filter(|mode| *mode == "cloud")
+    else {
+        return output;
+    };
+    let Some(content) = output.content.as_object_mut() else {
+        return output;
+    };
+    if content.get("connection").and_then(Value::as_str) != Some("not-configured") {
+        return output;
+    }
+    if content.get("mode").and_then(Value::as_str) != Some("none") {
+        return output;
+    }
+
+    content.insert("selected_browser_mode".to_string(), json!(selected_mode));
+    content.insert("display_status".to_string(), json!("not-started"));
+    content.insert(
+        "reason".to_string(),
+        json!("Browser Use Cloud is selected, but no cloud browser has been started yet."),
+    );
+    content.insert("next_step".to_string(), json!("browser remote start"));
+    output
+}
+
 fn open_default_profile_before_local_connect(
     backend: &dyn BrowserBackend,
     session_id: &str,
@@ -2266,6 +2304,9 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 selected_browser_mode,
                             )
                             .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+                            let effective_mode =
+                                effective_browser_mode(Some(&store), selected_browser_mode)
+                                    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
                             let default_profile_id = store
                                 .get_setting(BROWSER_PREF_PROFILE)
                                 .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
@@ -2306,10 +2347,15 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                     &resolved,
                                     default_profile_id.as_deref(),
                                 );
-                                enrich_local_connect_recovery_with_default_profile(
+                                let output = enrich_local_connect_recovery_with_default_profile(
                                     output,
                                     &resolved,
                                     default_profile_id.as_deref(),
+                                );
+                                enrich_status_with_selected_browser_mode(
+                                    output,
+                                    &resolved,
+                                    Some(effective_mode),
                                 )
                             }
                         }
@@ -2320,9 +2366,14 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             selected_browser_mode,
                         )
                         .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                        backend
+                        let output = backend
                             .command(&session_id, &cwd, &artifact_dir, &resolved)
-                            .map_err(ToolError::Other)?
+                            .map_err(ToolError::Other)?;
+                        enrich_status_with_selected_browser_mode(
+                            output,
+                            &resolved,
+                            selected_browser_mode,
+                        )
                     };
                     if let Some(persistence) = &persistence {
                         if let Ok(store) = persistence.store.lock() {
