@@ -5358,7 +5358,7 @@ impl App {
     }
 
     fn should_capture_mouse(&self) -> bool {
-        self.should_capture_welcome_mouse()
+        self.should_capture_welcome_mouse() || self.should_capture_live_link_mouse()
     }
 
     fn trace_mouse_event(
@@ -5368,6 +5368,7 @@ impl App {
         row: u16,
         before_cursor: usize,
         logo_handled: bool,
+        live_link_handled: bool,
     ) {
         let Some(path) = std::env::var_os("BUT_MOUSE_TRACE").filter(|path| !path.is_empty()) else {
             return;
@@ -5407,6 +5408,7 @@ impl App {
             "before_cursor": before_cursor,
             "after_cursor": self.composer.cursor_index(),
             "logo_handled": logo_handled,
+            "live_link_handled": live_link_handled,
             "line_lengths": line_lengths,
         });
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -5434,6 +5436,35 @@ impl App {
         }
         self.welcome_anim.throw();
         true
+    }
+
+    fn should_capture_live_link_mouse(&self) -> bool {
+        self.live_link_overlay
+            .borrow()
+            .as_ref()
+            .is_some_and(|link| !link.text.is_empty())
+    }
+
+    fn live_link_url_at(&self, column: u16, row: u16) -> Option<String> {
+        let overlay = self.live_link_overlay.borrow();
+        let link = overlay.as_ref()?;
+        if link.text.is_empty() || row != link.row {
+            return None;
+        }
+        let width = u16::try_from(link.text.chars().count()).unwrap_or(u16::MAX);
+        let end = link.col.saturating_add(width);
+        if column < link.col || column >= end {
+            return None;
+        }
+        Some(link.url.clone())
+    }
+
+    fn handle_live_link_click(&mut self, column: u16, row: u16) -> Result<bool> {
+        let Some(url) = self.live_link_url_at(column, row) else {
+            return Ok(false);
+        };
+        self.request_open_browser_target(url)?;
+        Ok(true)
     }
 
     fn execute_surface_selection(&mut self) -> Result<()> {
@@ -6890,23 +6921,30 @@ impl App {
     }
 
     fn request_open_browser(&mut self) -> Result<()> {
+        let target = {
+            let state = self.workbench_state()?;
+            state
+                .browser
+                .live_url
+                .as_deref()
+                .or(state.browser.url.as_deref())
+                .unwrap_or("about:blank")
+                .to_string()
+        };
+        self.request_open_browser_target(target)
+    }
+
+    fn request_open_browser_target(&mut self, target: String) -> Result<()> {
         let Some(session_id) = self.selected_session_id.clone() else {
             self.browser_notice = Some("No current browser task yet.".to_string());
             return Ok(());
         };
-        let state = self.workbench_state()?;
-        let target = state
-            .browser
-            .live_url
-            .as_deref()
-            .or(state.browser.url.as_deref())
-            .unwrap_or("about:blank");
         self.store.append_event(
             &session_id,
             "browser.open_requested",
             serde_json::json!({ "target": target }),
         )?;
-        self.browser_notice = Some(match open_external_url(target) {
+        self.browser_notice = Some(match open_external_url(&target) {
             Ok(()) => format!("Opened {target}"),
             Err(error) => format!("Could not open {target}: {error}"),
         });
@@ -9016,9 +9054,17 @@ fn handle_terminal_event(
         }) => {
             let kind_label = mouse_event_kind_label(kind);
             let before_cursor = app.composer.cursor_index();
-            let logo_handled = matches!(kind, MouseEventKind::Down(_))
-                && app.handle_welcome_logo_click(column, row);
-            app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
+            let is_button_down = matches!(kind, MouseEventKind::Down(_));
+            let logo_handled = is_button_down && app.handle_welcome_logo_click(column, row);
+            let live_link_handled = is_button_down && app.handle_live_link_click(column, row)?;
+            app.trace_mouse_event(
+                kind_label,
+                column,
+                row,
+                before_cursor,
+                logo_handled,
+                live_link_handled,
+            );
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
@@ -10783,6 +10829,49 @@ mod redesign_tests {
 
         assert!(app.composer_input_rect.get().is_some());
         assert!(!app.should_capture_mouse());
+        Ok(())
+    }
+
+    #[test]
+    fn live_status_link_click_opens_recorded_live_url() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store.set_setting("browser", BROWSER_USE_CLOUD)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        let live_url = "https://live.browser-use.com/?wss=example-long-target";
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": live_url}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+
+        let _screen = render_dump(&mut app)?;
+        assert!(app.should_capture_mouse());
+        let link = app
+            .live_link_overlay
+            .borrow()
+            .as_ref()
+            .map(|link| (link.col, link.row, link.url.clone()))
+            .context("live link overlay")?;
+        assert_eq!(link.2, live_url);
+
+        assert!(app.handle_live_link_click(link.0, link.1)?);
+        assert!(!app.handle_live_link_click(link.0.saturating_sub(1), link.1)?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let targets = events
+            .iter()
+            .filter(|event| event.event_type == "browser.open_requested")
+            .filter_map(|event| event.payload.get("target").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec![live_url]);
         Ok(())
     }
 
