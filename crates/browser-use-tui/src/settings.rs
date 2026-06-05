@@ -73,7 +73,8 @@ pub(crate) struct ModelChoice {
     pub(crate) group: ModelChoiceGroup,
 }
 
-/// A starter pick surfaced at the top of the provider screen
+/// A starter pick surfaced at the top of the provider screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RecommendedModel {
     pub(crate) display: &'static str,
     pub(crate) account: &'static str,
@@ -97,6 +98,20 @@ pub(crate) const RECOMMENDED_MODELS: &[RecommendedModel] = &[
         provider_model: "google/gemini-3.1-pro-preview",
     },
 ];
+
+pub(crate) fn recommended_models_for_codex_availability(
+    codex_available: bool,
+) -> Vec<RecommendedModel> {
+    let mut models = RECOMMENDED_MODELS.to_vec();
+    if !codex_available {
+        for model in &mut models {
+            if model.account == ACCOUNT_CODEX {
+                model.account = ACCOUNT_OPENAI;
+            }
+        }
+    }
+    models
+}
 
 pub(crate) const ACCOUNT_CODEX: &str = "Codex login";
 pub(crate) const ACCOUNT_CLAUDE_CODE: &str = "Claude Code subscription";
@@ -446,6 +461,18 @@ pub(crate) fn bundled_openai_model_ids() -> Vec<String> {
     .collect()
 }
 
+pub(crate) fn bundled_codex_login_model_ids() -> Vec<String> {
+    bundled_openai_model_ids()
+        .into_iter()
+        .filter(|id| {
+            !matches!(
+                id.as_str(),
+                "gpt-5.5-pro" | "gpt-5.4-pro" | "gpt-5.4-nano" | "gpt-5.3-codex"
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn bundled_openrouter_model_ids() -> Vec<String> {
     [
         // Anthropic
@@ -578,6 +605,14 @@ mod tests {
     }
 
     #[test]
+    fn bundled_codex_login_ids_exclude_login_only_unsupported_models() {
+        assert_eq!(
+            bundled_codex_login_model_ids(),
+            vec!["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+        );
+    }
+
+    #[test]
     fn recommended_models_have_a_matching_provider_row() {
         let choices = fallback_model_choices();
         for rec in RECOMMENDED_MODELS {
@@ -591,5 +626,21 @@ mod tests {
                 rec.account
             );
         }
+    }
+
+    #[test]
+    fn recommended_openai_model_uses_api_key_when_codex_is_unavailable() {
+        let models = recommended_models_for_codex_availability(false);
+        assert_eq!(models[0].display, "GPT-5.5");
+        assert_eq!(models[0].account, ACCOUNT_OPENAI);
+        assert_eq!(models[0].provider_model, "gpt-5.5");
+    }
+
+    #[test]
+    fn recommended_openai_model_uses_codex_when_codex_is_available() {
+        let models = recommended_models_for_codex_availability(true);
+        assert_eq!(models[0].display, "GPT-5.5");
+        assert_eq!(models[0].account, ACCOUNT_CODEX);
+        assert_eq!(models[0].provider_model, "gpt-5.5");
     }
 }

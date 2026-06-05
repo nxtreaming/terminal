@@ -22,7 +22,6 @@ use crate::palette;
 use crate::settings::{
     is_claude_code_account, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
     ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
-    RECOMMENDED_MODELS,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -2592,7 +2591,8 @@ fn provider_lines(app: &App) -> Vec<Line<'static>> {
     // the top picks) OR on its provider row below (so it's visible either way).
     let current_recommended = app.current_recommended_index();
     lines.push(Line::from(Span::styled("recommended", muted())));
-    for (idx, rec) in RECOMMENDED_MODELS.iter().enumerate() {
+    let recommended = app.recommended_models();
+    for (idx, rec) in recommended.iter().enumerate() {
         lines.push(selectable_row(
             &format!("{:<22} {}", rec.display, access_label(rec.account)),
             idx,
@@ -2602,7 +2602,7 @@ fn provider_lines(app: &App) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("providers", muted())));
-    let base = RECOMMENDED_MODELS.len();
+    let base = recommended.len();
     for (idx, row) in app.provider_rows().iter().enumerate() {
         let status = if app.account_ready(row.account).unwrap_or(false) {
             "connected"

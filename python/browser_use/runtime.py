@@ -30,7 +30,8 @@ class RuntimeClient:
         self._reader_task: Optional[asyncio.Task[Any]] = None
         self._stderr_task: Optional[asyncio.Task[Any]] = None
         self._next_id = 1
-        self._write_lock = asyncio.Lock()
+        self._write_lock: Optional[asyncio.Lock] = None
+        self._write_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self._pending: Dict[int, asyncio.Future[Any]] = {}
         self._events: Dict[str, asyncio.Queue[Dict[str, Any]]] = {}
         self._projected_events: Dict[str, asyncio.Queue[Dict[str, Any]]] = {}
@@ -42,7 +43,7 @@ class RuntimeClient:
             raise BrowserUseProtocolError("Rust SDK server stdin is unavailable")
 
         loop = asyncio.get_running_loop()
-        async with self._write_lock:
+        async with self._get_write_lock(loop):
             request_id = self._next_id
             self._next_id += 1
             future: asyncio.Future[Any] = loop.create_future()
@@ -67,7 +68,7 @@ class RuntimeClient:
         if self._process is None or self._process.stdin is None:
             raise BrowserUseProtocolError("Rust SDK server stdin is unavailable")
         request = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-        async with self._write_lock:
+        async with self._get_write_lock(asyncio.get_running_loop()):
             self._process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
             await self._process.stdin.drain()
 
@@ -108,10 +109,24 @@ class RuntimeClient:
         self._process = None
 
     def event_queue(self, run_id: str) -> asyncio.Queue[Dict[str, Any]]:
-        return self._events.setdefault(run_id, asyncio.Queue())
+        queue = self._events.get(run_id)
+        if queue is None:
+            queue = _new_asyncio_queue()
+            self._events[run_id] = queue
+        return queue
 
     def projected_event_queue(self, run_id: str) -> asyncio.Queue[Dict[str, Any]]:
-        return self._projected_events.setdefault(run_id, asyncio.Queue())
+        queue = self._projected_events.get(run_id)
+        if queue is None:
+            queue = _new_asyncio_queue()
+            self._projected_events[run_id] = queue
+        return queue
+
+    def _get_write_lock(self, loop: asyncio.AbstractEventLoop) -> asyncio.Lock:
+        if self._write_lock is None or self._write_lock_loop is not loop:
+            self._write_lock = asyncio.Lock()
+            self._write_lock_loop = loop
+        return self._write_lock
 
     async def _read_stdout(self) -> None:
         assert self._process is not None
@@ -194,6 +209,19 @@ def default_runtime() -> RuntimeClient:
     if _default_runtime is None:
         _default_runtime = RuntimeClient()
     return _default_runtime
+
+
+def _new_asyncio_queue() -> asyncio.Queue[Dict[str, Any]]:
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    else:
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    return asyncio.Queue()
 
 
 def _default_sdk_server_command(state_dir: Optional[Path]) -> List[str]:

@@ -119,14 +119,17 @@ use runtime::{
     cancel_agent_run, has_live_runtime_agent, pending_runtime_trigger_turn_agent_mailbox_count,
     spawn_tui_agent_run, submit_runtime_user_input,
 };
+#[cfg(test)]
+use settings::RECOMMENDED_MODELS;
 use settings::{
-    browser_use_cloud_env_key_present, bundled_openai_model_ids, bundled_openrouter_model_ids,
-    display_and_provider_model_for_input, display_model_for_provider_model, fallback_model_choices,
-    is_claude_code_account, model_choices_for_config, provider_model_choices,
-    provider_model_for_display, AgentBackend, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES,
-    ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES,
-    BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
-    BROWSER_USE_CLOUD_API_KEY_SETTING, RECOMMENDED_MODELS,
+    browser_use_cloud_env_key_present, bundled_codex_login_model_ids, bundled_openai_model_ids,
+    bundled_openrouter_model_ids, display_and_provider_model_for_input,
+    display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
+    model_choices_for_config, provider_model_choices, provider_model_for_display,
+    recommended_models_for_codex_availability, AgentBackend, ModelChoice, RecommendedModel,
+    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
+    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -1124,6 +1127,9 @@ struct App {
     /// Provider/account chosen on the provider screen; scopes the model search to
     /// that provider's models.
     selected_provider: Option<&'static str>,
+    /// Cached once at startup and refreshed after Codex auth changes. Kept out
+    /// of provider-screen redraws so rendering does not probe auth files.
+    codex_login_available: bool,
     /// Live model ids for the typeahead of the currently-selected provider,
     /// seeded from the per-source cache and refreshed in the background.
     provider_models: Vec<ProviderModel>,
@@ -2116,6 +2122,7 @@ impl App {
             .unwrap_or_else(|| args.browser.clone());
         let browser_profile_label = browser_profile_label_from_store(&store)?;
         let selected_row = 0;
+        let codex_login_available = Self::probe_codex_login_available(&store)?;
         let _ = had_stored_model;
         let mut app = Self {
             store,
@@ -2142,6 +2149,7 @@ impl App {
             model_provider_id,
             model_choices,
             selected_provider: None,
+            codex_login_available,
             provider_models: Vec::new(),
             provider_fetch: None,
             collaboration_mode,
@@ -2352,6 +2360,7 @@ impl App {
                     match result {
                         Ok(auth) => {
                             self.store_codex_auth(&auth)?;
+                            self.codex_login_available = true;
                             self.account = account.clone();
                             self.persist_runtime_settings()?;
                             self.show_setup_result(
@@ -3410,9 +3419,13 @@ impl App {
         if !self.model_configured {
             return None;
         }
-        RECOMMENDED_MODELS.iter().position(|rec| {
+        self.recommended_models().iter().position(|rec| {
             self.account == rec.account && self.provider_model == rec.provider_model
         })
+    }
+
+    fn recommended_models(&self) -> Vec<RecommendedModel> {
+        recommended_models_for_codex_availability(self.codex_login_available)
     }
 
     /// Row to start the cursor on when opening the provider screen: the active
@@ -3425,7 +3438,7 @@ impl App {
         if !self.model_configured {
             return None;
         }
-        let base = RECOMMENDED_MODELS.len();
+        let base = self.recommended_models().len();
         self.provider_rows()
             .iter()
             .position(|row| self.provider_row_is_current(row))
@@ -3456,7 +3469,7 @@ impl App {
     /// Provider screen selection: a recommended quick-pick (top rows) or a
     /// provider row (lower rows). OpenAI opens its auth sub-dialogue.
     fn provider_surface_select(&mut self) -> Result<()> {
-        let rec_count = RECOMMENDED_MODELS.len();
+        let rec_count = self.recommended_models().len();
         if self.selected_row < rec_count {
             self.dispatch(AppCommand::SelectRecommended(self.selected_row))?;
             return Ok(());
@@ -3533,7 +3546,8 @@ impl App {
     /// Apply a recommended quick-pick directly: build its choice and save it,
     /// auto-authenticating first if the provider isn't connected yet.
     fn select_recommended(&mut self, index: usize) -> Result<()> {
-        let Some(rec) = RECOMMENDED_MODELS.get(index) else {
+        let recommended = self.recommended_models();
+        let Some(rec) = recommended.get(index) else {
             return Ok(());
         };
         self.selected_provider = Some(rec.account);
@@ -3574,7 +3588,19 @@ impl App {
     /// Seed the typeahead from curated provider ids or the per-source disk cache
     /// so it shows instantly.
     fn seed_provider_models(&mut self, account: &str) {
-        if account == ACCOUNT_CODEX || account == ACCOUNT_OPENAI {
+        if account == ACCOUNT_CODEX {
+            self.provider_models = bundled_codex_login_model_ids()
+                .into_iter()
+                .map(|id| ProviderModel {
+                    id,
+                    name: None,
+                    vision: false,
+                    supports_tools: None,
+                })
+                .collect();
+            return;
+        }
+        if account == ACCOUNT_OPENAI {
             self.provider_models = bundled_openai_model_ids()
                 .into_iter()
                 .map(|id| ProviderModel {
@@ -3589,6 +3615,14 @@ impl App {
         let Some(source) = model_source_for_account(account) else {
             return;
         };
+        let key_scoped_openrouter = account == ACCOUNT_OPENROUTER
+            && matches!(
+                self.get_provider_credential(account),
+                ProviderCredential::ApiKey(_)
+            );
+        if key_scoped_openrouter {
+            return;
+        }
         if let Some(dir) = browser_use_terminal_home_dir() {
             if let Some((models, _fresh)) = load_cached_provider_models(&dir, source) {
                 if !models.is_empty() {
@@ -3641,7 +3675,13 @@ impl App {
             return self.codex_credential();
         }
         if account == ACCOUNT_OPENROUTER {
-            return ProviderCredential::None; // OpenRouter's model list is public.
+            return match self.resolved_secret(
+                "auth.openrouter.api_key",
+                &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
+            ) {
+                Some(key) => ProviderCredential::ApiKey(key),
+                None => ProviderCredential::None,
+            };
         }
         let (key_setting, env_names): (&str, &[&str]) = if account == ACCOUNT_OPENAI {
             (
@@ -7178,7 +7218,7 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
-            Surface::Provider => RECOMMENDED_MODELS.len() + self.provider_rows().len(),
+            Surface::Provider => self.recommended_models().len() + self.provider_rows().len(),
             Surface::OpenAiAuth => self.openai_auth_rows().len(),
             Surface::Model => self.model_surface_row_count(),
             Surface::ModelSearch => self.model_search_row_count(),
@@ -7509,12 +7549,14 @@ impl App {
     }
 
     fn has_codex_login(&self) -> Result<bool> {
-        if self
-            .store
+        Self::probe_codex_login_available(&self.store)
+    }
+
+    fn probe_codex_login_available(store: &Store) -> Result<bool> {
+        if store
             .get_setting("auth.codex.access_token")?
             .is_some_and(|value| !value.trim().is_empty())
-            && self
-                .store
+            && store
                 .get_setting("auth.codex.account_id")?
                 .is_some_and(|value| !value.trim().is_empty())
         {
@@ -13069,15 +13111,7 @@ wire_api = "responses"
         assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
         assert_eq!(
             app.model_search_rows(),
-            vec![
-                "gpt-5.5",
-                "gpt-5.5-pro",
-                "gpt-5.4",
-                "gpt-5.4-pro",
-                "gpt-5.4-nano",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex",
-            ]
+            vec!["gpt-5.5", "gpt-5.4", "gpt-5.4-mini",]
         );
         assert!(!app.model_search_has_filter_input());
 
@@ -13272,7 +13306,12 @@ wire_api = "responses"
         app.select_provider(settings::ACCOUNT_OPENROUTER)?;
         assert_eq!(app.surface, Surface::ModelSearch);
         assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENROUTER));
-        // Typeahead filters the seeded ids; the raw query is offered too.
+        assert!(app.provider_models.is_empty());
+        assert!(matches!(
+            app.get_provider_credential(settings::ACCOUNT_OPENROUTER),
+            ProviderCredential::ApiKey(key) if key == "sk-or-test"
+        ));
+        // Until the key-scoped fetch returns, typed raw ids are still offered
         app.composer.set_input("kimi".to_string());
         let rows = app.model_search_rows();
         assert!(rows.iter().any(|id| id.contains("kimi")));
