@@ -927,22 +927,21 @@ fn local_connect_default_profile_preflight(
     if !is_plain_local_connect_command(resolved_command) || has_default_profile {
         return Ok(None);
     }
-    let profiles = match backend.command(
-        session_id,
-        cwd,
-        artifact_dir,
-        "browser local profiles --json",
-    ) {
-        Ok(output) => output.content,
-        Err(_) => return Ok(None),
-    };
-    if profiles
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|status| status == "failed")
-    {
-        return Ok(None);
-    }
+    let profiles = backend
+        .command(
+            session_id,
+            cwd,
+            artifact_dir,
+            "browser local profiles --json",
+        )
+        .map(|output| output.content)
+        .unwrap_or_else(|error| {
+            json!({
+                "status": "failed",
+                "error": format!("{error:#}"),
+                "profiles": [],
+            })
+        });
     let local_profiles = profiles
         .get("local_profiles")
         .or_else(|| profiles.get("profiles"))
@@ -962,7 +961,7 @@ fn local_connect_default_profile_preflight(
     }))
 }
 
-fn enrich_local_connect_recovery_with_default_profile(
+pub(crate) fn enrich_local_connect_recovery_with_default_profile(
     mut output: BrowserCommandOutput,
     resolved_command: &str,
     default_profile_id: Option<&str>,
@@ -1007,11 +1006,17 @@ fn enrich_local_connect_recovery_with_default_profile(
         }
         "permission-blocked" => {
             content.insert("default_profile_id".to_string(), json!(profile_id));
+            let focus_command =
+                format!("browser local open --profile {quoted_profile} --no-marker");
+            content.insert(
+                "profile_recovery_command".to_string(),
+                json!(focus_command.clone()),
+            );
             content.insert(
                 "next_step".to_string(),
-                json!(
-                    "Ask the user to click Allow in Chrome's 'Allow remote debugging?' popup, then run `browser connect local`. Do not run `browser local open` again while permission is pending; the selected profile was already opened before this connect attempt."
-                ),
+                json!(format!(
+                    "Run `{focus_command}` to open/focus the selected Chrome profile without creating a marker tab, then immediately run `browser connect local` again to trigger Chrome's 'Allow remote debugging?' popup. If that fresh connect still returns permission-blocked, ask the user to click Allow and reply when done."
+                )),
             );
         }
         "profile-target-missing" => {
@@ -1029,6 +1034,84 @@ fn enrich_local_connect_recovery_with_default_profile(
         }
         _ => {}
     }
+    output
+}
+
+fn enforce_local_connect_default_profile_context(
+    output: BrowserCommandOutput,
+    resolved_command: &str,
+    default_profile_id: Option<&str>,
+) -> BrowserCommandOutput {
+    if !is_plain_local_connect_command(resolved_command) {
+        return output;
+    }
+    let Some(profile_id) = default_profile_id
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
+    else {
+        return output;
+    };
+    if output.content.get("status").and_then(Value::as_str) != Some("connected") {
+        return output;
+    }
+    if browser_status_local_profile_id(&output.content) == Some(profile_id) {
+        return output;
+    }
+
+    let candidate = output
+        .content
+        .get("candidate")
+        .or_else(|| output.content.pointer("/browser/candidate"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let quoted_profile = shell_quote_browser_arg(profile_id);
+    BrowserCommandOutput {
+        content: json!({
+            "status": "blocked",
+            "state": "profile-target-missing",
+            "reason": "Local Chrome connected, but not to the selected default profile target. Refusing to continue in an arbitrary Chrome profile.",
+            "default_profile_id": profile_id,
+            "candidate": candidate,
+            "profile_recovery_command": format!("browser local open --profile {quoted_profile}"),
+            "next_step": format!("Run `browser local open --profile {quoted_profile}`, give Chrome a moment, then run `browser connect local` again. Do not ask the user to pick a profile and do not use shell/open to switch profiles."),
+            "browser_task_blocked": true,
+            "model_instruction": "Browser work is blocked. Do not answer the user's browser/search/page task from memory and do not ask the user to choose a Chrome profile when a default_profile_id is present. Follow next_step with the browser tool, then retry browser work.",
+        }),
+        events: output.events,
+    }
+}
+
+fn enrich_local_profiles_with_default_profile(
+    mut output: BrowserCommandOutput,
+    resolved_command: &str,
+    default_profile_id: Option<&str>,
+) -> BrowserCommandOutput {
+    let Ok(words) = browser_command_words(resolved_command) else {
+        return output;
+    };
+    let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+    if !matches!(
+        words.as_slice(),
+        ["browser", "local", "profiles", ..] | ["local", "profiles", ..]
+    ) {
+        return output;
+    }
+    let Some(profile_id) = default_profile_id
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
+    else {
+        return output;
+    };
+    let Some(content) = output.content.as_object_mut() else {
+        return output;
+    };
+    content.insert("default_profile_id".to_string(), json!(profile_id));
+    content.insert(
+        "model_instruction".to_string(),
+        json!(
+            "A default local Chrome profile is already set. Do not ask the user which profile to use for browser work. Use the default profile; only change it if the user explicitly asks to switch profiles."
+        ),
+    );
     output
 }
 
@@ -1097,16 +1180,7 @@ fn ensure_local_browser_ready_for_work(
 
     let status = backend.command(session_id, cwd, artifact_dir, "browser status --json")?;
     if local_browser_ready_for_profile(&status.content, profile_id) {
-        if let Ok(reattach) = backend.command(
-            session_id,
-            cwd,
-            artifact_dir,
-            "browser recover reattach-same-target",
-        ) {
-            if local_browser_ready_for_profile(&reattach.content, profile_id) {
-                return Ok(());
-            }
-        }
+        return Ok(());
     }
 
     if browser_status_connection(&status.content) == Some("connected") {
@@ -2197,6 +2271,16 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 let output = backend
                                     .command(&session_id, &cwd, &artifact_dir, &resolved)
                                     .map_err(ToolError::Other)?;
+                                let output = enrich_local_profiles_with_default_profile(
+                                    output,
+                                    &resolved,
+                                    default_profile_id.as_deref(),
+                                );
+                                let output = enforce_local_connect_default_profile_context(
+                                    output,
+                                    &resolved,
+                                    default_profile_id.as_deref(),
+                                );
                                 enrich_local_connect_recovery_with_default_profile(
                                     output,
                                     &resolved,
@@ -2245,6 +2329,20 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             None
                         };
                         drop(store);
+                        if mode == "local" && default_profile_id.is_none() {
+                            if let Some(preflight) = local_connect_default_profile_preflight(
+                                false,
+                                backend.as_ref(),
+                                &session_id,
+                                &cwd,
+                                &artifact_dir,
+                                "browser connect local",
+                            )
+                            .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                            {
+                                return Ok(map_command_output(preflight));
+                            }
+                        }
                         ensure_browser_ready_for_work(
                             backend.as_ref(),
                             &session_id,
