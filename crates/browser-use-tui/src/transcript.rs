@@ -19,8 +19,9 @@ use crate::theme::{
 use super::{
     active_followup_is_after_next_tool_call, active_followup_is_cancelled_in_events,
     active_followup_is_pending_in_events, user_input_display_text_from_payload, App,
-    PENDING_FOLLOWUP_INTERRUPT_REASON, SESSION_MAILBOX_CONTINUATION_STARTED_EVENT,
-    SESSION_PAUSED_REASON, SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
+    LOCAL_CHROME_CLOUD_PROMO_EVENT, PENDING_FOLLOWUP_INTERRUPT_REASON,
+    SESSION_MAILBOX_CONTINUATION_STARTED_EVENT, SESSION_PAUSED_REASON,
+    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
 };
 
 const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
@@ -211,6 +212,9 @@ enum TranscriptKind {
         markdown: String,
         source: Option<String>,
     },
+    Notice {
+        text: String,
+    },
     StreamingAssistant {
         markdown: String,
     },
@@ -281,6 +285,7 @@ impl TranscriptNode {
                 }
                 lines
             }
+            TranscriptKind::Notice { text } => notice_lines(text, width),
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown_cell_lines(markdown, width, mode)
             }
@@ -341,6 +346,7 @@ impl TranscriptNode {
                 }
                 out
             }
+            TranscriptKind::Notice { text } => text.lines().map(str::to_string).collect(),
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown.lines().map(str::to_string).collect()
             }
@@ -913,6 +919,18 @@ fn committed_node_for_event(
                     markdown: text,
                     source: source_for_state(state),
                 },
+            })
+        }
+        LOCAL_CHROME_CLOUD_PROMO_EVENT => {
+            let text = payload_string(event, "text")?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(TranscriptNode {
+                id,
+                seq: event.seq,
+                revision: event.seq.max(0) as u64,
+                kind: TranscriptKind::Notice { text },
             })
         }
         "session.done" => {
@@ -2597,6 +2615,13 @@ fn markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<Lin
     lines
 }
 
+fn notice_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    wrap_plain(text.trim_end(), width)
+        .into_iter()
+        .map(|(_, row)| Line::from(styled_notice_spans(&row, activity_task())))
+        .collect()
+}
+
 fn source_display_lines(source: &str, width: u16) -> Vec<Line<'static>> {
     let prefix = "source ";
     let first_width = width.saturating_sub(prefix.chars().count() as u16).max(1);
@@ -2683,6 +2708,24 @@ fn styled_value_spans(_group: &str, text: &str, fallback: Style) -> Vec<Span<'st
         return spans;
     }
     styled_path_tokens(text, fallback)
+}
+
+fn styled_notice_spans(text: &str, fallback: Style) -> Vec<Span<'static>> {
+    let Some(start) = text.find("[cloud.browser-use.com]") else {
+        return styled_path_tokens(text, fallback);
+    };
+    let end = start + "[cloud.browser-use.com]".len();
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.extend(styled_path_tokens(&text[..start], fallback));
+    }
+    spans.push(Span::styled("[".to_string(), fallback));
+    spans.push(Span::styled("cloud.browser-use.com".to_string(), link()));
+    spans.push(Span::styled("]".to_string(), fallback));
+    if end < text.len() {
+        spans.extend(styled_path_tokens(&text[end..], fallback));
+    }
+    spans
 }
 
 fn styled_activity_line_spans(text: &str, fallback: Style) -> Option<Vec<Span<'static>>> {
@@ -4469,5 +4512,27 @@ mod tests {
             group_label_style("run", NodeStyle::Normal),
             group_label_style("explored", NodeStyle::Normal)
         );
+    }
+
+    #[test]
+    fn cloud_promo_notice_body_and_link_are_colored() {
+        let lines = notice_lines(
+            "[tip] Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]",
+            120,
+        );
+        let spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .collect::<Vec<_>>();
+
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "[tip]" && span.style == activity_task()));
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "Cloud" && span.style == activity_task()));
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "cloud.browser-use.com" && span.style == link()));
     }
 }

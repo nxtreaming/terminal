@@ -387,6 +387,7 @@ fn render_main(
             ProductState::Ready => Some(crate::welcome::logo_screen_rect(
                 body_content_rect,
                 app.status_notice.is_some(),
+                cloud_home_banner_lines(app, body_width).map_or(0, |lines| lines.len()),
             )),
             ProductState::SetupNeeded => Some(setup_logo_screen_rect(body_content_rect)),
             ProductState::Running
@@ -3006,6 +3007,9 @@ struct ContextComponent {
 #[derive(Debug, Default, Clone)]
 struct ContextUsageSummary {
     latest_input_tokens: Option<i64>,
+    latest_cached_input_tokens: Option<i64>,
+    total_input_tokens: Option<i64>,
+    total_cached_input_tokens: Option<i64>,
     context_window: Option<i64>,
 }
 
@@ -3088,6 +3092,15 @@ fn context_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'s
         lines.push(Line::from(spans));
     }
 
+    let cache_lines = prompt_cache_lines(&usage);
+    if !cache_lines.is_empty() {
+        // ---- Provider prompt cache ----
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Prompt cache", bold())));
+        lines.push(Line::from(""));
+        lines.extend(cache_lines);
+    }
+
     // ---- What's in it ----
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("What's using it", bold())));
@@ -3117,12 +3130,23 @@ fn context_usage_from_events(events: &[EventRecord]) -> ContextUsageSummary {
         let Some(info) = event.payload.get("info").filter(|info| info.is_object()) else {
             continue;
         };
-        if let Some(input) = info
+        if let Some(usage) = info
             .get("last_token_usage")
-            .and_then(|usage| usage.get("input_tokens"))
-            .and_then(Value::as_i64)
+            .filter(|usage| usage.is_object())
         {
-            summary.latest_input_tokens = Some(input.max(0));
+            if let Some(input) = usage.get("input_tokens").and_then(Value::as_i64) {
+                summary.latest_input_tokens = Some(input.max(0));
+            }
+            summary.latest_cached_input_tokens = cached_input_from_usage(usage);
+        }
+        if let Some(usage) = info
+            .get("total_token_usage")
+            .filter(|usage| usage.is_object())
+        {
+            if let Some(input) = usage.get("input_tokens").and_then(Value::as_i64) {
+                summary.total_input_tokens = Some(input.max(0));
+            }
+            summary.total_cached_input_tokens = cached_input_from_usage(usage);
         }
         if let Some(context_window) = info
             .get("model_context_window")
@@ -3133,6 +3157,49 @@ fn context_usage_from_events(events: &[EventRecord]) -> ContextUsageSummary {
         }
     }
     summary
+}
+
+fn cached_input_from_usage(usage: &Value) -> Option<i64> {
+    usage
+        .get("cached_input_tokens")
+        .or_else(|| usage.get("input_cached_tokens"))
+        .and_then(Value::as_i64)
+        .map(|cached| cached.max(0))
+}
+
+fn prompt_cache_lines(usage: &ContextUsageSummary) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let (Some(input), Some(cached)) =
+        (usage.latest_input_tokens, usage.latest_cached_input_tokens)
+    {
+        lines.push(prompt_cache_line("last turn", cached, input));
+    }
+    if let (Some(input), Some(cached)) = (usage.total_input_tokens, usage.total_cached_input_tokens)
+    {
+        lines.push(prompt_cache_line("session total", cached, input));
+    }
+    lines
+}
+
+fn prompt_cache_line(label: &str, cached: i64, input: i64) -> Line<'static> {
+    let cached = cached.max(0);
+    let input = input.max(0);
+    let percent = context_percent(cached, input);
+    let uncached = input.saturating_sub(cached);
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{label:<12}"), muted()),
+        Span::styled(format!("{percent:>4}"), accent()),
+        Span::raw("  "),
+        Span::styled(format_token_count(cached), text_style()),
+        Span::styled(" cached", muted()),
+        Span::styled(" / ", dim()),
+        Span::styled(format_token_count(input), text_style()),
+        Span::styled(" input", muted()),
+        Span::styled("  ", muted()),
+        Span::styled(format_token_count(uncached), dim()),
+        Span::styled(" uncached", dim()),
+    ])
 }
 
 fn context_composition_from_events(events: &[EventRecord]) -> ContextComposition {
@@ -3554,6 +3621,7 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16, max_h: u16) -> Vec
         lines.push(Line::from(Span::styled(notice.clone(), failed())));
         lines.push(Line::from(""));
     }
+    let banner = cloud_home_banner_lines(app, width);
     // Pass the remaining body height to the welcome renderer so it can
     // balance the gap above the logo with the gap below the menu.
     let remaining = max_h.saturating_sub(lines.len() as u16);
@@ -3562,8 +3630,62 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16, max_h: u16) -> Vec
         &app.welcome_anim,
         app.selected_row,
         remaining,
+        banner,
     ));
     let _ = state;
+    lines
+}
+
+fn cloud_home_banner_lines(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
+    if width == 0 || app.surface != Surface::Main || app.is_slash_palette_active() {
+        return None;
+    }
+    if app.browser_use_cloud_key_ready().unwrap_or(true) {
+        return None;
+    }
+
+    let wrap_width = (width as usize).saturating_sub(8).clamp(16, 64);
+    let words = [
+        ("Use", text_style()),
+        ("a", text_style()),
+        ("Cloud", text_style()),
+        ("browser", text_style()),
+        ("to", text_style()),
+        ("avoid", text_style()),
+        ("manual", text_style()),
+        ("permissions", text_style()),
+        ("and", text_style()),
+        ("get", text_style()),
+        ("automatic", text_style()),
+        ("captcha-solving!", text_style()),
+        ("[cloud.browser-use.com]", link()),
+    ];
+    Some(wrap_styled_words(&words, wrap_width))
+}
+
+fn wrap_styled_words(words: &[(&'static str, Style)], max_width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+
+    for (word, style) in words {
+        let word_width = word.chars().count();
+        let separator_width = usize::from(current_width > 0);
+        if current_width > 0 && current_width + separator_width + word_width > max_width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            current_width = 0;
+        }
+        if current_width > 0 {
+            spans.push(Span::styled(" ", text_style()));
+            current_width += 1;
+        }
+        spans.push(Span::styled(*word, *style));
+        current_width += word_width;
+    }
+
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
     lines
 }
 
