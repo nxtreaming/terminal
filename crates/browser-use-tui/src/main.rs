@@ -58,7 +58,7 @@ use browser_use_providers::{
 use browser_use_store::StoreNotifier;
 use browser_use_store::{resolve_state_dir, Store, StoreNotification};
 use clap::{Parser, ValueEnum};
-use crossterm::cursor::{MoveTo, Show};
+use crossterm::cursor::{MoveTo, RestorePosition, SavePosition, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as TermEvent,
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
@@ -81,7 +81,6 @@ use ratatui::widgets::{Clear as RatatuiClear, Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 #[cfg(unix)]
 use signal_hook::consts::signal::SIGUSR2;
-use unicode_width::UnicodeWidthStr;
 
 #[cfg(test)]
 static BROWSER_USE_TERMINAL_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -5361,7 +5360,7 @@ impl App {
     }
 
     fn should_capture_mouse(&self) -> bool {
-        self.should_capture_welcome_mouse() || self.should_capture_live_link_mouse()
+        self.should_capture_welcome_mouse()
     }
 
     fn trace_mouse_event(
@@ -5371,7 +5370,6 @@ impl App {
         row: u16,
         before_cursor: usize,
         logo_handled: bool,
-        live_link_handled: bool,
     ) {
         let Some(path) = std::env::var_os("BUT_MOUSE_TRACE").filter(|path| !path.is_empty()) else {
             return;
@@ -5411,7 +5409,6 @@ impl App {
             "before_cursor": before_cursor,
             "after_cursor": self.composer.cursor_index(),
             "logo_handled": logo_handled,
-            "live_link_handled": live_link_handled,
             "line_lengths": line_lengths,
         });
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -5439,35 +5436,6 @@ impl App {
         }
         self.welcome_anim.throw();
         true
-    }
-
-    fn should_capture_live_link_mouse(&self) -> bool {
-        self.live_link_overlay
-            .borrow()
-            .as_ref()
-            .is_some_and(|link| !link.text.is_empty())
-    }
-
-    fn live_link_url_at(&self, column: u16, row: u16) -> Option<String> {
-        let overlay = self.live_link_overlay.borrow();
-        let link = overlay.as_ref()?;
-        if link.text.is_empty() || row != link.row {
-            return None;
-        }
-        let width = u16::try_from(link.text.chars().count()).unwrap_or(u16::MAX);
-        let end = link.col.saturating_add(width);
-        if column < link.col || column >= end {
-            return None;
-        }
-        Some(link.url.clone())
-    }
-
-    fn handle_live_link_click(&mut self, column: u16, row: u16) -> Result<bool> {
-        let Some(url) = self.live_link_url_at(column, row) else {
-            return Ok(false);
-        };
-        self.request_open_browser_target(url)?;
-        Ok(true)
     }
 
     fn execute_surface_selection(&mut self) -> Result<()> {
@@ -8884,12 +8852,14 @@ fn draw_live_link_overlay(target: &mut CrosstermBackend<io::Stdout>, app: &App) 
     }
     queue!(
         target,
+        SavePosition,
         SetAttribute(Attribute::Reset),
         SetForegroundColor(ratatui_color_to_crossterm(link.fg)),
         MoveTo(link.col, link.row),
         Print(live_link_osc8(&link.url, &link.text)),
         ResetColor,
         SetAttribute(Attribute::Reset),
+        RestorePosition,
     )?;
     target.flush()?;
     Ok(())
@@ -9057,17 +9027,9 @@ fn handle_terminal_event(
         }) => {
             let kind_label = mouse_event_kind_label(kind);
             let before_cursor = app.composer.cursor_index();
-            let is_button_down = matches!(kind, MouseEventKind::Down(_));
-            let logo_handled = is_button_down && app.handle_welcome_logo_click(column, row);
-            let live_link_handled = is_button_down && app.handle_live_link_click(column, row)?;
-            app.trace_mouse_event(
-                kind_label,
-                column,
-                row,
-                before_cursor,
-                logo_handled,
-                live_link_handled,
-            );
+            let logo_handled = matches!(kind, MouseEventKind::Down(_))
+                && app.handle_welcome_logo_click(column, row);
+            app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
@@ -9241,9 +9203,19 @@ fn maybe_emit_native_transcript(
         let live_stream = native_live_stream_plan(app, model, width);
 
         if !history_active {
-            let emission =
-                transcript::terminal_scrollback_emission_since(model, 0, width, defer_open_tail);
-            let mut lines = crate::welcome::session_header_lines(width);
+            let emission = transcript::terminal_scrollback_native_emission_since(
+                model,
+                0,
+                width,
+                defer_open_tail,
+            );
+            let mut lines = crate::welcome::session_header_lines(width)
+                .into_iter()
+                .map(|line| transcript::NativeLine {
+                    line,
+                    links: Vec::new(),
+                })
+                .collect::<Vec<_>>();
             lines.extend(emission.lines);
             return NativeTranscriptEmissionPlan {
                 reset_session: true,
@@ -9257,7 +9229,7 @@ fn maybe_emit_native_transcript(
         let mut committed_lines = Vec::new();
         let mut committed_last_seq = None;
         if model.last_event_seq > after_seq {
-            let mut emission = transcript::terminal_scrollback_emission_since(
+            let mut emission = transcript::terminal_scrollback_native_emission_since(
                 model,
                 after_seq,
                 width,
@@ -9284,10 +9256,19 @@ fn maybe_emit_native_transcript(
     };
 
     if plan.reset_session {
-        insert_native_lines(terminal, plan.committed_lines)?;
+        insert_native_lines(
+            terminal,
+            plan.committed_lines,
+            Some(Path::new(&session.cwd)),
+        )?;
         app.native_history
             .reset_for_session_with_group(session_id, plan.reset_last_seq, None);
-        apply_native_live_stream_plan(terminal, app, plan.live_stream)?;
+        apply_native_live_stream_plan(
+            terminal,
+            app,
+            plan.live_stream,
+            Some(Path::new(&session.cwd)),
+        )?;
         return Ok(());
     }
 
@@ -9297,16 +9278,25 @@ fn maybe_emit_native_transcript(
         app.native_history.clear_live_stream();
     }
     if !plan.committed_lines.is_empty() {
-        insert_native_lines(terminal, plan.committed_lines)?;
+        insert_native_lines(
+            terminal,
+            plan.committed_lines,
+            Some(Path::new(&session.cwd)),
+        )?;
     }
-    apply_native_live_stream_plan(terminal, app, plan.live_stream)?;
+    apply_native_live_stream_plan(
+        terminal,
+        app,
+        plan.live_stream,
+        Some(Path::new(&session.cwd)),
+    )?;
     Ok(())
 }
 
 struct NativeTranscriptEmissionPlan {
     reset_session: bool,
     reset_last_seq: i64,
-    committed_lines: Vec<Line<'static>>,
+    committed_lines: Vec<transcript::NativeLine>,
     committed_last_seq: Option<i64>,
     live_stream: NativeLiveStreamPlan,
 }
@@ -9317,7 +9307,7 @@ struct NativeLiveStreamPlan {
     session_id: String,
     width: u16,
     emit_count: usize,
-    lines: Vec<Line<'static>>,
+    lines: Vec<transcript::NativeLine>,
     emitted_text_lines: Vec<String>,
 }
 
@@ -9326,12 +9316,16 @@ fn native_live_stream_plan(
     model: &transcript::TranscriptModel,
     width: u16,
 ) -> NativeLiveStreamPlan {
-    let lines = transcript::active_streaming_lines(Some(model), width);
-    let emit_count = if transcript::active_streaming_can_commit_all(Some(model)) && lines.len() > 1
+    let lines = transcript::active_streaming_native_lines(Some(model), width);
+    let commit_prefix_lines =
+        transcript::active_streaming_native_commit_prefix_lines(Some(model), width);
+    let commit_prefix_len = commit_prefix_lines.len().min(lines.len());
+    let emit_count = if commit_prefix_len < lines.len()
+        || (transcript::active_streaming_can_commit_all(Some(model)) && lines.len() > 1)
     {
-        lines.len()
+        commit_prefix_len
     } else {
-        lines.len().saturating_sub(1)
+        commit_prefix_len.saturating_sub(1)
     };
     if emit_count == 0 {
         return NativeLiveStreamPlan {
@@ -9346,11 +9340,17 @@ fn native_live_stream_plan(
     if emit_count <= already {
         return NativeLiveStreamPlan::default();
     }
-    let mut emitted_lines = lines[already..emit_count].to_vec();
+    let mut emitted_lines = commit_prefix_lines[already..emit_count].to_vec();
     if already == 0 {
-        emitted_lines.insert(0, Line::from(""));
+        emitted_lines.insert(
+            0,
+            transcript::NativeLine {
+                line: Line::from(""),
+                links: Vec::new(),
+            },
+        );
     }
-    let emitted_text_lines = plain_text_lines(&lines[..emit_count]);
+    let emitted_text_lines = plain_text_lines(&commit_prefix_lines[..emit_count]);
     NativeLiveStreamPlan {
         clear_live_stream: false,
         session_id: model.session_id.clone(),
@@ -9365,6 +9365,7 @@ fn apply_native_live_stream_plan(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     plan: NativeLiveStreamPlan,
+    base_cwd: Option<&Path>,
 ) -> Result<()> {
     if plan.clear_live_stream {
         app.native_history.clear_live_stream();
@@ -9373,7 +9374,7 @@ fn apply_native_live_stream_plan(
     if plan.lines.is_empty() {
         return Ok(());
     }
-    insert_native_lines(terminal, plan.lines)?;
+    insert_native_lines(terminal, plan.lines, base_cwd)?;
     app.native_history.set_live_stream_emitted_lines(
         &plan.session_id,
         plan.width,
@@ -9384,9 +9385,9 @@ fn apply_native_live_stream_plan(
 }
 
 fn strip_live_stream_prefix(
-    lines: Vec<Line<'static>>,
+    lines: Vec<transcript::NativeLine>,
     live_stream_prefix: &[String],
-) -> Vec<Line<'static>> {
+) -> Vec<transcript::NativeLine> {
     if live_stream_prefix.is_empty() || lines.is_empty() {
         return lines;
     }
@@ -9421,8 +9422,12 @@ fn live_stream_prefix_start(line_text: &[String], live_stream_prefix: &[String])
     })
 }
 
-fn plain_text_lines(lines: &[Line<'static>]) -> Vec<String> {
-    lines_plain_text(lines)
+fn plain_text_lines(lines: &[transcript::NativeLine]) -> Vec<String> {
+    let render_lines = lines
+        .iter()
+        .map(|line| line.line.clone())
+        .collect::<Vec<_>>();
+    lines_plain_text(&render_lines)
         .lines()
         .map(ToOwned::to_owned)
         .collect()
@@ -9468,20 +9473,25 @@ fn reset_inline_viewport_origin(
 
 fn insert_native_lines(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    lines: Vec<Line<'static>>,
+    lines: Vec<transcript::NativeLine>,
+    base_cwd: Option<&Path>,
 ) -> Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
     clear_inline_viewport_for_native_insert(terminal)?;
     let height = lines.len().try_into().unwrap_or(u16::MAX).max(1);
-    let hyperlinks = collect_native_hyperlink_segments(&lines);
+    let hyperlinks = native_hyperlink_segments(&lines, base_cwd);
+    let render_lines = lines
+        .into_iter()
+        .map(|native_line| native_line.line)
+        .collect::<Vec<_>>();
     terminal.insert_before(height, |buf| {
         let area = buf.area.inner(Margin {
             vertical: 0,
             horizontal: NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
         });
-        Paragraph::new(lines).render(area, buf);
+        Paragraph::new(render_lines).render(area, buf);
         apply_native_hyperlinks(buf, area, &hyperlinks);
     })?;
     Ok(())
@@ -9504,93 +9514,26 @@ struct NativeHyperlinkSegment {
     target: String,
 }
 
-#[derive(Clone, Debug)]
-struct PendingNativeHyperlink {
-    target: String,
-    segments: Vec<NativeHyperlinkSegment>,
-}
-
-#[derive(Clone, Debug)]
-struct LinkSpanFragment {
-    start_col: usize,
-    width: usize,
-    text: String,
-}
-
-fn collect_native_hyperlink_segments(lines: &[Line<'static>]) -> Vec<NativeHyperlinkSegment> {
-    let mut out = Vec::new();
-    let mut pending: Option<PendingNativeHyperlink> = None;
-
-    for (line_idx, line) in lines.iter().enumerate() {
-        let fragments = link_span_fragments(line);
-        let line_is_wrapped_link = !fragments.is_empty() && line_has_only_link_text(line);
-
-        if !line_is_wrapped_link {
-            flush_pending_hyperlink(&mut out, &mut pending);
-            for fragment in fragments {
-                let trimmed = fragment.text.trim();
-                if clickable_target_for_link_text(trimmed).is_some() {
-                    out.push(NativeHyperlinkSegment {
+fn native_hyperlink_segments(
+    lines: &[transcript::NativeLine],
+    base_cwd: Option<&Path>,
+) -> Vec<NativeHyperlinkSegment> {
+    lines
+        .iter()
+        .enumerate()
+        .flat_map(|(line_idx, line)| {
+            line.links.iter().filter_map(move |link| {
+                clickable_target_for_link_text(&link.target, base_cwd).map(|target| {
+                    NativeHyperlinkSegment {
                         line: line_idx,
-                        start_col: fragment.start_col,
-                        width: fragment.width,
-                        target: trimmed.to_string(),
-                    });
-                }
-            }
-            continue;
-        }
-
-        let Some(first_fragment) = fragments.first() else {
-            continue;
-        };
-        let first_text = first_fragment.text.trim();
-        if clickable_target_for_link_text(first_text).is_some() {
-            flush_pending_hyperlink(&mut out, &mut pending);
-            pending = Some(PendingNativeHyperlink {
-                target: String::new(),
-                segments: Vec::new(),
-            });
-        } else if pending.is_none() {
-            continue;
-        }
-
-        if let Some(group) = pending.as_mut() {
-            for fragment in fragments {
-                group.target.push_str(fragment.text.trim());
-                group.segments.push(NativeHyperlinkSegment {
-                    line: line_idx,
-                    start_col: fragment.start_col,
-                    width: fragment.width,
-                    target: String::new(),
-                });
-            }
-        }
-    }
-
-    flush_pending_hyperlink(&mut out, &mut pending);
-    out
-}
-
-fn flush_pending_hyperlink(
-    out: &mut Vec<NativeHyperlinkSegment>,
-    pending: &mut Option<PendingNativeHyperlink>,
-) {
-    let Some(group) = pending.take() else {
-        return;
-    };
-    if clickable_target_for_link_text(&group.target).is_none() {
-        return;
-    }
-    out.extend(
-        group
-            .segments
-            .into_iter()
-            .map(|segment| NativeHyperlinkSegment {
-                target: group.target.clone(),
-                ..segment
-            }),
-    );
+                        start_col: link.start_col,
+                        width: link.width,
+                        target,
+                    }
+                })
+            })
+        })
+        .collect()
 }
 
 fn abbreviated_goal_objective(value: &str) -> String {
@@ -9730,31 +9673,7 @@ fn format_goal_tokens_compact(tokens: i64) -> String {
     }
 }
 
-fn link_span_fragments(line: &Line<'static>) -> Vec<LinkSpanFragment> {
-    let mut fragments = Vec::new();
-    let mut col = 0;
-    for span in &line.spans {
-        let text = span.content.as_ref();
-        let width = UnicodeWidthStr::width(text);
-        if span.style == theme::link() && !text.trim().is_empty() && width > 0 {
-            fragments.push(LinkSpanFragment {
-                start_col: col,
-                width,
-                text: text.to_string(),
-            });
-        }
-        col += width;
-    }
-    fragments
-}
-
-fn line_has_only_link_text(line: &Line<'static>) -> bool {
-    line.spans
-        .iter()
-        .all(|span| span.content.trim().is_empty() || span.style == theme::link())
-}
-
-fn clickable_target_for_link_text(value: &str) -> Option<String> {
+fn clickable_target_for_link_text(value: &str, base_cwd: Option<&Path>) -> Option<String> {
     let value = value.trim();
     if value.is_empty() || value.chars().any(char::is_control) {
         return None;
@@ -9763,9 +9682,69 @@ fn clickable_target_for_link_text(value: &str) -> Option<String> {
     {
         return Some(value.replace('\\', "%5C"));
     }
-    value
-        .starts_with('/')
-        .then(|| format!("file://{}", percent_encode_file_url_path(value)))
+    local_file_url_for_link_text(value, base_cwd)
+}
+
+fn local_file_url_for_link_text(value: &str, base_cwd: Option<&Path>) -> Option<String> {
+    let path = if value.starts_with('/') {
+        PathBuf::from(value)
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+        PathBuf::from(home).join(rest)
+    } else if value.starts_with("./")
+        || value.starts_with("../")
+        || native_local_file_extension(value).is_some()
+    {
+        base_cwd
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())?
+            .join(value)
+    } else {
+        return None;
+    };
+    Some(format!(
+        "file://{}",
+        percent_encode_file_url_path(&path.display().to_string())
+    ))
+}
+
+fn native_local_file_extension(value: &str) -> Option<&str> {
+    let extension = value.rsplit_once('.')?.1;
+    matches!(
+        extension,
+        "rs" | "toml"
+            | "lock"
+            | "md"
+            | "py"
+            | "json"
+            | "jsonl"
+            | "yaml"
+            | "yml"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "css"
+            | "scss"
+            | "html"
+            | "sql"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "txt"
+            | "log"
+            | "xml"
+            | "svg"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "pdf"
+            | "diff"
+            | "patch"
+    )
+    .then_some(extension)
 }
 
 fn percent_encode_file_url_path(path: &str) -> String {
@@ -9802,9 +9781,10 @@ fn apply_native_hyperlinks(buf: &mut Buffer, area: Rect, hyperlinks: &[NativeHyp
             continue;
         }
         let end_x = start_x + visible_width as u16 - 1;
-        let Some(target) = clickable_target_for_link_text(&segment.target) else {
+        let target = strip_terminal_controls(&segment.target);
+        if target.is_empty() {
             continue;
-        };
+        }
         let open = format!("\x1b]8;;{target}\x1b\\");
         let close = "\x1b]8;;\x1b\\";
 
@@ -10836,7 +10816,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn live_status_link_click_opens_recorded_live_url() -> Result<()> {
+    fn live_status_link_does_not_capture_terminal_mouse() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.browser = BROWSER_USE_CLOUD.to_string();
@@ -10856,7 +10836,6 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id.clone());
 
         let _screen = render_dump(&mut app)?;
-        assert!(app.should_capture_mouse());
         let link = app
             .live_link_overlay
             .borrow()
@@ -10864,17 +10843,10 @@ mod redesign_tests {
             .map(|link| (link.col, link.row, link.url.clone()))
             .context("live link overlay")?;
         assert_eq!(link.2, live_url);
-
-        assert!(app.handle_live_link_click(link.0, link.1)?);
-        assert!(!app.handle_live_link_click(link.0.saturating_sub(1), link.1)?);
-
-        let events = app.store.events_for_session(&session.id)?;
-        let targets = events
-            .iter()
-            .filter(|event| event.event_type == "browser.open_requested")
-            .filter_map(|event| event.payload.get("target").and_then(|value| value.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(targets, vec![live_url]);
+        assert!(
+            !app.should_capture_mouse(),
+            "live links must stay terminal-native so scrollback and text selection keep working"
+        );
         Ok(())
     }
 
@@ -14601,6 +14573,76 @@ wire_api = "responses"
     }
 
     #[test]
+    fn native_live_stream_plan_defers_open_markdown_table() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "make a table"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+
+        let plan = native_live_stream_plan(&app, &model, 100);
+        let emitted = plain_text_lines(&plan.lines).join("\n");
+
+        assert!(emitted.contains("Intro."), "{emitted}");
+        assert!(!emitted.contains("Name"), "{emitted}");
+        assert!(!emitted.contains("Apples"), "{emitted}");
+        Ok(())
+    }
+
+    #[test]
+    fn native_live_stream_plan_emits_closed_table_before_live_tail() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "make a table"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |\n\nNext paragraph"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+
+        let plan = native_live_stream_plan(&app, &model, 100);
+        let emitted = plain_text_lines(&plan.lines).join("\n");
+
+        assert!(emitted.contains("Intro."), "{emitted}");
+        assert!(emitted.contains("Name"), "{emitted}");
+        assert!(emitted.contains("Apples"), "{emitted}");
+        assert!(!emitted.contains("| Name | Count |"), "{emitted}");
+        assert!(!emitted.contains("Next paragraph"), "{emitted}");
+        Ok(())
+    }
+
+    #[test]
     fn pre_tool_streaming_text_commits_before_tool_rows() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -14887,12 +14929,14 @@ wire_api = "responses"
     #[test]
     fn live_stream_prefix_strips_after_deferred_warning_rows() {
         let lines = vec![
-            Line::from("• warning"),
-            Line::from("  └ Model `gpt-5.5` is not in the active model catalog."),
-            Line::from(
+            transcript::NativeLine::plain(Line::from("• warning")),
+            transcript::NativeLine::plain(Line::from(
+                "  └ Model `gpt-5.5` is not in the active model catalog.",
+            )),
+            transcript::NativeLine::plain(Line::from(
                 "Not much. I'm in /Users/reagan/.superset/projects/browser-use-terminal and",
-            ),
-            Line::from("ready to work on the repo."),
+            )),
+            transcript::NativeLine::plain(Line::from("ready to work on the repo.")),
         ];
         let prefix = vec![
             "Not much. I'm in /Users/reagan/.superset/projects/browser-use-terminal and"
@@ -14914,9 +14958,13 @@ wire_api = "responses"
     #[test]
     fn live_stream_prefix_preserves_separator_before_remaining_tail() {
         let lines = vec![
-            Line::from(""),
-            Line::from("I'll inspect the repo structure and key docs/config first, then"),
-            Line::from("summarize what it appears to be and how it's organized."),
+            transcript::NativeLine::plain(Line::from("")),
+            transcript::NativeLine::plain(Line::from(
+                "I'll inspect the repo structure and key docs/config first, then",
+            )),
+            transcript::NativeLine::plain(Line::from(
+                "summarize what it appears to be and how it's organized.",
+            )),
         ];
         let prefix =
             vec!["I'll inspect the repo structure and key docs/config first, then".to_string()];
@@ -15068,98 +15116,6 @@ wire_api = "responses"
             out,
             "\x1b]8;;https://x.test/]0;pwned?a=1\x1b\\https://x...[2J\x1b]8;;\x1b\\"
         );
-    }
-
-    #[test]
-    fn wrapped_native_links_use_the_full_url_for_each_visible_fragment() {
-        let lines = vec![
-            Line::from(ratatui::text::Span::styled(
-                "https://en.wikiped",
-                theme::link(),
-            )),
-            Line::from(ratatui::text::Span::styled(
-                "ia.org/wiki/Apple_Inc.",
-                theme::link(),
-            )),
-        ];
-
-        let hyperlinks = collect_native_hyperlink_segments(&lines);
-        assert_eq!(hyperlinks.len(), 2);
-        assert_eq!(
-            hyperlinks[0].target,
-            "https://en.wikipedia.org/wiki/Apple_Inc."
-        );
-        assert_eq!(hyperlinks[1].target, hyperlinks[0].target);
-        assert_eq!(hyperlinks[0].line, 0);
-        assert_eq!(hyperlinks[1].line, 1);
-    }
-
-    #[test]
-    fn file_native_links_use_the_full_url_for_each_visible_fragment() {
-        let lines = vec![
-            Line::from(ratatui::text::Span::styled(
-                "file:///tmp/browser-use-terminal/.browser-use-terminal/",
-                theme::link(),
-            )),
-            Line::from(ratatui::text::Span::styled(
-                "artifacts/session/result.json",
-                theme::link(),
-            )),
-        ];
-
-        let hyperlinks = collect_native_hyperlink_segments(&lines);
-        assert_eq!(hyperlinks.len(), 2);
-        assert_eq!(
-            hyperlinks[0].target,
-            "file:///tmp/browser-use-terminal/.browser-use-terminal/artifacts/session/result.json"
-        );
-        assert_eq!(hyperlinks[1].target, hyperlinks[0].target);
-    }
-
-    #[test]
-    fn absolute_file_path_native_links_encode_to_file_urls() {
-        let lines = vec![Line::from(ratatui::text::Span::styled(
-            "/tmp/browser use/result #1.json",
-            theme::link(),
-        ))];
-
-        let hyperlinks = collect_native_hyperlink_segments(&lines);
-        assert_eq!(hyperlinks.len(), 1);
-        assert_eq!(hyperlinks[0].target, "/tmp/browser use/result #1.json");
-
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 1));
-        let area = buffer.area;
-        Paragraph::new(lines).render(area, &mut buffer);
-        apply_native_hyperlinks(&mut buffer, area, &hyperlinks);
-
-        assert!(buffer[(0, 0)]
-            .symbol()
-            .starts_with("\x1b]8;;file:///tmp/browser%20use/result%20%231.json\x1b\\/"));
-    }
-
-    #[test]
-    fn native_link_escape_annotation_keeps_visible_symbols_clickable() {
-        let lines = vec![
-            Line::from(ratatui::text::Span::styled(
-                "https://example",
-                theme::link(),
-            )),
-            Line::from(ratatui::text::Span::styled(".com/docs", theme::link())),
-        ];
-        let hyperlinks = collect_native_hyperlink_segments(&lines);
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 2));
-        let area = buffer.area;
-        Paragraph::new(lines).render(area, &mut buffer);
-        apply_native_hyperlinks(&mut buffer, area, &hyperlinks);
-
-        assert!(buffer[(0, 0)]
-            .symbol()
-            .starts_with("\x1b]8;;https://example.com/docs\x1b\\h"));
-        assert!(buffer[(14, 0)].symbol().ends_with("\x1b]8;;\x1b\\"));
-        assert!(buffer[(0, 1)]
-            .symbol()
-            .starts_with("\x1b]8;;https://example.com/docs\x1b\\."));
-        assert!(buffer[(8, 1)].symbol().ends_with("\x1b]8;;\x1b\\"));
     }
 
     #[test]
