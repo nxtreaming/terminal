@@ -3466,16 +3466,14 @@ impl BrowserSession {
         } else {
             let targets = self.targets()?;
             let launched_profile_id = self.preferred_profile_id.take();
+            let allow_initial_placeholder = self.mode == BrowserMode::RemoteCloud;
             let target_info = if launched_profile_id.is_some() {
                 targets
                     .iter()
                     .find(|target| is_page_target(target) && !is_profile_marker_target(target))
                     .cloned()
             } else {
-                targets
-                    .iter()
-                    .find(|target| is_real_page_target(target))
-                    .cloned()
+                select_initial_page_target(&targets, allow_initial_placeholder)
             };
             if launched_profile_id.is_some() {
                 attached_profile_id = launched_profile_id;
@@ -3584,16 +3582,14 @@ impl BrowserSession {
         } else {
             let targets = self.targets_with_deadline(deadline)?;
             let launched_profile_id = self.preferred_profile_id.take();
+            let allow_initial_placeholder = self.mode == BrowserMode::RemoteCloud;
             let target_info = if launched_profile_id.is_some() {
                 targets
                     .iter()
                     .find(|target| is_page_target(target) && !is_profile_marker_target(target))
                     .cloned()
             } else {
-                targets
-                    .iter()
-                    .find(|target| is_real_page_target(target))
-                    .cloned()
+                select_initial_page_target(&targets, allow_initial_placeholder)
             };
             if launched_profile_id.is_some() {
                 attached_profile_id = launched_profile_id;
@@ -7519,6 +7515,12 @@ const GIF_MIN_DELAY_MS: u32 = 400;
 const GIF_MAX_DELAY_MS: u32 = 2500;
 const GIF_SPEED: i32 = 12; // image crate GifEncoder speed 1..=30 (higher = faster encode, coarser palette)
 
+fn gif_generation_enabled() -> bool {
+    // Temporarily disable all GIF generation while keeping frame capture and
+    // JPEG contact-sheet helpers available for debugging/inspection.
+    false
+}
+
 /// One frame to include in the summary GIF: its file and how long to dwell on it.
 pub struct GifFrame {
     pub path: PathBuf,
@@ -7720,6 +7722,9 @@ pub fn build_captioned_gif(
     selection: &[CaptionedFrame],
     out_path: &Path,
 ) -> Result<usize> {
+    if !gif_generation_enabled() {
+        bail!("GIF generation is temporarily disabled");
+    }
     use image::codecs::gif::{GifEncoder, Repeat};
     let frames_dir = latest_frames_dir(artifact_root)
         .ok_or_else(|| anyhow!("no capture frames under {}", artifact_root.display()))?;
@@ -7777,6 +7782,9 @@ pub fn build_captioned_gif(
 /// Build an animated GIF from the given (already curated) frames, dwelling on
 /// each for a clamped function of its hold_ms. Writes to `out_path`.
 pub fn build_summary_gif(frames: &[GifFrame], out_path: &Path) -> Result<()> {
+    if !gif_generation_enabled() {
+        bail!("GIF generation is temporarily disabled");
+    }
     use image::codecs::gif::{GifEncoder, Repeat};
     if frames.is_empty() {
         bail!("build_summary_gif: no frames provided");
@@ -7887,6 +7895,9 @@ pub fn build_curated_gif(
     selection: &[CurationSelection],
     confirmation_seq: Option<u32>,
 ) -> Result<CurationResult> {
+    if !gif_generation_enabled() {
+        bail!("GIF generation is temporarily disabled");
+    }
     let frames_dir = latest_frames_dir(artifact_root)
         .ok_or_else(|| anyhow!("no capture frames found under {}", artifact_root.display()))?;
     let manifest = read_frame_manifest(&frames_dir)?;
@@ -7963,8 +7974,12 @@ pub fn capture_contact_sheet(artifact_root: &Path, caps: StitchCaps) -> Result<O
 /// Deterministic fallback recording: a summary GIF of ALL unique frames (seq
 /// order, dwell from hold_ms) from the latest capture under `artifact_root`.
 /// Used when LLM curation didn't run (non-vision model, or the model didn't call
-/// submit_capture_curation) so a recording always exists. Ok(None) with no frames.
+/// submit_capture_curation). While GIF generation is disabled, this returns
+/// Ok(None) without producing an artifact.
 pub fn build_uncurated_summary_gif(artifact_root: &Path) -> Result<Option<PathBuf>> {
+    if !gif_generation_enabled() {
+        return Ok(None);
+    }
     let Some(frames_dir) = latest_frames_dir(artifact_root) else {
         return Ok(None);
     };
@@ -8257,6 +8272,36 @@ fn is_real_page_target(target: &Value) -> bool {
         return false;
     }
     true
+}
+
+fn select_initial_page_target(targets: &[Value], allow_placeholder: bool) -> Option<Value> {
+    targets
+        .iter()
+        .find(|target| is_real_page_target(target))
+        .cloned()
+        .or_else(|| {
+            allow_placeholder
+                .then(|| {
+                    targets
+                        .iter()
+                        .find(|target| is_reusable_placeholder_page_target(target))
+                        .cloned()
+                })
+                .flatten()
+        })
+}
+
+fn is_reusable_placeholder_page_target(target: &Value) -> bool {
+    if !is_page_target(target) || is_profile_marker_target(target) {
+        return false;
+    }
+    let url = target
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    url.is_empty() || url == "about:blank"
 }
 
 fn is_internal_browser_url(url: &str) -> bool {
@@ -8595,6 +8640,18 @@ mod tests {
     }
 
     #[test]
+    fn gif_generation_is_temporarily_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("summary.gif");
+
+        assert_eq!(build_uncurated_summary_gif(temp.path()).unwrap(), None);
+
+        let err = build_summary_gif(&[], &out).unwrap_err().to_string();
+        assert!(err.contains("GIF generation is temporarily disabled"));
+        assert!(!out.exists());
+    }
+
+    #[test]
     fn latest_frames_dir_ignores_capture_dirs_without_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -8849,6 +8906,50 @@ mod tests {
             "url": "https://dashboard.brex.com/account-management/home",
             "title": "Brex",
         })));
+    }
+
+    #[test]
+    fn initial_target_selection_prefers_real_page() {
+        let targets = vec![
+            json!({
+                "type": "page",
+                "targetId": "blank",
+                "url": "about:blank",
+            }),
+            json!({
+                "type": "page",
+                "targetId": "real",
+                "url": "https://example.test",
+            }),
+        ];
+
+        let selected = select_initial_page_target(&targets, true).expect("selected target");
+
+        assert_eq!(selected["targetId"], "real");
+    }
+
+    #[test]
+    fn cloud_initial_target_selection_reuses_existing_blank_page() {
+        let targets = vec![json!({
+            "type": "page",
+            "targetId": "cloud-start-page",
+            "url": "about:blank",
+        })];
+
+        let selected = select_initial_page_target(&targets, true).expect("selected target");
+
+        assert_eq!(selected["targetId"], "cloud-start-page");
+    }
+
+    #[test]
+    fn non_cloud_initial_target_selection_rejects_existing_blank_page() {
+        let targets = vec![json!({
+            "type": "page",
+            "targetId": "local-start-page",
+            "url": "about:blank",
+        })];
+
+        assert!(select_initial_page_target(&targets, false).is_none());
     }
 
     #[test]
