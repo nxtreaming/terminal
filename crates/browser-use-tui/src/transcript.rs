@@ -52,8 +52,14 @@ pub(crate) struct TranscriptModel {
     live_phase: usize,
 }
 
+#[cfg(test)]
 pub(crate) struct TerminalScrollbackEmission {
     pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) last_seq: i64,
+}
+
+pub(crate) struct TerminalNativeScrollbackEmission {
+    pub(crate) lines: Vec<NativeLine>,
     pub(crate) last_seq: i64,
 }
 
@@ -330,6 +336,71 @@ impl TranscriptNode {
         }
     }
 
+    fn native_display_lines(&self, width: u16, mode: DisplayMode) -> Vec<NativeLine> {
+        let width = width.max(1);
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => cells_to_native_lines(nodes.iter(), width, mode),
+            TranscriptKind::Prompt { text, followup } => {
+                plain_native_lines(prompt_lines(text, *followup, width))
+            }
+            TranscriptKind::PendingStatus { status, detail } => plain_native_lines(
+                pending_status_lines(status, detail.as_deref(), ShimmerMode::Static),
+            ),
+            TranscriptKind::Assistant { markdown, source } => {
+                let mut lines = native_markdown_cell_lines(markdown, width, mode);
+                if let Some(source) = source.as_deref() {
+                    lines.extend(native_source_display_lines(source, width));
+                }
+                lines
+            }
+            TranscriptKind::Notice { text } => plain_native_lines(notice_lines(text, width)),
+            TranscriptKind::StreamingAssistant { markdown } => {
+                native_markdown_cell_lines(markdown, width, mode)
+            }
+            TranscriptKind::ResultFile {
+                file_path,
+                bytes,
+                mime,
+                source,
+            } => {
+                let mut lines = native_result_file_lines(file_path, *bytes, mime.as_deref(), width);
+                if let Some(source) = source.as_deref() {
+                    lines.extend(native_source_display_lines(source, width));
+                }
+                lines
+            }
+            TranscriptKind::Timeline {
+                group,
+                lines,
+                style,
+            }
+            | TranscriptKind::ActiveStatus {
+                group,
+                lines,
+                style,
+            } => native_grouped_lines(group, lines, *style, width),
+            TranscriptKind::ToolImage {
+                path,
+                label,
+                took_screenshot,
+            } => native_tool_image_display_lines(
+                path.as_deref(),
+                label.as_deref(),
+                *took_screenshot,
+                width,
+            ),
+            TranscriptKind::Error { text } => native_grouped_lines(
+                "error",
+                &[friendly_error_message(text)],
+                NodeStyle::Failed,
+                width,
+            ),
+            TranscriptKind::Cancelled { title, text, style } => {
+                native_grouped_lines(title, std::slice::from_ref(text), *style, width)
+            }
+        }
+    }
+
     fn plain_lines(&self) -> Vec<String> {
         match &self.kind {
             TranscriptKind::Stack { nodes } => {
@@ -538,6 +609,20 @@ impl TranscriptNode {
         }
     }
 
+    fn streaming_native_display_lines(&self, width: u16) -> Vec<NativeLine> {
+        let width = width.max(1);
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => nodes
+                .iter()
+                .flat_map(|node| node.streaming_native_display_lines(width))
+                .collect(),
+            TranscriptKind::StreamingAssistant { markdown } => {
+                native_markdown_cell_lines(markdown, width, DisplayMode::Active)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn can_commit_full_live_stream(&self) -> bool {
         match &self.kind {
             TranscriptKind::Stack { nodes } => nodes.iter().enumerate().any(|(idx, node)| {
@@ -676,6 +761,29 @@ pub(crate) fn all_terminal_scrollback_lines(
     )
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct NativeLineLink {
+    pub(crate) start_col: usize,
+    pub(crate) width: usize,
+    pub(crate) target: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeLine {
+    pub(crate) line: Line<'static>,
+    pub(crate) links: Vec<NativeLineLink>,
+}
+
+impl NativeLine {
+    pub(crate) fn plain(line: Line<'static>) -> Self {
+        Self {
+            line,
+            links: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn terminal_scrollback_emission_since(
     model: &TranscriptModel,
     after_seq: i64,
@@ -699,6 +807,33 @@ pub(crate) fn terminal_scrollback_emission_since(
     }
     TerminalScrollbackEmission {
         lines: cells_to_lines(nodes.iter(), width, DisplayMode::Scrollback),
+        last_seq,
+    }
+}
+
+pub(crate) fn terminal_scrollback_native_emission_since(
+    model: &TranscriptModel,
+    after_seq: i64,
+    width: u16,
+    defer_open_tail: bool,
+) -> TerminalNativeScrollbackEmission {
+    let mut nodes = Vec::new();
+    let mut last_seq = after_seq;
+    for node in model
+        .terminal_committed
+        .iter()
+        .filter(|node| node.seq() > after_seq)
+        .filter(|node| !node.is_terminal_scrollback_transient())
+    {
+        last_seq = node.seq();
+        push_committed_node(&mut nodes, node.clone());
+    }
+    if defer_open_tail && nodes.last().is_some_and(is_open_timeline_node) {
+        nodes.pop();
+        last_seq = nodes.last().map(TranscriptNode::seq).unwrap_or(after_seq);
+    }
+    TerminalNativeScrollbackEmission {
+        lines: cells_to_native_lines(nodes.iter(), width, DisplayMode::Scrollback),
         last_seq,
     }
 }
@@ -770,6 +905,16 @@ pub(crate) fn active_streaming_lines(
         .unwrap_or_default()
 }
 
+pub(crate) fn active_streaming_native_lines(
+    model: Option<&TranscriptModel>,
+    width: u16,
+) -> Vec<NativeLine> {
+    model
+        .and_then(|model| model.active.as_ref())
+        .map(|active| active.streaming_native_display_lines(width))
+        .unwrap_or_default()
+}
+
 pub(crate) fn active_streaming_can_commit_all(model: Option<&TranscriptModel>) -> bool {
     model
         .and_then(|model| model.active.as_ref())
@@ -834,6 +979,57 @@ fn cells_to_lines<'a>(
         previous_kind = Some(&node.kind);
     }
     out
+}
+
+fn cells_to_native_lines<'a>(
+    nodes: impl Iterator<Item = &'a TranscriptNode>,
+    width: u16,
+    mode: DisplayMode,
+) -> Vec<NativeLine> {
+    let mut out = Vec::new();
+    let mut previous_kind = None;
+    for node in nodes {
+        let _ = (node.id(), node.revision());
+        if !out.is_empty() {
+            let gap = previous_kind
+                .map(|previous| gap_lines_between(previous, &node.kind))
+                .unwrap_or(0);
+            if gap > 0 {
+                out.extend(std::iter::repeat_with(|| NativeLine::plain(Line::from(""))).take(gap));
+            }
+        }
+        out.extend(node.native_display_lines(width, mode));
+        previous_kind = Some(&node.kind);
+    }
+    out
+}
+
+fn plain_native_lines(lines: Vec<Line<'static>>) -> Vec<NativeLine> {
+    lines
+        .into_iter()
+        .map(native_line_from_styled_line)
+        .collect()
+}
+
+fn native_line_from_styled_line(line: Line<'static>) -> NativeLine {
+    let mut links = Vec::new();
+    let mut col = 0usize;
+    for span in &line.spans {
+        let text = span.content.as_ref();
+        let width = display_width(text);
+        if (span.style == link() || span.style == path_reference())
+            && !text.trim().is_empty()
+            && width > 0
+        {
+            links.push(NativeLineLink {
+                start_col: col,
+                width,
+                target: text.trim().to_string(),
+            });
+        }
+        col = col.saturating_add(width);
+    }
+    NativeLine { line, links }
 }
 
 pub(crate) fn gap_before_active(model: &TranscriptModel) -> usize {
@@ -2390,6 +2586,24 @@ fn tool_image_display_lines(
     grouped_lines(group, &[line], NodeStyle::Normal, width)
 }
 
+fn native_tool_image_display_lines(
+    path: Option<&str>,
+    label: Option<&str>,
+    took_screenshot: bool,
+    width: u16,
+) -> Vec<NativeLine> {
+    let line = path
+        .map(ToOwned::to_owned)
+        .or_else(|| label.map(|label| format!("image: {label}")))
+        .unwrap_or_else(|| "image attached".to_string());
+    let group = if took_screenshot {
+        "took screenshot"
+    } else {
+        "read image"
+    };
+    native_grouped_lines(group, &[line], NodeStyle::Normal, width)
+}
+
 fn tool_image_plain_lines(
     path: Option<&str>,
     label: Option<&str>,
@@ -2615,6 +2829,10 @@ fn markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<Lin
     lines
 }
 
+fn native_markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<NativeLine> {
+    plain_native_lines(markdown_cell_lines(markdown, width, mode))
+}
+
 fn notice_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     wrap_plain(text.trim_end(), width)
         .into_iter()
@@ -2664,6 +2882,38 @@ fn source_display_lines(source: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+fn native_source_display_lines(source: &str, width: u16) -> Vec<NativeLine> {
+    explicit_target_lines(source_display_lines(source, width), source)
+}
+
+fn explicit_target_lines(lines: Vec<Line<'static>>, target: &str) -> Vec<NativeLine> {
+    lines
+        .into_iter()
+        .map(|line| explicit_target_line(line, target))
+        .collect()
+}
+
+fn explicit_target_line(line: Line<'static>, target: &str) -> NativeLine {
+    let mut links = Vec::new();
+    let mut col = 0usize;
+    for span in &line.spans {
+        let text = span.content.as_ref();
+        let width = display_width(text);
+        if (span.style == link() || span.style == path_reference())
+            && !text.trim().is_empty()
+            && width > 0
+        {
+            links.push(NativeLineLink {
+                start_col: col,
+                width,
+                target: target.to_string(),
+            });
+        }
+        col = col.saturating_add(width);
+    }
+    NativeLine { line, links }
+}
+
 fn grouped_lines(
     group: &str,
     values: &[String],
@@ -2698,6 +2948,138 @@ fn grouped_lines(
         lines.push(Line::from(spans));
     }
     lines
+}
+
+fn native_grouped_lines(
+    group: &str,
+    values: &[String],
+    style: NodeStyle,
+    width: u16,
+) -> Vec<NativeLine> {
+    let mut lines = Vec::new();
+    lines.push(NativeLine::plain(Line::from(vec![
+        Span::styled("• ", dim()),
+        Span::styled(group.to_string(), group_label_style(group, style)),
+    ])));
+    let value_style = body_style(style);
+    let prefix_width = display_width(GROUP_VALUE_LAST_PREFIX) as u16;
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let value_rows = values
+        .iter()
+        .flat_map(|value| native_wrapped_value_fragments(group, value, value_style, content_width))
+        .collect::<Vec<_>>();
+    let last_idx = value_rows.len().saturating_sub(1);
+    for (idx, row) in value_rows.into_iter().enumerate() {
+        let prefix = if idx == last_idx {
+            GROUP_VALUE_LAST_PREFIX
+        } else {
+            GROUP_VALUE_RAIL_PREFIX
+        };
+        lines.push(native_line_from_prefixed_fragments(prefix, row));
+    }
+    lines
+}
+
+#[derive(Clone, Debug)]
+struct NativeStyledFragment {
+    text: String,
+    style: Style,
+    target: Option<String>,
+}
+
+fn native_wrapped_value_fragments(
+    group: &str,
+    value: &str,
+    fallback: Style,
+    width: u16,
+) -> Vec<Vec<NativeStyledFragment>> {
+    let fragments = styled_value_spans(group, value, fallback)
+        .into_iter()
+        .map(|span| {
+            let text = span.content.into_owned();
+            let target = ((span.style == link() || span.style == path_reference())
+                && !text.trim().is_empty())
+            .then(|| text.trim().to_string());
+            NativeStyledFragment {
+                text,
+                style: span.style,
+                target,
+            }
+        })
+        .collect::<Vec<_>>();
+    wrap_native_fragments(fragments, width)
+}
+
+fn wrap_native_fragments(
+    fragments: Vec<NativeStyledFragment>,
+    width: u16,
+) -> Vec<Vec<NativeStyledFragment>> {
+    let width = width.max(1) as usize;
+    let mut rows = vec![Vec::new()];
+    let mut line_width = 0usize;
+    for fragment in fragments {
+        for ch in fragment.text.chars() {
+            let ch_width = ch.width().unwrap_or(0).max(1);
+            if line_width > 0 && line_width + ch_width > width {
+                rows.push(Vec::new());
+                line_width = 0;
+            }
+            append_native_fragment_char(
+                rows.last_mut()
+                    .expect("native fragment rows are never empty"),
+                ch,
+                fragment.style,
+                fragment.target.clone(),
+            );
+            line_width += ch_width;
+        }
+    }
+    rows
+}
+
+fn append_native_fragment_char(
+    row: &mut Vec<NativeStyledFragment>,
+    ch: char,
+    style: Style,
+    target: Option<String>,
+) {
+    if let Some(last) = row
+        .last_mut()
+        .filter(|last| last.style == style && last.target == target)
+    {
+        last.text.push(ch);
+        return;
+    }
+    row.push(NativeStyledFragment {
+        text: ch.to_string(),
+        style,
+        target,
+    });
+}
+
+fn native_line_from_prefixed_fragments(
+    prefix: &str,
+    fragments: Vec<NativeStyledFragment>,
+) -> NativeLine {
+    let mut spans = vec![Span::styled(prefix.to_string(), dim())];
+    let mut links = Vec::new();
+    let mut col = display_width(prefix);
+    for fragment in fragments {
+        let width = display_width(&fragment.text);
+        if let Some(target) = fragment.target.as_ref().filter(|_| width > 0) {
+            links.push(NativeLineLink {
+                start_col: col,
+                width,
+                target: target.clone(),
+            });
+        }
+        col = col.saturating_add(width);
+        spans.push(Span::styled(fragment.text, fragment.style));
+    }
+    NativeLine {
+        line: Line::from(spans),
+        links,
+    }
 }
 
 fn styled_value_spans(_group: &str, text: &str, fallback: Style) -> Vec<Span<'static>> {
@@ -2965,6 +3347,12 @@ fn source_extension(token: &str) -> Option<&str> {
             | "log"
             | "xml"
             | "svg"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "pdf"
             | "diff"
             | "patch"
     )
@@ -3235,6 +3623,30 @@ fn result_file_lines(
     if let Some(metadata) = result_file_metadata(bytes, mime) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(metadata, muted())));
+    }
+    lines
+}
+
+fn native_result_file_lines(
+    file_path: &str,
+    bytes: Option<u64>,
+    mime: Option<&str>,
+    width: u16,
+) -> Vec<NativeLine> {
+    let mut lines = vec![
+        NativeLine::plain(Line::from(Span::styled("Saved result file", text_style()))),
+        NativeLine::plain(Line::from("")),
+    ];
+    let path_style = result_file_path_style(file_path);
+    lines.extend(wrap_plain(file_path, width).into_iter().map(|(_, line)| {
+        explicit_target_line(Line::from(Span::styled(line, path_style)), file_path)
+    }));
+    if let Some(metadata) = result_file_metadata(bytes, mime) {
+        lines.push(NativeLine::plain(Line::from("")));
+        lines.push(NativeLine::plain(Line::from(Span::styled(
+            metadata,
+            muted(),
+        ))));
     }
     lines
 }
@@ -4369,6 +4781,70 @@ mod tests {
     }
 
     #[test]
+    fn native_source_wraps_each_visible_fragment_with_original_target() {
+        let source = "https://live.browser-use.com?wss=https%3A%2F%2Fexample.cdp.browser-use.com";
+        let lines = native_source_display_lines(source, 42);
+        let linked_targets = lines
+            .iter()
+            .flat_map(|line| line.links.iter().map(|link| link.target.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(linked_targets.len() > 1, "{linked_targets:?}");
+        assert!(linked_targets.iter().all(|target| *target == source));
+    }
+
+    #[test]
+    fn native_wrapped_links_keep_separate_targets_for_following_paths() {
+        let url = "https://example.com/docs/";
+        let path = "README.md";
+        let lines = native_grouped_lines(
+            "source",
+            &[url.to_string(), path.to_string()],
+            NodeStyle::Normal,
+            32,
+        );
+        let linked_targets = lines
+            .iter()
+            .flat_map(|line| line.links.iter().map(|link| link.target.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(linked_targets.contains(&url), "{linked_targets:?}");
+        assert!(linked_targets.contains(&path), "{linked_targets:?}");
+        assert_eq!(
+            linked_targets
+                .iter()
+                .filter(|target| **target == url)
+                .count(),
+            1
+        );
+        assert_eq!(
+            linked_targets
+                .iter()
+                .filter(|target| **target == path)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_activity_artifact_path_keeps_full_target_after_wrapping() {
+        let path = "/Users/example/.browser-use-terminal/artifacts/session/capture-summary.gif";
+        let lines = native_grouped_lines(
+            "artifacts created",
+            &[format!("summary_gif {path}")],
+            NodeStyle::Normal,
+            46,
+        );
+        let linked_targets = lines
+            .iter()
+            .flat_map(|line| line.links.iter().map(|link| link.target.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(linked_targets.len() > 1, "{linked_targets:?}");
+        assert!(linked_targets.iter().all(|target| *target == path));
+    }
+
+    #[test]
     fn result_file_lines_render_full_path_as_clickable_text() {
         let path = "/tmp/browser use/artifacts/session/result.json";
         let lines = result_file_lines(path, Some(2048), Some("application/octet-stream"), 120);
@@ -4408,6 +4884,18 @@ mod tests {
         assert!(!path_spans
             .iter()
             .any(|span| span.content.contains("markdown.rs") && span.style == link()));
+    }
+
+    #[test]
+    fn activity_values_style_image_artifact_paths() {
+        let spans = styled_value_spans(
+            "took screenshot",
+            "80677223915_search_results_sf_food.png",
+            text_style(),
+        );
+        assert!(spans.iter().any(|span| {
+            span.content.contains("search_results_sf_food.png") && span.style == path_reference()
+        }));
     }
 
     #[test]
