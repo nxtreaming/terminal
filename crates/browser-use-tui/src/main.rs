@@ -11989,6 +11989,11 @@ mod redesign_tests {
         assert!(screen.contains("Tool definitions"));
         // Conversation categories still attributed from message events.
         assert!(screen.contains("Tool outputs"));
+        assert!(screen.contains("Prompt cache"));
+        assert!(screen.contains("last turn"));
+        assert!(screen.contains("57%"));
+        assert!(screen.contains("session total"));
+        assert!(screen.contains("5%"));
         // No mystery bucket and no raw message-text labels.
         assert!(!screen.contains("Unattributed"));
         assert!(!screen.contains("base instructions"));
@@ -12035,8 +12040,69 @@ mod redesign_tests {
 
         assert!(screen.contains("0/128k"));
         assert!(screen.contains("No context yet."));
+        assert!(!screen.contains("Prompt cache"));
         assert!(!screen.contains("50k/128k"));
         assert!(!screen.contains("User messages"));
+        Ok(())
+    }
+
+    #[test]
+    fn context_surface_hides_cache_when_latest_provider_has_no_cache_data() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect context usage"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 14000,
+                        "cached_input_tokens": 8000,
+                        "total_tokens": 14500
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 14000,
+                        "cached_input_tokens": 8000,
+                        "total_tokens": 14500
+                    },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 0
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 9000,
+                        "total_tokens": 9200
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 23000,
+                        "total_tokens": 23700
+                    },
+                    "model_context_window": 128000
+                },
+                "turn_idx": 1
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        app.args.height = 44;
+        app.open_surface(Surface::Context);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("9k/128k"));
+        assert!(!screen.contains("Prompt cache"));
+        assert!(!screen.contains("57%"));
         Ok(())
     }
 
