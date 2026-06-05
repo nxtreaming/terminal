@@ -58,7 +58,7 @@ use browser_use_providers::{
 use browser_use_store::StoreNotifier;
 use browser_use_store::{resolve_state_dir, Store, StoreNotification};
 use clap::{Parser, ValueEnum};
-use crossterm::cursor::{MoveTo, Show};
+use crossterm::cursor::{MoveTo, RestorePosition, SavePosition, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as TermEvent,
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
@@ -5361,7 +5361,7 @@ impl App {
     }
 
     fn should_capture_mouse(&self) -> bool {
-        self.should_capture_welcome_mouse() || self.should_capture_live_link_mouse()
+        self.should_capture_welcome_mouse()
     }
 
     fn trace_mouse_event(
@@ -5371,7 +5371,6 @@ impl App {
         row: u16,
         before_cursor: usize,
         logo_handled: bool,
-        live_link_handled: bool,
     ) {
         let Some(path) = std::env::var_os("BUT_MOUSE_TRACE").filter(|path| !path.is_empty()) else {
             return;
@@ -5411,7 +5410,6 @@ impl App {
             "before_cursor": before_cursor,
             "after_cursor": self.composer.cursor_index(),
             "logo_handled": logo_handled,
-            "live_link_handled": live_link_handled,
             "line_lengths": line_lengths,
         });
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -5439,35 +5437,6 @@ impl App {
         }
         self.welcome_anim.throw();
         true
-    }
-
-    fn should_capture_live_link_mouse(&self) -> bool {
-        self.live_link_overlay
-            .borrow()
-            .as_ref()
-            .is_some_and(|link| !link.text.is_empty())
-    }
-
-    fn live_link_url_at(&self, column: u16, row: u16) -> Option<String> {
-        let overlay = self.live_link_overlay.borrow();
-        let link = overlay.as_ref()?;
-        if link.text.is_empty() || row != link.row {
-            return None;
-        }
-        let width = u16::try_from(link.text.chars().count()).unwrap_or(u16::MAX);
-        let end = link.col.saturating_add(width);
-        if column < link.col || column >= end {
-            return None;
-        }
-        Some(link.url.clone())
-    }
-
-    fn handle_live_link_click(&mut self, column: u16, row: u16) -> Result<bool> {
-        let Some(url) = self.live_link_url_at(column, row) else {
-            return Ok(false);
-        };
-        self.request_open_browser_target(url)?;
-        Ok(true)
     }
 
     fn execute_surface_selection(&mut self) -> Result<()> {
@@ -8884,12 +8853,14 @@ fn draw_live_link_overlay(target: &mut CrosstermBackend<io::Stdout>, app: &App) 
     }
     queue!(
         target,
+        SavePosition,
         SetAttribute(Attribute::Reset),
         SetForegroundColor(ratatui_color_to_crossterm(link.fg)),
         MoveTo(link.col, link.row),
         Print(live_link_osc8(&link.url, &link.text)),
         ResetColor,
         SetAttribute(Attribute::Reset),
+        RestorePosition,
     )?;
     target.flush()?;
     Ok(())
@@ -9057,17 +9028,9 @@ fn handle_terminal_event(
         }) => {
             let kind_label = mouse_event_kind_label(kind);
             let before_cursor = app.composer.cursor_index();
-            let is_button_down = matches!(kind, MouseEventKind::Down(_));
-            let logo_handled = is_button_down && app.handle_welcome_logo_click(column, row);
-            let live_link_handled = is_button_down && app.handle_live_link_click(column, row)?;
-            app.trace_mouse_event(
-                kind_label,
-                column,
-                row,
-                before_cursor,
-                logo_handled,
-                live_link_handled,
-            );
+            let logo_handled = matches!(kind, MouseEventKind::Down(_))
+                && app.handle_welcome_logo_click(column, row);
+            app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
@@ -9284,10 +9247,19 @@ fn maybe_emit_native_transcript(
     };
 
     if plan.reset_session {
-        insert_native_lines(terminal, plan.committed_lines)?;
+        insert_native_lines(
+            terminal,
+            plan.committed_lines,
+            Some(Path::new(&session.cwd)),
+        )?;
         app.native_history
             .reset_for_session_with_group(session_id, plan.reset_last_seq, None);
-        apply_native_live_stream_plan(terminal, app, plan.live_stream)?;
+        apply_native_live_stream_plan(
+            terminal,
+            app,
+            plan.live_stream,
+            Some(Path::new(&session.cwd)),
+        )?;
         return Ok(());
     }
 
@@ -9297,9 +9269,18 @@ fn maybe_emit_native_transcript(
         app.native_history.clear_live_stream();
     }
     if !plan.committed_lines.is_empty() {
-        insert_native_lines(terminal, plan.committed_lines)?;
+        insert_native_lines(
+            terminal,
+            plan.committed_lines,
+            Some(Path::new(&session.cwd)),
+        )?;
     }
-    apply_native_live_stream_plan(terminal, app, plan.live_stream)?;
+    apply_native_live_stream_plan(
+        terminal,
+        app,
+        plan.live_stream,
+        Some(Path::new(&session.cwd)),
+    )?;
     Ok(())
 }
 
@@ -9365,6 +9346,7 @@ fn apply_native_live_stream_plan(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     plan: NativeLiveStreamPlan,
+    base_cwd: Option<&Path>,
 ) -> Result<()> {
     if plan.clear_live_stream {
         app.native_history.clear_live_stream();
@@ -9373,7 +9355,7 @@ fn apply_native_live_stream_plan(
     if plan.lines.is_empty() {
         return Ok(());
     }
-    insert_native_lines(terminal, plan.lines)?;
+    insert_native_lines(terminal, plan.lines, base_cwd)?;
     app.native_history.set_live_stream_emitted_lines(
         &plan.session_id,
         plan.width,
@@ -9469,13 +9451,14 @@ fn reset_inline_viewport_origin(
 fn insert_native_lines(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     lines: Vec<Line<'static>>,
+    base_cwd: Option<&Path>,
 ) -> Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
     clear_inline_viewport_for_native_insert(terminal)?;
     let height = lines.len().try_into().unwrap_or(u16::MAX).max(1);
-    let hyperlinks = collect_native_hyperlink_segments(&lines);
+    let hyperlinks = collect_native_hyperlink_segments(&lines, base_cwd);
     terminal.insert_before(height, |buf| {
         let area = buf.area.inner(Margin {
             vertical: 0,
@@ -9517,77 +9500,133 @@ struct LinkSpanFragment {
     text: String,
 }
 
-fn collect_native_hyperlink_segments(lines: &[Line<'static>]) -> Vec<NativeHyperlinkSegment> {
+fn collect_native_hyperlink_segments(
+    lines: &[Line<'static>],
+    base_cwd: Option<&Path>,
+) -> Vec<NativeHyperlinkSegment> {
     let mut out = Vec::new();
     let mut pending: Option<PendingNativeHyperlink> = None;
 
     for (line_idx, line) in lines.iter().enumerate() {
         let fragments = link_span_fragments(line);
-        let line_is_wrapped_link = !fragments.is_empty() && line_has_only_link_text(line);
-
-        if !line_is_wrapped_link {
-            flush_pending_hyperlink(&mut out, &mut pending);
-            for fragment in fragments {
-                let trimmed = fragment.text.trim();
-                if clickable_target_for_link_text(trimmed).is_some() {
-                    out.push(NativeHyperlinkSegment {
-                        line: line_idx,
-                        start_col: fragment.start_col,
-                        width: fragment.width,
-                        target: trimmed.to_string(),
-                    });
-                }
+        if let Some(first_fragment) = fragments.first() {
+            let first_text = first_fragment.text.trim();
+            if pending.is_some() && !starts_new_wrapped_hyperlink(first_text) {
+                append_fragments_to_pending(&mut pending, line_idx, fragments);
+                continue;
             }
+        }
+        flush_pending_hyperlink(&mut out, &mut pending, base_cwd);
+
+        if fragments.is_empty() {
             continue;
         }
 
-        let Some(first_fragment) = fragments.first() else {
-            continue;
-        };
-        let first_text = first_fragment.text.trim();
-        if clickable_target_for_link_text(first_text).is_some() {
-            flush_pending_hyperlink(&mut out, &mut pending);
+        let line_is_wrapped_link = line_has_only_link_text(line);
+        if line_is_wrapped_link {
+            let first_text = fragments[0].text.trim();
+            if clickable_target_for_link_text(first_text, base_cwd).is_none() {
+                continue;
+            }
             pending = Some(PendingNativeHyperlink {
                 target: String::new(),
                 segments: Vec::new(),
             });
-        } else if pending.is_none() {
+            append_fragments_to_pending(&mut pending, line_idx, fragments);
             continue;
         }
 
-        if let Some(group) = pending.as_mut() {
-            for fragment in fragments {
-                group.target.push_str(fragment.text.trim());
-                group.segments.push(NativeHyperlinkSegment {
+        for fragment in fragments {
+            let trimmed = fragment.text.trim();
+            let Some(target) = clickable_target_for_link_text(trimmed, base_cwd) else {
+                continue;
+            };
+            if fragment_is_trailing_link(line, &fragment) {
+                pending = Some(PendingNativeHyperlink {
+                    target: String::new(),
+                    segments: vec![NativeHyperlinkSegment {
+                        line: line_idx,
+                        start_col: fragment.start_col,
+                        width: fragment.width,
+                        target: String::new(),
+                    }],
+                });
+                if let Some(group) = pending.as_mut() {
+                    group.target.push_str(trimmed);
+                }
+            } else {
+                out.push(NativeHyperlinkSegment {
                     line: line_idx,
                     start_col: fragment.start_col,
                     width: fragment.width,
-                    target: String::new(),
+                    target,
                 });
             }
         }
     }
 
-    flush_pending_hyperlink(&mut out, &mut pending);
+    flush_pending_hyperlink(&mut out, &mut pending, base_cwd);
     out
+}
+
+fn append_fragments_to_pending(
+    pending: &mut Option<PendingNativeHyperlink>,
+    line_idx: usize,
+    fragments: Vec<LinkSpanFragment>,
+) {
+    let Some(group) = pending.as_mut() else {
+        return;
+    };
+    for fragment in fragments {
+        group.target.push_str(fragment.text.trim());
+        group.segments.push(NativeHyperlinkSegment {
+            line: line_idx,
+            start_col: fragment.start_col,
+            width: fragment.width,
+            target: String::new(),
+        });
+    }
+}
+
+fn starts_new_wrapped_hyperlink(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("https://")
+        || value.starts_with("http://")
+        || value.starts_with("file://")
+        || value.starts_with('/')
+        || value.starts_with("~/")
+        || value.starts_with("./")
+        || value.starts_with("../")
+}
+
+fn fragment_is_trailing_link(line: &Line<'static>, fragment: &LinkSpanFragment) -> bool {
+    fragment.start_col.saturating_add(fragment.width) >= line_display_width(line)
+}
+
+fn line_display_width(line: &Line<'static>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
 }
 
 fn flush_pending_hyperlink(
     out: &mut Vec<NativeHyperlinkSegment>,
     pending: &mut Option<PendingNativeHyperlink>,
+    base_cwd: Option<&Path>,
 ) {
     let Some(group) = pending.take() else {
         return;
     };
-    if clickable_target_for_link_text(&group.target).is_none() {
+    let Some(target) = clickable_target_for_link_text(&group.target, base_cwd) else {
         return;
-    }
+    };
     out.extend(
         group
             .segments
             .into_iter()
             .map(|segment| NativeHyperlinkSegment {
-                target: group.target.clone(),
+                target: target.clone(),
                 ..segment
             }),
     );
@@ -9736,7 +9775,7 @@ fn link_span_fragments(line: &Line<'static>) -> Vec<LinkSpanFragment> {
     for span in &line.spans {
         let text = span.content.as_ref();
         let width = UnicodeWidthStr::width(text);
-        if span.style == theme::link() && !text.trim().is_empty() && width > 0 {
+        if native_hyperlink_style(span.style) && !text.trim().is_empty() && width > 0 {
             fragments.push(LinkSpanFragment {
                 start_col: col,
                 width,
@@ -9751,10 +9790,14 @@ fn link_span_fragments(line: &Line<'static>) -> Vec<LinkSpanFragment> {
 fn line_has_only_link_text(line: &Line<'static>) -> bool {
     line.spans
         .iter()
-        .all(|span| span.content.trim().is_empty() || span.style == theme::link())
+        .all(|span| span.content.trim().is_empty() || native_hyperlink_style(span.style))
 }
 
-fn clickable_target_for_link_text(value: &str) -> Option<String> {
+fn native_hyperlink_style(style: ratatui::style::Style) -> bool {
+    style == theme::link() || style == theme::path_reference()
+}
+
+fn clickable_target_for_link_text(value: &str, base_cwd: Option<&Path>) -> Option<String> {
     let value = value.trim();
     if value.is_empty() || value.chars().any(char::is_control) {
         return None;
@@ -9763,9 +9806,69 @@ fn clickable_target_for_link_text(value: &str) -> Option<String> {
     {
         return Some(value.replace('\\', "%5C"));
     }
-    value
-        .starts_with('/')
-        .then(|| format!("file://{}", percent_encode_file_url_path(value)))
+    local_file_url_for_link_text(value, base_cwd)
+}
+
+fn local_file_url_for_link_text(value: &str, base_cwd: Option<&Path>) -> Option<String> {
+    let path = if value.starts_with('/') {
+        PathBuf::from(value)
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+        PathBuf::from(home).join(rest)
+    } else if value.starts_with("./")
+        || value.starts_with("../")
+        || native_local_file_extension(value).is_some()
+    {
+        base_cwd
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())?
+            .join(value)
+    } else {
+        return None;
+    };
+    Some(format!(
+        "file://{}",
+        percent_encode_file_url_path(&path.display().to_string())
+    ))
+}
+
+fn native_local_file_extension(value: &str) -> Option<&str> {
+    let extension = value.rsplit_once('.')?.1;
+    matches!(
+        extension,
+        "rs" | "toml"
+            | "lock"
+            | "md"
+            | "py"
+            | "json"
+            | "jsonl"
+            | "yaml"
+            | "yml"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "css"
+            | "scss"
+            | "html"
+            | "sql"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "txt"
+            | "log"
+            | "xml"
+            | "svg"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "pdf"
+            | "diff"
+            | "patch"
+    )
+    .then_some(extension)
 }
 
 fn percent_encode_file_url_path(path: &str) -> String {
@@ -9802,9 +9905,10 @@ fn apply_native_hyperlinks(buf: &mut Buffer, area: Rect, hyperlinks: &[NativeHyp
             continue;
         }
         let end_x = start_x + visible_width as u16 - 1;
-        let Some(target) = clickable_target_for_link_text(&segment.target) else {
+        let target = strip_terminal_controls(&segment.target);
+        if target.is_empty() {
             continue;
-        };
+        }
         let open = format!("\x1b]8;;{target}\x1b\\");
         let close = "\x1b]8;;\x1b\\";
 
@@ -10836,7 +10940,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn live_status_link_click_opens_recorded_live_url() -> Result<()> {
+    fn live_status_link_does_not_capture_terminal_mouse() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.browser = BROWSER_USE_CLOUD.to_string();
@@ -10856,7 +10960,6 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id.clone());
 
         let _screen = render_dump(&mut app)?;
-        assert!(app.should_capture_mouse());
         let link = app
             .live_link_overlay
             .borrow()
@@ -10864,17 +10967,10 @@ mod redesign_tests {
             .map(|link| (link.col, link.row, link.url.clone()))
             .context("live link overlay")?;
         assert_eq!(link.2, live_url);
-
-        assert!(app.handle_live_link_click(link.0, link.1)?);
-        assert!(!app.handle_live_link_click(link.0.saturating_sub(1), link.1)?);
-
-        let events = app.store.events_for_session(&session.id)?;
-        let targets = events
-            .iter()
-            .filter(|event| event.event_type == "browser.open_requested")
-            .filter_map(|event| event.payload.get("target").and_then(|value| value.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(targets, vec![live_url]);
+        assert!(
+            !app.should_capture_mouse(),
+            "live links must stay terminal-native so scrollback and text selection keep working"
+        );
         Ok(())
     }
 
@@ -15083,7 +15179,7 @@ wire_api = "responses"
             )),
         ];
 
-        let hyperlinks = collect_native_hyperlink_segments(&lines);
+        let hyperlinks = collect_native_hyperlink_segments(&lines, None);
         assert_eq!(hyperlinks.len(), 2);
         assert_eq!(
             hyperlinks[0].target,
@@ -15107,7 +15203,7 @@ wire_api = "responses"
             )),
         ];
 
-        let hyperlinks = collect_native_hyperlink_segments(&lines);
+        let hyperlinks = collect_native_hyperlink_segments(&lines, None);
         assert_eq!(hyperlinks.len(), 2);
         assert_eq!(
             hyperlinks[0].target,
@@ -15123,9 +15219,12 @@ wire_api = "responses"
             theme::link(),
         ))];
 
-        let hyperlinks = collect_native_hyperlink_segments(&lines);
+        let hyperlinks = collect_native_hyperlink_segments(&lines, None);
         assert_eq!(hyperlinks.len(), 1);
-        assert_eq!(hyperlinks[0].target, "/tmp/browser use/result #1.json");
+        assert_eq!(
+            hyperlinks[0].target,
+            "file:///tmp/browser%20use/result%20%231.json"
+        );
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 1));
         let area = buffer.area;
@@ -15146,7 +15245,7 @@ wire_api = "responses"
             )),
             Line::from(ratatui::text::Span::styled(".com/docs", theme::link())),
         ];
-        let hyperlinks = collect_native_hyperlink_segments(&lines);
+        let hyperlinks = collect_native_hyperlink_segments(&lines, None);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 2));
         let area = buffer.area;
         Paragraph::new(lines).render(area, &mut buffer);

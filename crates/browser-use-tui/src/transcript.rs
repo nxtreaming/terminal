@@ -2965,6 +2965,12 @@ fn source_extension(token: &str) -> Option<&str> {
             | "log"
             | "xml"
             | "svg"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "pdf"
             | "diff"
             | "patch"
     )
@@ -4408,6 +4414,18 @@ mod tests {
         assert!(!path_spans
             .iter()
             .any(|span| span.content.contains("markdown.rs") && span.style == link()));
+    }
+
+    #[test]
+    fn activity_values_style_image_artifact_paths() {
+        let spans = styled_value_spans(
+            "took screenshot",
+            "80677223915_search_results_sf_food.png",
+            text_style(),
+        );
+        assert!(spans.iter().any(|span| {
+            span.content.contains("search_results_sf_food.png") && span.style == path_reference()
+        }));
     }
 
     #[test]
