@@ -10,7 +10,6 @@ browser preference --json
 browser preference use local
 browser profile suggest --domain example.com --json
 browser profile remember --domain example.com --profile google-chrome:Profile 2
-browser profile sync --profile google-chrome:Default --all-cookies
 browser domain skills --domain example.com --json
 browser connect
 browser connect local
@@ -44,7 +43,6 @@ Preferences:
 - `browser profile remember --domain <domain> --profile <profile-id> [--mode local|cloud]` stores the profile to use next time for that domain.
 - `browser domain skills --domain <domain> --json` lists matching browser-harness domain skill files. Use `--include-content` when you need to read the playbook before navigation.
 - If a site likely needs login and no profile is remembered, run `browser profile suggest --domain <regex> --json` before connecting. In cloud mode, choose a profile whose matching cookie domains fit the target login domain, run `browser profile remember --mode cloud --profile <profile-id>`, then `browser connect`. Do not guess friendly cloud profile names like `Work`.
-- Browser Use Cloud profiles are snapshots, not live mirrors of local Chrome. If the chosen cloud profile still lands on a login/password page, refresh it from local Chrome before asking the user to log in: run a domain-filtered `browser profile sync --profile <local-profile-id> --domain <site-domain> --domain <identity-provider-domain> --cloud-profile-id <cloud-profile-id>`, then `browser remote stop`, then reconnect with that cloud profile. If no local profile is known, run `browser profile sync --domain <site-domain> --cloud-profile-id <cloud-profile-id>` so the tool can return local profile choices.
 - Do not silently attach to a different local profile when a profile is remembered.
 - Tool commands returned in `next_step` are internal actions for you to run. Never tell the user to run `browser ...` commands manually.
 
@@ -66,12 +64,6 @@ Local profiles:
 - If a profile id or name contains spaces, quote it like `browser local profiles inspect 'google-chrome:Profile 2' --domains-only`.
 - `browser local profiles inspect <profile-id-or-name> --domains-only` copies the selected profile into a temporary browser profile, starts that temporary copy with CDP, and returns only cookie domain/count/expiry metadata.
 - Raw cookie values are never returned by default. Profile inspection is for choosing the right profile, not for dumping secrets.
-- `browser profile sync --profile <profile-id-or-name> --all-cookies` imports cookies from a temporary copy of the local profile into a Browser Use cloud profile. All cookies are the default; add repeated `--domain <domain>` only when the user wants a narrower import.
-- Use domain-filtered sync to refresh stale cloud auth for a specific site. Include both the app domain and identity-provider domains when obvious, for example `--domain app.example.com --domain accounts.example.com`.
-- Cookie sync requires a configured Browser Use cloud key. If missing, open `/auth` for Browser Use cloud key setup, then rerun the sync command.
-- If `--cloud-profile-id` or `--cloud-profile-name` is omitted, cookie sync creates a new Browser Use cloud profile named after the local browser profile.
-- Cookie sync first starts a local headless browser from a temporary profile copy and a temporary Browser Use cloud browser. It does not attach to or relaunch the user's real browser when headless extraction works.
-- If cookie sync returns `status: "needs-user-action"` with `action: "approve-interactive-cookie-refresh"`, headless extraction failed or found no scoped cookies. Ask the user for permission before running `local_refresh_command`. This opens or focuses local Chrome only so the user can refresh/login and update local cookies. Keep Browser Use Cloud as the working browser, do not run `browser connect local`, then rerun `retry_sync_command`.
 
 Managed browser:
 
@@ -117,7 +109,6 @@ browser profile suggest --domain <regex> --json
 browser profile use <profile-id>
 browser profile remember --domain <domain> --profile <profile-id> [--mode local|cloud|managed-headless]
 browser profile forget --domain <domain>
-browser profile sync [--profile <profile-id-or-name>] [--all-cookies|--domain <domain>...] [--exclude-domain <domain>...] [--cloud-profile-id <uuid>|--cloud-profile-name <name>|--new-cloud-profile-name <name>]
 browser domain skills --domain <domain> [--include-content] --json
 
 browser connect

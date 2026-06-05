@@ -1595,7 +1595,7 @@ fn cloud_profile_user_prompt(profiles: &serde_json::Value, domain: Option<&str>)
         formatted_cloud_profile_options(&serde_json::Value::Array(matches), domain)
     };
     if listed.is_empty() {
-        return "No Browser Use Cloud profiles were found. Sync local cookies first with browser profile sync, or start a clean cloud browser.".to_string();
+        return "No Browser Use Cloud profiles were found. Ask the user to sync local cookies with /sync-cookies, or start a clean cloud browser.".to_string();
     }
     let scope = domain
         .map(|domain| format!(" for {domain}"))
