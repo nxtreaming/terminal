@@ -205,7 +205,10 @@ pub fn browser_mode_instruction(mode: &str) -> String {
         )
         .to_string(),
         "cloud" | "browser-use-cloud" => concat!(
-            "Selected browser mode: Browser Use cloud. Use `browser remote start` before page work. ",
+            "Selected browser mode: Browser Use cloud. Use `browser connect` before page work. ",
+            "For login-sensitive tasks, first run `browser profile suggest --domain <regex> --json`; choose a cloud profile whose matching cookie domains fit the target login domain, run `browser profile remember --mode cloud --profile <profile-id>`, then run `browser connect`. ",
+            "Browser Use Cloud profiles are snapshots, not live mirrors of local Chrome. If a selected cloud profile still reaches a login/password page, refresh it with a domain-filtered `browser profile sync --profile <local-profile-id> --domain <site-domain> --domain <identity-provider-domain> --cloud-profile-id <cloud-profile-id>`, stop the remote browser, then reconnect with that cloud profile. If no local profile is known, omit `--profile` so the sync command returns local profile choices. If sync returns `status: \"needs-user-action\"` with `action: \"approve-interactive-cookie-refresh\"`, ask the user for permission to run its `local_refresh_command`, keep Browser Use Cloud as the working browser, do not run `browser connect local`, then rerun `retry_sync_command`. ",
+            "Plain `browser connect` uses the remembered cloud profile when one is set. If a named cloud profile lookup fails, do not continue in a clean cloud browser; list profiles with `browser remote profiles --json` and choose by profile ID/cookieDomains. ",
             "Remote start means start and connect; use `browser remote live-url` to retrieve the watch URL."
         )
         .to_string(),

@@ -6942,10 +6942,19 @@ impl App {
     fn start_default_profile_load(&mut self) -> Result<()> {
         self.default_profile.status = DefaultProfileStatus::Loading;
         self.default_profile.profiles.clear();
-        self.default_profile.current_profile_id = self
+        let mode = self
             .store
-            .get_setting("browser.preference.profile")?
-            .filter(|value| !value.trim().is_empty());
+            .get_setting("browser.preference.mode")?
+            .or_else(|| self.store.get_setting("browser").ok().flatten())
+            .unwrap_or_else(|| "local".to_string())
+            .to_ascii_lowercase();
+        self.default_profile.current_profile_id = if mode == "local" || mode == "local chrome" {
+            self.store
+                .get_setting("browser.preference.profile")?
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            None
+        };
         let cwd = std::env::current_dir()?;
         let artifact_root = self.store.state_dir().join("profile-settings-artifacts");
         fs::create_dir_all(&artifact_root)?;
@@ -6989,6 +6998,8 @@ impl App {
         };
         self.store
             .set_setting("browser.preference.profile", &profile.id)?;
+        self.store.set_setting("browser.preference.mode", "local")?;
+        self.store.set_setting("browser", "Local Chrome")?;
         let profile_label = human_profile_label(&profile);
         self.store
             .set_setting("browser.preference.profile_label", &profile_label)?;
@@ -7682,6 +7693,14 @@ fn concise_profile_label(label: &str) -> String {
 }
 
 fn browser_profile_label_from_store(store: &Store) -> Result<Option<String>> {
+    let mode = store
+        .get_setting("browser.preference.mode")?
+        .or_else(|| store.get_setting("browser").ok().flatten())
+        .unwrap_or_else(|| "local".to_string())
+        .to_ascii_lowercase();
+    if !(mode == "local" || mode == "local chrome") {
+        return Ok(None);
+    }
     Ok(store
         .get_setting("browser.preference.profile_label")?
         .filter(|label| !label.trim().is_empty())

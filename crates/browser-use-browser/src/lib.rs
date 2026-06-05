@@ -2181,6 +2181,18 @@ struct ProfileCookieSyncOptions {
     all_cookies: bool,
 }
 
+struct ProfileCookieCandidate {
+    profile: LocalBrowserProfile,
+    filtered_cookies: Vec<Value>,
+    extracted_cookie_count: usize,
+}
+
+enum LocalProfileSyncSelection {
+    Selected(LocalBrowserProfile, ProfileCookieCandidate),
+    NeedsUserAction(Value),
+    NoSelection,
+}
+
 fn profile_cookie_sync_options(argv: &[String]) -> ProfileCookieSyncOptions {
     ProfileCookieSyncOptions {
         profile_ref: option_value(argv, "--profile").or_else(|| {
@@ -2220,53 +2232,65 @@ fn sync_profile_cookies(argv: &[String], command_options: &BrowserCommandOptions
     }
 
     let profiles = detect_local_profiles();
-    let Some(profile_ref) = opts.profile_ref.as_deref() else {
-        return Ok(json!({
-            "status": "needs-user-action",
-            "action": "select-local-profile",
-            "default_cookie_scope": "all",
-            "raw_cookie_values_returned": false,
-            "profiles": profiles,
-            "instructions": [
-                "Choose the local Chromium profile whose cookies should be imported.",
-                "All cookies are imported by default. Add --domain only when the user wants a narrower import.",
-                "If no cloud profile is specified, Browser Use Terminal creates one named after the local browser profile."
-            ],
-            "next_step": "browser profile sync --profile <profile-id> --all-cookies"
-        }));
+    let (selected, prefiltered_cookies) = match opts.profile_ref.as_deref() {
+        Some(profile_ref) => {
+            let selected = match resolve_local_profile(&profiles, profile_ref) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    return Ok(json!({
+                        "status": "failed",
+                        "profile_ref": profile_ref,
+                        "error": format!("{error:#}"),
+                        "available_profiles": profiles,
+                    }));
+                }
+            };
+            (selected, None)
+        }
+        None => match select_local_profile_for_domain_sync(&profiles, &opts) {
+            LocalProfileSyncSelection::Selected(selected, cookies) => (selected, Some(cookies)),
+            LocalProfileSyncSelection::NeedsUserAction(output) => return Ok(output),
+            LocalProfileSyncSelection::NoSelection => {
+                let candidates = (!opts.include_domains.is_empty()).then(Vec::new);
+                return Ok(local_profile_selection_request(
+                    &profiles, &opts, candidates, None,
+                ));
+            }
+        },
     };
 
-    let selected = match resolve_local_profile(&profiles, profile_ref) {
-        Ok(profile) => profile,
-        Err(error) => {
-            return Ok(json!({
-                "status": "failed",
-                "profile_ref": profile_ref,
-                "error": format!("{error:#}"),
-                "available_profiles": profiles,
-            }));
+    let (cookies, extracted_cookie_count) = match prefiltered_cookies {
+        Some(candidate) => (candidate.filtered_cookies, candidate.extracted_cookie_count),
+        None => {
+            let mut cookies = match local_profile_cookies(&selected) {
+                Ok(cookies) => cookies,
+                Err(error) => {
+                    return Ok(interactive_cookie_refresh_request(
+                        &selected,
+                        &opts,
+                        "headless local cookie extraction failed",
+                        Some(format!("{error:#}")),
+                        None,
+                    ));
+                }
+            };
+            let extracted_cookie_count = cookies.len();
+            cookies =
+                filter_cookies_by_domain(&cookies, &opts.include_domains, &opts.exclude_domains);
+            (cookies, extracted_cookie_count)
         }
     };
-
-    let mut cookies = local_profile_cookies(&selected)?;
-    let extracted_cookie_count = cookies.len();
-    cookies = filter_cookies_by_domain(&cookies, &opts.include_domains, &opts.exclude_domains);
-    let cookie_summary = cookie_domain_summary(&cookies);
-    let domain_count = cookie_summary.as_array().map_or(0, Vec::len);
+    let display_cookie_summary = profile_sync_display_cookie_summary(&cookies, &opts);
+    let domain_count = display_cookie_summary.as_array().map_or(0, Vec::len);
 
     if cookies.is_empty() {
-        return Ok(json!({
-            "status": "ok",
-            "synced": false,
-            "reason": "no cookies to sync after applying filters",
-            "profile": selected,
-            "raw_cookie_values_returned": false,
-            "extracted_cookie_count": extracted_cookie_count,
-            "synced_cookie_count": 0,
-            "domain_count": 0,
-            "cookie_scope": profile_sync_cookie_scope(&opts),
-            "cookie_summary": cookie_summary,
-        }));
+        return Ok(interactive_cookie_refresh_request(
+            &selected,
+            &opts,
+            "no cookies to sync after applying filters",
+            None,
+            Some((extracted_cookie_count, display_cookie_summary)),
+        ));
     }
 
     let (cloud_profile_id, cloud_profile_name, cloud_profile_created) =
@@ -2320,7 +2344,7 @@ fn sync_profile_cookies(argv: &[String], command_options: &BrowserCommandOptions
         "extracted_cookie_count": extracted_cookie_count,
         "synced_cookie_count": cookies.len(),
         "domain_count": domain_count,
-        "cookie_summary": cookie_summary,
+        "cookie_summary": display_cookie_summary,
         "next_step": "Use browser remote start --profile-id <cloud_profile.id> to start a Browser Use Cloud browser with these cookies."
     }))
 }
@@ -2811,7 +2835,9 @@ impl BrowserSession {
 
     fn start_remote_cloud(&mut self, argv: &[String]) -> Result<Value> {
         let mut body = serde_json::Map::new();
+        let mut requested_profile_id = None;
         if let Some(profile_id) = option_value(argv, "--profile-id") {
+            requested_profile_id = Some(profile_id.clone());
             body.insert("profileId".to_string(), Value::String(profile_id));
         }
         if let Some(profile_name) = option_value(argv, "--profile-name") {
@@ -2819,6 +2845,7 @@ impl BrowserSession {
                 bail!("pass --profile-id or --profile-name, not both");
             }
             let profile_id = resolve_cloud_profile_name(&profile_name)?;
+            requested_profile_id = Some(profile_id.clone());
             body.insert("profileId".to_string(), Value::String(profile_id));
         }
         if let Some(timeout) = option_value(argv, "--timeout") {
@@ -2869,6 +2896,7 @@ impl BrowserSession {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         self.browser_name = Some("Browser Use Cloud".to_string());
+        self.profile = requested_profile_id;
         Ok(json!({
             "status": "connected",
             "remote_browser": browser,
@@ -5862,6 +5890,209 @@ fn cookie_domain_summary(cookies: &[Value]) -> Value {
     Value::Array(rows)
 }
 
+fn select_local_profile_for_domain_sync(
+    profiles: &[LocalBrowserProfile],
+    opts: &ProfileCookieSyncOptions,
+) -> LocalProfileSyncSelection {
+    if opts.include_domains.is_empty() {
+        return LocalProfileSyncSelection::NoSelection;
+    }
+    let (candidates, inspection_errors) = local_profile_cookie_candidates(profiles, opts);
+    match candidates.len() {
+        1 => {
+            let candidate = candidates.into_iter().next().expect("candidate");
+            LocalProfileSyncSelection::Selected(candidate.profile.clone(), candidate)
+        }
+        _ if !candidates.is_empty() || !inspection_errors.is_empty() => {
+            LocalProfileSyncSelection::NeedsUserAction(local_profile_selection_request(
+                profiles,
+                opts,
+                Some(candidates),
+                Some(inspection_errors),
+            ))
+        }
+        _ => LocalProfileSyncSelection::NoSelection,
+    }
+}
+
+fn local_profile_cookie_candidates(
+    profiles: &[LocalBrowserProfile],
+    opts: &ProfileCookieSyncOptions,
+) -> (Vec<ProfileCookieCandidate>, Vec<Value>) {
+    let mut candidates = Vec::new();
+    let mut inspection_errors = Vec::new();
+    for profile in profiles {
+        match local_profile_cookies(profile) {
+            Ok(cookies) => {
+                let extracted_cookie_count = cookies.len();
+                let filtered_cookies = filter_cookies_by_domain(
+                    &cookies,
+                    &opts.include_domains,
+                    &opts.exclude_domains,
+                );
+                if filtered_cookies.is_empty() {
+                    continue;
+                }
+                candidates.push(ProfileCookieCandidate {
+                    profile: profile.clone(),
+                    filtered_cookies,
+                    extracted_cookie_count,
+                });
+            }
+            Err(error) => {
+                inspection_errors.push(json!({
+                    "profile_id": profile.id,
+                    "profile_label": profile.display_name,
+                    "error": format!("{error:#}"),
+                }));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.filtered_cookies
+            .len()
+            .cmp(&a.filtered_cookies.len())
+            .then_with(|| a.profile.display_name.cmp(&b.profile.display_name))
+    });
+    (candidates, inspection_errors)
+}
+
+fn local_profile_selection_request(
+    profiles: &[LocalBrowserProfile],
+    opts: &ProfileCookieSyncOptions,
+    candidates: Option<Vec<ProfileCookieCandidate>>,
+    inspection_errors: Option<Vec<Value>>,
+) -> Value {
+    let candidate_profiles = candidates
+        .as_ref()
+        .map(|candidates| {
+            candidates
+                .iter()
+                .map(|candidate| profile_cookie_candidate_json(candidate, opts))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let profiles_json = profiles
+        .iter()
+        .map(|profile| json!(profile))
+        .collect::<Vec<_>>();
+    let mut output = json!({
+        "status": "needs-user-action",
+        "action": "select-local-profile",
+        "raw_cookie_values_returned": false,
+        "cookie_scope": profile_sync_cookie_scope(opts),
+        "profiles": profiles_json,
+        "matching_profiles": candidate_profiles,
+        "instructions": [
+            "Choose the local Chromium profile whose cookies should be imported.",
+            "When domain filters are provided, matching_profiles contains only profiles where headless inspection found matching cookies.",
+            "If no cloud profile is specified, Browser Use Terminal creates one named after the local browser profile."
+        ],
+        "next_step": profile_cookie_sync_command_with_profile_arg("<profile-id>", opts),
+    });
+    if opts.include_domains.is_empty() {
+        output["default_cookie_scope"] = json!("all");
+    }
+    if let Some(candidates) = candidates {
+        output["matched_profile_count"] = json!(candidates.len());
+        if candidates.len() > 1 {
+            output["reason"] =
+                json!("multiple local profiles have cookies matching the requested domain filters");
+            output["user_prompt"] = json!(format!(
+                "Multiple local Chrome profiles have cookies matching this sync scope:\n\n{}\n\nWhich profile should I use?",
+                candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, candidate)| format!(
+                        "{}) {} ({})",
+                        idx + 1,
+                        candidate.profile.id,
+                        requested_filter_summary_inline(candidate, opts)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        } else if !opts.include_domains.is_empty() {
+            output["reason"] =
+                json!("no local profiles had cookies matching the requested domain filters");
+        }
+    }
+    if let Some(inspection_errors) = inspection_errors {
+        if !inspection_errors.is_empty() {
+            output["inspection_errors"] = json!(inspection_errors);
+        }
+    }
+    output
+}
+
+fn profile_cookie_candidate_json(
+    candidate: &ProfileCookieCandidate,
+    opts: &ProfileCookieSyncOptions,
+) -> Value {
+    json!({
+        "profile": &candidate.profile,
+        "extracted_cookie_count": candidate.extracted_cookie_count,
+        "matched_cookie_count": candidate.filtered_cookies.len(),
+        "matched_cookie_filters": requested_cookie_filter_summary(&candidate.filtered_cookies, opts),
+    })
+}
+
+fn profile_sync_display_cookie_summary(
+    cookies: &[Value],
+    opts: &ProfileCookieSyncOptions,
+) -> Value {
+    if opts.include_domains.is_empty() {
+        cookie_domain_summary(cookies)
+    } else {
+        requested_cookie_filter_summary(cookies, opts)
+    }
+}
+
+fn requested_cookie_filter_summary(cookies: &[Value], opts: &ProfileCookieSyncOptions) -> Value {
+    let rows = normalized_domain_list(&opts.include_domains)
+        .into_iter()
+        .map(|domain| {
+            let count = cookies
+                .iter()
+                .filter(|cookie| {
+                    cookie
+                        .get("domain")
+                        .and_then(Value::as_str)
+                        .is_some_and(|cookie_domain| {
+                            cookie_domain_matches(cookie_domain, std::slice::from_ref(&domain))
+                        })
+                })
+                .count();
+            json!({
+                "domain": domain,
+                "matched_cookie_count": count,
+            })
+        })
+        .collect::<Vec<_>>();
+    Value::Array(rows)
+}
+
+fn requested_filter_summary_inline(
+    candidate: &ProfileCookieCandidate,
+    opts: &ProfileCookieSyncOptions,
+) -> String {
+    let filters = requested_cookie_filter_summary(&candidate.filtered_cookies, opts)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let domain = row.get("domain").and_then(Value::as_str)?;
+            let count = row.get("matched_cookie_count").and_then(Value::as_u64)?;
+            (count > 0).then(|| format!("{domain}: {count}"))
+        })
+        .collect::<Vec<_>>();
+    if filters.is_empty() {
+        "matching cookies".to_string()
+    } else {
+        filters.join(", ")
+    }
+}
+
 fn profile_sync_cookie_scope(opts: &ProfileCookieSyncOptions) -> Value {
     if opts.include_domains.is_empty() && opts.exclude_domains.is_empty() {
         json!({ "kind": "all" })
@@ -5871,6 +6102,115 @@ fn profile_sync_cookie_scope(opts: &ProfileCookieSyncOptions) -> Value {
             "include_domains": normalized_domain_list(&opts.include_domains),
             "exclude_domains": normalized_domain_list(&opts.exclude_domains),
         })
+    }
+}
+
+fn interactive_cookie_refresh_request(
+    profile: &LocalBrowserProfile,
+    opts: &ProfileCookieSyncOptions,
+    reason: &str,
+    error: Option<String>,
+    extraction_summary: Option<(usize, Value)>,
+) -> Value {
+    let open_command = format!(
+        "browser local open --profile {} --no-marker",
+        shell_quote_browser_arg(&profile.id)
+    );
+    let retry_sync_command = profile_cookie_sync_retry_command(profile, opts);
+    let mut output = json!({
+        "status": "needs-user-action",
+        "action": "approve-interactive-cookie-refresh",
+        "reason": reason,
+        "profile": profile,
+        "raw_cookie_values_returned": false,
+        "cookie_scope": profile_sync_cookie_scope(opts),
+        "permission_prompt": "Headless cookie sync could not get usable cookies. Ask the user for permission to open or focus this local Chrome profile so they can refresh the selected site cookies. Keep Browser Use Cloud as the working browser; do not run `browser connect local`.",
+        "local_refresh_command": open_command,
+        "retry_sync_command": retry_sync_command,
+        "next_step": "Ask the user for permission to open/focus local Chrome for cookie refresh. If they approve, run local_refresh_command, have them complete or refresh the login locally, then rerun retry_sync_command and continue in Browser Use Cloud.",
+    });
+    if let Some(error) = error {
+        output["error"] = json!(error);
+    }
+    if let Some((extracted_cookie_count, cookie_summary)) = extraction_summary {
+        let domain_count = cookie_summary.as_array().map_or(0, Vec::len);
+        output["extracted_cookie_count"] = json!(extracted_cookie_count);
+        output["synced_cookie_count"] = json!(0);
+        output["domain_count"] = json!(domain_count);
+        output["cookie_summary"] = cookie_summary;
+    }
+    if let Some(cloud_profile_id) = opts.cloud_profile_id.as_deref() {
+        output["cloud_profile"] = json!({
+            "id": cloud_profile_id,
+            "created": false,
+        });
+    } else if let Some(cloud_profile_name) = opts.cloud_profile_name.as_deref() {
+        output["cloud_profile"] = json!({
+            "name": cloud_profile_name,
+            "created": false,
+        });
+    } else if let Some(new_cloud_profile_name) = opts.new_cloud_profile_name.as_deref() {
+        output["cloud_profile"] = json!({
+            "name": new_cloud_profile_name,
+            "created": true,
+        });
+    }
+    output
+}
+
+fn profile_cookie_sync_retry_command(
+    profile: &LocalBrowserProfile,
+    opts: &ProfileCookieSyncOptions,
+) -> String {
+    profile_cookie_sync_command_with_profile_arg(&shell_quote_browser_arg(&profile.id), opts)
+}
+
+fn profile_cookie_sync_command_with_profile_arg(
+    profile_arg: &str,
+    opts: &ProfileCookieSyncOptions,
+) -> String {
+    let mut parts = vec![
+        "browser".to_string(),
+        "profile".to_string(),
+        "sync".to_string(),
+        "--profile".to_string(),
+        profile_arg.to_string(),
+    ];
+    if opts.all_cookies || (opts.include_domains.is_empty() && opts.exclude_domains.is_empty()) {
+        parts.push("--all-cookies".to_string());
+    } else {
+        for domain in &opts.include_domains {
+            parts.push("--domain".to_string());
+            parts.push(shell_quote_browser_arg(domain));
+        }
+        for domain in &opts.exclude_domains {
+            parts.push("--exclude-domain".to_string());
+            parts.push(shell_quote_browser_arg(domain));
+        }
+    }
+    if let Some(cloud_profile_id) = opts.cloud_profile_id.as_deref() {
+        parts.push("--cloud-profile-id".to_string());
+        parts.push(shell_quote_browser_arg(cloud_profile_id));
+    }
+    if let Some(cloud_profile_name) = opts.cloud_profile_name.as_deref() {
+        parts.push("--cloud-profile-name".to_string());
+        parts.push(shell_quote_browser_arg(cloud_profile_name));
+    }
+    if let Some(new_cloud_profile_name) = opts.new_cloud_profile_name.as_deref() {
+        parts.push("--new-cloud-profile-name".to_string());
+        parts.push(shell_quote_browser_arg(new_cloud_profile_name));
+    }
+    parts.join(" ")
+}
+
+fn shell_quote_browser_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '/' | '.'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 
@@ -10484,6 +10824,94 @@ print("large response ok", len(data["blob"]))
     }
 
     #[test]
+    fn profile_sync_interactive_refresh_request_keeps_cloud_workflow() {
+        let profile = LocalBrowserProfile {
+            id: "google-chrome:Profile 1".to_string(),
+            browser_name: "Google Chrome".to_string(),
+            browser_path: PathBuf::from("/Applications/Google Chrome.app"),
+            user_data_dir: PathBuf::from("/tmp/chrome"),
+            profile_dir: "Profile 1".to_string(),
+            profile_name: "Work".to_string(),
+            profile_path: PathBuf::from("/tmp/chrome/Profile 1"),
+            display_name: "Google Chrome - Work".to_string(),
+        };
+        let opts = ProfileCookieSyncOptions {
+            profile_ref: Some(profile.id.clone()),
+            cloud_profile_id: Some("cloud-profile-123".to_string()),
+            cloud_profile_name: None,
+            new_cloud_profile_name: None,
+            include_domains: vec![
+                "app.example.com".to_string(),
+                "accounts.example.com".to_string(),
+            ],
+            exclude_domains: Vec::new(),
+            all_cookies: false,
+        };
+
+        let output = interactive_cookie_refresh_request(
+            &profile,
+            &opts,
+            "no cookies to sync after applying filters",
+            None,
+            Some((12, json!([]))),
+        );
+
+        assert_eq!(output["status"], "needs-user-action");
+        assert_eq!(output["action"], "approve-interactive-cookie-refresh");
+        assert_eq!(output["raw_cookie_values_returned"], false);
+        assert_eq!(output["cloud_profile"]["id"], "cloud-profile-123");
+        assert_eq!(
+            output["local_refresh_command"],
+            "browser local open --profile 'google-chrome:Profile 1' --no-marker"
+        );
+        assert_eq!(
+            output["retry_sync_command"],
+            "browser profile sync --profile 'google-chrome:Profile 1' --domain app.example.com --domain accounts.example.com --cloud-profile-id cloud-profile-123"
+        );
+        let prompt = output["permission_prompt"].as_str().unwrap();
+        assert!(prompt.contains("Keep Browser Use Cloud as the working browser"));
+        assert!(prompt.contains("do not run `browser connect local`"));
+    }
+
+    #[test]
+    fn profile_sync_interactive_refresh_request_preserves_all_cookie_retry() {
+        let profile = LocalBrowserProfile {
+            id: "google-chrome:Default".to_string(),
+            browser_name: "Google Chrome".to_string(),
+            browser_path: PathBuf::from("/Applications/Google Chrome.app"),
+            user_data_dir: PathBuf::from("/tmp/chrome"),
+            profile_dir: "Default".to_string(),
+            profile_name: "Default".to_string(),
+            profile_path: PathBuf::from("/tmp/chrome/Default"),
+            display_name: "Google Chrome - Default".to_string(),
+        };
+        let opts = ProfileCookieSyncOptions {
+            profile_ref: Some(profile.id.clone()),
+            cloud_profile_id: None,
+            cloud_profile_name: Some("Work Cloud".to_string()),
+            new_cloud_profile_name: None,
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+            all_cookies: true,
+        };
+
+        let output = interactive_cookie_refresh_request(
+            &profile,
+            &opts,
+            "headless local cookie extraction failed",
+            Some("chrome exited".to_string()),
+            None,
+        );
+
+        assert_eq!(
+            output["retry_sync_command"],
+            "browser profile sync --profile google-chrome:Default --all-cookies --cloud-profile-name 'Work Cloud'"
+        );
+        assert_eq!(output["cloud_profile"]["name"], "Work Cloud");
+        assert_eq!(output["error"], "chrome exited");
+    }
+
+    #[test]
     fn cookie_domain_filter_defaults_to_all_and_supports_excludes() {
         let cookies = vec![
             json!({ "name": "a", "value": "1", "domain": ".example.com", "path": "/" }),
@@ -10500,6 +10928,38 @@ print("large response ok", len(data["blob"]))
         );
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["name"], "a");
+    }
+
+    #[test]
+    fn filtered_cookie_display_summary_hides_discovered_subdomains() {
+        let cookies = vec![
+            json!({ "name": "a", "value": "1", "domain": "google.com", "path": "/" }),
+            json!({ "name": "b", "value": "2", "domain": "mail.google.com", "path": "/" }),
+            json!({ "name": "c", "value": "3", "domain": "drive.google.com", "path": "/" }),
+            json!({ "name": "d", "value": "4", "domain": "linear.app", "path": "/" }),
+        ];
+        let opts = ProfileCookieSyncOptions {
+            profile_ref: None,
+            cloud_profile_id: Some("cloud-profile".to_string()),
+            cloud_profile_name: None,
+            new_cloud_profile_name: None,
+            include_domains: vec!["google.com".to_string(), "linear.app".to_string()],
+            exclude_domains: Vec::new(),
+            all_cookies: false,
+        };
+        let filtered = filter_cookies_by_domain(&cookies, &opts.include_domains, &[]);
+        assert_eq!(filtered.len(), 4);
+
+        let summary = profile_sync_display_cookie_summary(&filtered, &opts);
+        assert_eq!(
+            summary,
+            json!([
+                { "domain": "google.com", "matched_cookie_count": 3 },
+                { "domain": "linear.app", "matched_cookie_count": 1 }
+            ])
+        );
+        assert!(!summary.to_string().contains("mail.google.com"));
+        assert!(!summary.to_string().contains("drive.google.com"));
     }
 
     #[test]
