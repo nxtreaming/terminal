@@ -2426,8 +2426,8 @@ fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
         lines.extend(browser_script_structured_output_lines(event));
     }
     if should_show_generic_tool_output_text(&name)
+        && name != "browser"
         && !(name == "browser_script" && has_browser_script_summary)
-        && !(name == "browser" && !lines.is_empty())
     {
         if let Some(text) = payload_string(event, "text").filter(|text| !text.trim().is_empty()) {
             if name == "browser_script" {
@@ -3202,6 +3202,10 @@ fn browser_command_output_lines(event: &EventRecord) -> Vec<String> {
 }
 
 fn browser_command_value_lines(value: &serde_json::Value) -> Vec<String> {
+    if is_routine_browser_status_output(value) {
+        return Vec::new();
+    }
+
     let mut lines = Vec::new();
     lines.push(browser_command_headline(value));
     if let Some(reason) = summary_value_string(value, "reason")
@@ -3236,6 +3240,41 @@ fn browser_command_value_lines(value: &serde_json::Value) -> Vec<String> {
     lines
 }
 
+fn is_routine_browser_status_output(value: &serde_json::Value) -> bool {
+    if browser_command_output_has_visible_result(value) {
+        return false;
+    }
+    if let Some(connection) = summary_value_string(value, "connection") {
+        return matches!(
+            connection.as_str(),
+            "connected" | "not-configured" | "disconnected"
+        );
+    }
+    if let Some(status) = summary_value_string(value, "status") {
+        return matches!(
+            status.as_str(),
+            "connected" | "ok" | "not-configured" | "disconnected"
+        );
+    }
+    false
+}
+
+fn browser_command_output_has_visible_result(value: &serde_json::Value) -> bool {
+    browser_profiles(value).is_some()
+        || summary_value_string(value, "profile_id").is_some()
+        || matches!(
+            summary_value_string(value, "status").as_deref(),
+            Some("needs-user-action" | "failed")
+        )
+        || summary_value_string(value, "reason").is_some()
+        || summary_value_string(value, "error").is_some()
+        || summary_value_string(value, "raw_error").is_some()
+        || value
+            .get("active_scripts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|scripts| !scripts.is_empty())
+}
+
 fn browser_command_headline(value: &serde_json::Value) -> String {
     if let Some(connection) = summary_value_string(value, "connection") {
         let browser =
@@ -3263,10 +3302,6 @@ fn browser_command_headline(value: &serde_json::Value) -> String {
                 "browser profiles found".to_string()
             } else if value.get("profile_id").is_some() {
                 "browser profile selected".to_string()
-            } else if value.get("remembered").is_some() {
-                "browser profile remembered".to_string()
-            } else if value.get("forgot_domain").is_some() {
-                "browser profile forgotten".to_string()
             } else {
                 "browser ok".to_string()
             }
@@ -7485,7 +7520,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_status_output_renders_connection_summary() {
+    fn routine_browser_status_output_is_hidden() {
         let event = EventRecord {
             seq: 8,
             id: "event-8".to_string(),
@@ -7508,6 +7543,49 @@ mod tests {
             }),
         };
 
+        assert!(tool_output_node(&event).is_none());
+    }
+
+    #[test]
+    fn routine_not_configured_browser_status_output_is_hidden() {
+        let event = EventRecord {
+            seq: 8,
+            id: "event-8".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.output".to_string(),
+            payload: serde_json::json!({
+                "name": "browser",
+                "text": serde_json::json!({
+                    "mode": "none",
+                    "connection": "not-configured",
+                    "browser_task_blocked": true,
+                    "next_step": "browser connect local",
+                    "model_instruction": "Follow next_step."
+                }).to_string()
+            }),
+        };
+
+        assert!(tool_output_node(&event).is_none());
+    }
+
+    #[test]
+    fn browser_profile_command_result_stays_visible() {
+        let event = EventRecord {
+            seq: 8,
+            id: "event-8".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.output".to_string(),
+            payload: serde_json::json!({
+                "name": "browser",
+                "text": serde_json::json!({
+                    "status": "ok",
+                    "profile_id": "google-chrome:Default"
+                }).to_string()
+            }),
+        };
+
         let node = tool_output_node(&event).expect("tool output node");
         let text = node
             .display_lines(120, DisplayMode::Scrollback)
@@ -7517,13 +7595,8 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("• browser"), "{text}");
-        assert!(text.contains("connected to Google Chrome"), "{text}");
-        assert!(
-            text.contains("live view live.browser-use.com/?..."),
-            "{text}"
-        );
-        assert!(!text.contains("active_scripts"), "{text}");
-        assert!(!text.contains("devtools/browser/secret"), "{text}");
+        assert!(text.contains("browser profile selected"), "{text}");
+        assert!(text.contains("profile: google-chrome:Default"), "{text}");
     }
 
     #[test]
