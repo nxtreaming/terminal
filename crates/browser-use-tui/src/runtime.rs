@@ -447,16 +447,7 @@ fn local_chrome_cloud_promo_user_turn_seq(
 }
 
 fn increment_local_chrome_cloud_promo_qualified_task_count(store: &Store) -> Result<u64> {
-    let current = store
-        .get_setting(LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING)?
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    let next = current.saturating_add(1);
-    store.set_setting(
-        LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING,
-        &next.to_string(),
-    )?;
-    Ok(next)
+    store.increment_u64_setting(LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING)
 }
 
 fn should_append_local_chrome_cloud_promo(
