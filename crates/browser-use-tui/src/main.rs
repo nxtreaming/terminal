@@ -157,6 +157,9 @@ const TYPEWRITER_TICK_INTERVAL: Duration = Duration::from_millis(8);
 const NO_KEY_NUDGE_TEXT: &str = "It looks like you don't have an API key set up yet. \
 You can get one free at cloud.browser-use.com and run this on DeepSeek V4 for \
 free — or add your own key with /auth.";
+pub(crate) const LOCAL_CHROME_CLOUD_PROMO_EVENT: &str = "session.cloud_promo";
+pub(crate) const LOCAL_CHROME_CLOUD_PROMO_TEXT: &str =
+    "[tip] Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
@@ -11256,6 +11259,111 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Tell the browser what to do"));
         assert!(!screen.contains("step 1/3"));
+        Ok(())
+    }
+
+    #[test]
+    fn home_shows_cloud_banner_only_without_browser_use_key() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        const BANNER_START: &str = "Use a Cloud browser";
+        const BANNER_CTA: &str = "automatic captcha-solving!";
+        const BANNER_LINK: &str = "[cloud.browser-use.com]";
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains(BANNER_START));
+            assert!(screen.contains(BANNER_CTA));
+            assert!(screen.contains(BANNER_LINK));
+            assert!(row_containing(&screen, BANNER_START) < row_containing(&screen, "Browser Use"));
+            assert!(row_containing(&screen, BANNER_CTA) < row_containing(&screen, "Browser Use"));
+            assert!(row_containing(&screen, BANNER_LINK) < row_containing(&screen, "Browser Use"));
+            let first_banner_line = screen
+                .lines()
+                .find(|line| line.contains(BANNER_START))
+                .unwrap();
+            let second_banner_line = screen
+                .lines()
+                .find(|line| line.contains(BANNER_CTA))
+                .unwrap();
+            let link_banner_line = screen
+                .lines()
+                .find(|line| line.contains(BANNER_LINK))
+                .unwrap();
+            assert!(
+                first_banner_line.starts_with("    "),
+                "{first_banner_line:?}"
+            );
+            assert!(
+                second_banner_line.starts_with("    "),
+                "{second_banner_line:?}"
+            );
+            assert!(link_banner_line.starts_with("    "), "{link_banner_line:?}");
+
+            app.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-test")?;
+            app.browser = BROWSER_USE_CLOUD.to_string();
+            let screen = render_dump(&mut app)?;
+            assert!(!screen.contains(BANNER_START));
+            assert!(!screen.contains(BANNER_CTA));
+            assert!(!screen.contains(BANNER_LINK));
+
+            app.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "")?;
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", "bu-env-test");
+            }
+            let screen = render_dump(&mut app)?;
+            assert!(!screen.contains(BANNER_START));
+            assert!(!screen.contains(BANNER_CTA));
+            assert!(!screen.contains(BANNER_LINK));
+            Ok(())
+        })();
+        unsafe {
+            if let Some(value) = saved {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            } else {
+                std::env::remove_var("BROWSER_USE_API_KEY");
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn cloud_promo_event_renders_as_committed_notice() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "run local task"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "local task result"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            LOCAL_CHROME_CLOUD_PROMO_EVENT,
+            serde_json::json!({"text": LOCAL_CHROME_CLOUD_PROMO_TEXT}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.args.width = 180;
+        app.args.height = 36;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("local task result"));
+        assert!(!screen.contains("• tip"));
+        assert!(screen.contains("[tip]"));
+        assert!(screen.contains("Use a Cloud browser"));
+        assert!(screen.contains("automatic captcha-solving!"));
+        assert!(screen.contains("[cloud.browser-use.com]"));
         Ok(())
     }
 

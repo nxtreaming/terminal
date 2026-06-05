@@ -387,6 +387,7 @@ fn render_main(
             ProductState::Ready => Some(crate::welcome::logo_screen_rect(
                 body_content_rect,
                 app.status_notice.is_some(),
+                cloud_home_banner_lines(app, body_width).map_or(0, |lines| lines.len()),
             )),
             ProductState::SetupNeeded => Some(setup_logo_screen_rect(body_content_rect)),
             ProductState::Running
@@ -3620,6 +3621,7 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16, max_h: u16) -> Vec
         lines.push(Line::from(Span::styled(notice.clone(), failed())));
         lines.push(Line::from(""));
     }
+    let banner = cloud_home_banner_lines(app, width);
     // Pass the remaining body height to the welcome renderer so it can
     // balance the gap above the logo with the gap below the menu.
     let remaining = max_h.saturating_sub(lines.len() as u16);
@@ -3628,8 +3630,62 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16, max_h: u16) -> Vec
         &app.welcome_anim,
         app.selected_row,
         remaining,
+        banner,
     ));
     let _ = state;
+    lines
+}
+
+fn cloud_home_banner_lines(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
+    if width == 0 || app.surface != Surface::Main || app.is_slash_palette_active() {
+        return None;
+    }
+    if app.browser_use_cloud_key_ready().unwrap_or(true) {
+        return None;
+    }
+
+    let wrap_width = (width as usize).saturating_sub(8).clamp(16, 64);
+    let words = [
+        ("Use", text_style()),
+        ("a", text_style()),
+        ("Cloud", text_style()),
+        ("browser", text_style()),
+        ("to", text_style()),
+        ("avoid", text_style()),
+        ("manual", text_style()),
+        ("permissions", text_style()),
+        ("and", text_style()),
+        ("get", text_style()),
+        ("automatic", text_style()),
+        ("captcha-solving!", text_style()),
+        ("[cloud.browser-use.com]", link()),
+    ];
+    Some(wrap_styled_words(&words, wrap_width))
+}
+
+fn wrap_styled_words(words: &[(&'static str, Style)], max_width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+
+    for (word, style) in words {
+        let word_width = word.chars().count();
+        let separator_width = usize::from(current_width > 0);
+        if current_width > 0 && current_width + separator_width + word_width > max_width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            current_width = 0;
+        }
+        if current_width > 0 {
+            spans.push(Span::styled(" ", text_style()));
+            current_width += 1;
+        }
+        spans.push(Span::styled(*word, *style));
+        current_width += word_width;
+    }
+
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
     lines
 }
 
