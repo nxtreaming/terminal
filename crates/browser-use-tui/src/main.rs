@@ -6947,8 +6947,8 @@ impl App {
             .get_setting("browser.preference.mode")?
             .or_else(|| self.store.get_setting("browser").ok().flatten())
             .unwrap_or_else(|| "local".to_string())
-            .to_ascii_lowercase();
-        self.default_profile.current_profile_id = if mode == "local" || mode == "local chrome" {
+            .to_string();
+        self.default_profile.current_profile_id = if is_local_browser_mode_setting(&mode) {
             self.store
                 .get_setting("browser.preference.profile")?
                 .filter(|value| !value.trim().is_empty())
@@ -7697,8 +7697,8 @@ fn browser_profile_label_from_store(store: &Store) -> Result<Option<String>> {
         .get_setting("browser.preference.mode")?
         .or_else(|| store.get_setting("browser").ok().flatten())
         .unwrap_or_else(|| "local".to_string())
-        .to_ascii_lowercase();
-    if !(mode == "local" || mode == "local chrome") {
+        .to_string();
+    if !is_local_browser_mode_setting(&mode) {
         return Ok(None);
     }
     Ok(store
@@ -7711,6 +7711,16 @@ fn browser_profile_label_from_store(store: &Store) -> Result<Option<String>> {
                 .flatten()
                 .filter(|profile| !profile.trim().is_empty())
         }))
+}
+
+fn is_local_browser_mode_setting(mode: &str) -> bool {
+    matches!(
+        mode.trim()
+            .to_ascii_lowercase()
+            .replace(['_', ' '], "-")
+            .as_str(),
+        "local" | "local-chrome"
+    )
 }
 
 pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
