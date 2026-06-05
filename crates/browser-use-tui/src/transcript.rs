@@ -212,6 +212,9 @@ enum TranscriptKind {
         markdown: String,
         source: Option<String>,
     },
+    Notice {
+        text: String,
+    },
     StreamingAssistant {
         markdown: String,
     },
@@ -250,7 +253,6 @@ enum TranscriptKind {
 enum NodeStyle {
     Normal,
     Muted,
-    Promo,
     Failed,
     Thought,
 }
@@ -283,6 +285,7 @@ impl TranscriptNode {
                 }
                 lines
             }
+            TranscriptKind::Notice { text } => notice_lines(text, width),
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown_cell_lines(markdown, width, mode)
             }
@@ -343,6 +346,7 @@ impl TranscriptNode {
                 }
                 out
             }
+            TranscriptKind::Notice { text } => text.lines().map(str::to_string).collect(),
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown.lines().map(str::to_string).collect()
             }
@@ -922,7 +926,12 @@ fn committed_node_for_event(
             if text.trim().is_empty() {
                 return None;
             }
-            Some(timeline_node(event, "tip", vec![text], NodeStyle::Promo))
+            Some(TranscriptNode {
+                id,
+                seq: event.seq,
+                revision: event.seq.max(0) as u64,
+                kind: TranscriptKind::Notice { text },
+            })
         }
         "session.done" => {
             if let Some(result_file) = session_done_result_file(event, state) {
@@ -2606,6 +2615,13 @@ fn markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<Lin
     lines
 }
 
+fn notice_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    wrap_plain(text.trim_end(), width)
+        .into_iter()
+        .map(|(_, row)| Line::from(styled_notice_spans(&row, activity_task())))
+        .collect()
+}
+
 fn source_display_lines(source: &str, width: u16) -> Vec<Line<'static>> {
     let prefix = "source ";
     let first_width = width.saturating_sub(prefix.chars().count() as u16).max(1);
@@ -2684,12 +2700,9 @@ fn grouped_lines(
     lines
 }
 
-fn styled_value_spans(group: &str, text: &str, fallback: Style) -> Vec<Span<'static>> {
+fn styled_value_spans(_group: &str, text: &str, fallback: Style) -> Vec<Span<'static>> {
     if text.starts_with("https://") || text.starts_with("http://") {
         return vec![Span::styled(text.to_string(), link())];
-    }
-    if group == "tip" {
-        return styled_tip_value_spans(text, fallback);
     }
     if let Some(spans) = styled_activity_line_spans(text, fallback) {
         return spans;
@@ -2697,7 +2710,7 @@ fn styled_value_spans(group: &str, text: &str, fallback: Style) -> Vec<Span<'sta
     styled_path_tokens(text, fallback)
 }
 
-fn styled_tip_value_spans(text: &str, fallback: Style) -> Vec<Span<'static>> {
+fn styled_notice_spans(text: &str, fallback: Style) -> Vec<Span<'static>> {
     let Some(start) = text.find("[cloud.browser-use.com]") else {
         return styled_path_tokens(text, fallback);
     };
@@ -2962,7 +2975,6 @@ fn group_style(style: NodeStyle) -> Style {
     match style {
         NodeStyle::Normal => activity_group(),
         NodeStyle::Muted => muted(),
-        NodeStyle::Promo => activity_task(),
         NodeStyle::Failed => failed(),
         NodeStyle::Thought => thought(),
     }
@@ -2972,7 +2984,6 @@ fn body_style(style: NodeStyle) -> Style {
     match style {
         NodeStyle::Normal => text_style(),
         NodeStyle::Muted => muted(),
-        NodeStyle::Promo => activity_task(),
         NodeStyle::Failed => failed(),
         NodeStyle::Thought => muted(),
     }
@@ -4501,17 +4512,18 @@ mod tests {
             group_label_style("run", NodeStyle::Normal),
             group_label_style("explored", NodeStyle::Normal)
         );
-        assert_eq!(group_label_style("tip", NodeStyle::Promo), activity_task());
-        assert_eq!(body_style(NodeStyle::Promo), activity_task());
     }
 
     #[test]
-    fn cloud_promo_tip_body_and_link_are_colored() {
-        let spans = styled_value_spans(
-            "tip",
-            "Cloud browser: no local Chrome prompts, auto-solves captchas. [cloud.browser-use.com]",
-            body_style(NodeStyle::Promo),
+    fn cloud_promo_notice_body_and_link_are_colored() {
+        let lines = notice_lines(
+            "Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]",
+            120,
         );
+        let spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .collect::<Vec<_>>();
 
         assert!(spans
             .iter()

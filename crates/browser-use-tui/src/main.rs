@@ -159,7 +159,7 @@ You can get one free at cloud.browser-use.com and run this on DeepSeek V4 for \
 free — or add your own key with /auth.";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_EVENT: &str = "session.cloud_promo";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_TEXT: &str =
-    "Cloud browser: no local Chrome prompts, auto-solves captchas. [cloud.browser-use.com]";
+    "Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
@@ -11265,8 +11265,8 @@ mod redesign_tests {
     #[test]
     fn home_shows_cloud_banner_even_when_key_exists_or_cloud_selected() -> Result<()> {
         let saved = std::env::var("BROWSER_USE_API_KEY").ok();
-        const BANNER_START: &str = "Cloud browser:";
-        const BANNER_CTA: &str = "no local Chrome prompts, auto-solves captchas.";
+        const BANNER_START: &str = "Use a Cloud browser";
+        const BANNER_CTA: &str = "automatic captcha-solving!";
         const BANNER_LINK: &str = "[cloud.browser-use.com]";
         unsafe {
             std::env::remove_var("BROWSER_USE_API_KEY");
@@ -11322,7 +11322,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn cloud_promo_event_renders_as_committed_tip() -> Result<()> {
+    fn cloud_promo_event_renders_as_committed_notice() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -11347,9 +11347,9 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("local task result"));
-        assert!(screen.contains("tip"));
-        assert!(screen.contains("Cloud browser: no local Chrome prompts"));
-        assert!(screen.contains("auto-solves captchas"));
+        assert!(!screen.contains("• tip"));
+        assert!(screen.contains("Use a Cloud browser"));
+        assert!(screen.contains("automatic captcha-solving!"));
         assert!(screen.contains("[cloud.browser-use.com]"));
         Ok(())
     }

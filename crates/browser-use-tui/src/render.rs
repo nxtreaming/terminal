@@ -3577,14 +3577,18 @@ fn cloud_home_banner_lines(app: &App, width: u16) -> Option<Vec<Line<'static>>> 
 
     let wrap_width = (width as usize).saturating_sub(8).clamp(16, 64);
     let words = [
+        ("Use", text_style()),
+        ("a", text_style()),
         ("Cloud", text_style()),
-        ("browser:", text_style()),
-        ("no", text_style()),
-        ("local", text_style()),
-        ("Chrome", text_style()),
-        ("prompts,", text_style()),
-        ("auto-solves", text_style()),
-        ("captchas.", text_style()),
+        ("browser", text_style()),
+        ("to", text_style()),
+        ("avoid", text_style()),
+        ("manual", text_style()),
+        ("permissions", text_style()),
+        ("and", text_style()),
+        ("get", text_style()),
+        ("automatic", text_style()),
+        ("captcha-solving!", text_style()),
         ("[cloud.browser-use.com]", link()),
     ];
     Some(wrap_styled_words(&words, wrap_width))
