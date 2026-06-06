@@ -126,8 +126,8 @@ use settings::{
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
     model_choices_for_config, provider_model_choices, provider_model_for_display,
     recommended_models_for_codex_availability, AgentBackend, ModelChoice, RecommendedModel,
-    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER,
+    AUTH_CHOICES, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
     BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
@@ -3325,6 +3325,7 @@ impl App {
         // Open the model picker on the currently active model
         self.selected_row = match surface {
             Surface::Provider => self.current_provider_screen_index().unwrap_or(0),
+            Surface::Account => self.current_auth_surface_index().unwrap_or(0),
             Surface::Model => self.current_model_surface_index().unwrap_or(0),
             Surface::ModelSearch => self.current_model_search_index().unwrap_or(0),
             Surface::OpenAiAuth => self
@@ -3353,6 +3354,13 @@ impl App {
                 .collect(),
             None => self.model_choices.clone(),
         }
+    }
+
+    fn current_auth_surface_index(&self) -> Option<usize> {
+        self.api_key_account
+            .as_deref()
+            .or(Some(self.account.as_str()))
+            .and_then(|account| AUTH_CHOICES.iter().position(|choice| *choice == account))
     }
 
     /// Whether the model screen shows the trailing "enter a custom model" row,
@@ -6874,7 +6882,7 @@ impl App {
     fn setup_row_count(&self) -> usize {
         self.setup_account_choices()
             .map(|choices| choices.len())
-            .unwrap_or_else(|_| ACCOUNT_CHOICES.len().saturating_sub(1))
+            .unwrap_or_else(|_| AUTH_CHOICES.len().saturating_sub(1))
     }
 
     fn cookie_sync_row_count(&self) -> usize {
@@ -11904,6 +11912,27 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn auth_surface_selects_browser_use_cloud_current_auth_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cloud_row = settings::AUTH_CHOICES
+            .iter()
+            .position(|account| *account == BROWSER_USE_CLOUD)
+            .context("Browser Use Cloud auth row")?;
+
+        app.account = BROWSER_USE_CLOUD.to_string();
+        app.open_surface(Surface::Account);
+        assert_eq!(app.selected_row, cloud_row);
+
+        app.account = settings::ACCOUNT_DEEPSEEK.to_string();
+        app.api_key_account = Some(BROWSER_USE_CLOUD.to_string());
+        app.open_surface(Surface::Account);
+        assert_eq!(app.selected_row, cloud_row);
+
+        Ok(())
     }
 
     #[test]

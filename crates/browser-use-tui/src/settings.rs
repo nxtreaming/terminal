@@ -121,14 +121,6 @@ pub(crate) const ACCOUNT_ANTHROPIC: &str = "Anthropic API key";
 pub(crate) const ACCOUNT_OPENROUTER: &str = "OpenRouter API key";
 pub(crate) const ACCOUNT_DEEPSEEK: &str = "DeepSeek API key";
 
-pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
-    ACCOUNT_CODEX,
-    ACCOUNT_OPENAI,
-    ACCOUNT_ANTHROPIC,
-    ACCOUNT_OPENROUTER,
-    ACCOUNT_DEEPSEEK,
-];
-
 pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use Cloud";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
