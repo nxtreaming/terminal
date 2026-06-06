@@ -6711,13 +6711,13 @@ impl App {
 
     fn sync_browser_select_cursor_to_current(&mut self) {
         let rows = self.browser_select_rows();
+        let current_local_browser = self.current_local_browser_label();
         if let Some(index) = rows.iter().position(|row| match row {
             BrowserSelectRow::Local(browser) => {
                 self.browser == BROWSER_LOCAL_CHROME
-                    && self.browser_local_label.as_deref().map_or_else(
-                        || browser.eq_ignore_ascii_case("Google Chrome"),
-                        |current| current.eq_ignore_ascii_case(browser),
-                    )
+                    && current_local_browser
+                        .as_deref()
+                        .is_some_and(|current| current.eq_ignore_ascii_case(browser))
             }
             BrowserSelectRow::ChromiumHeaded => self.browser == "Managed Chromium",
             BrowserSelectRow::ChromiumHeadless => self.browser == "Headless Chromium",
@@ -6729,13 +6729,41 @@ impl App {
         }
     }
 
+    pub(crate) fn current_local_browser_label(&self) -> Option<String> {
+        if let Some(label) = self
+            .browser_local_label
+            .as_deref()
+            .filter(|label| !label.trim().is_empty())
+        {
+            return Some(label.to_string());
+        }
+        let current = self.default_profile.current_profile_id.as_deref()?;
+        if let Some(profile) = self
+            .default_profile
+            .profiles
+            .iter()
+            .find(|profile| profile.id == current)
+        {
+            return Some(profile.browser_name.clone());
+        }
+        browser_name_from_profile_id(current).map(ToOwned::to_owned)
+    }
+
     fn current_profile_matches_browser(&self, browser_name: &str) -> bool {
         let Some(current) = self.default_profile.current_profile_id.as_deref() else {
-            return false;
+            return true;
         };
-        self.default_profile.profiles.iter().any(|profile| {
-            profile.id == current && profile.browser_name.eq_ignore_ascii_case(browser_name)
-        })
+        if let Some(profile) = self
+            .default_profile
+            .profiles
+            .iter()
+            .find(|profile| profile.id == current)
+        {
+            return profile.browser_name.eq_ignore_ascii_case(browser_name);
+        }
+        browser_name_from_profile_id(current)
+            .map(|current_browser| current_browser.eq_ignore_ascii_case(browser_name))
+            .unwrap_or(true)
     }
 
     fn append_browser_backend_change_if_needed(&mut self, previous_browser: &str) -> Result<()> {
@@ -7897,6 +7925,20 @@ fn browser_local_label_from_store(store: &Store) -> Result<Option<String>> {
                 .flatten()
         })
         .filter(|label| !label.trim().is_empty()))
+}
+
+fn browser_name_from_profile_id(profile_id: &str) -> Option<&'static str> {
+    let prefix = profile_id.split_once(':')?.0;
+    match prefix.to_ascii_lowercase().as_str() {
+        "google-chrome" => Some("Google Chrome"),
+        "chromium" => Some("Chromium"),
+        "microsoft-edge" => Some("Microsoft Edge"),
+        "microsoft-edge-beta" => Some("Microsoft Edge Beta"),
+        "microsoft-edge-dev" => Some("Microsoft Edge Dev"),
+        "microsoft-edge-canary" => Some("Microsoft Edge Canary"),
+        "brave" => Some("Brave"),
+        _ => None,
+    }
 }
 
 pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
@@ -12014,14 +12056,48 @@ mod redesign_tests {
         app.browser = BROWSER_LOCAL_CHROME.to_string();
         app.browser_local_label = None;
         app.default_profile.status = DefaultProfileStatus::Ready;
-        app.default_profile.browsers = vec!["Google Chrome".to_string(), "Chromium".to_string()];
+        app.default_profile.browsers = vec!["Google Chrome".to_string(), "Brave".to_string()];
+        app.default_profile.current_profile_id = Some("brave:Default".to_string());
 
         app.sync_browser_select_cursor_to_current();
 
-        assert_eq!(app.selected_row, 0);
+        assert_eq!(app.selected_row, 1);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Google Chrome  recommended"));
         assert!(!screen.contains("current"));
+        Ok(())
+    }
+
+    #[test]
+    fn browser_select_infers_current_local_browser_from_profile_id() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = None;
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Google Chrome".to_string(), "Brave".to_string()];
+        app.default_profile.current_profile_id = Some("brave:Default".to_string());
+        app.store
+            .set_setting("browser.preference.profile", "brave:Default")?;
+        app.store
+            .set_setting("browser.preference.profile_label", "Default")?;
+
+        app.save_browser(1)?;
+
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Brave"));
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.profile")?
+                .as_deref(),
+            Some("brave:Default")
+        );
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.profile_label")?
+                .as_deref(),
+            Some("Default")
+        );
         Ok(())
     }
 

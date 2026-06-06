@@ -7852,10 +7852,50 @@ fn capture_preview_html() -> &'static str {
 
 fn file_url_for_path(path: &Path) -> String {
     let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut url = String::from("file://");
-    for byte in absolute.to_string_lossy().as_bytes() {
+    file_url_for_path_text(&absolute.to_string_lossy())
+}
+
+fn file_url_for_path_text(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        windows_file_url_for_path_text(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut url = String::from("file://");
+        url.push_str(&percent_encode_file_url_path(path));
+        url
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_file_url_for_path_text(path: &str) -> String {
+    let slash_path = path.replace('\\', "/");
+    let bytes = slash_path.as_bytes();
+    if slash_path.starts_with("//") {
+        let without_prefix = slash_path.trim_start_matches('/');
+        let (host, rest) = without_prefix
+            .split_once('/')
+            .unwrap_or((without_prefix, ""));
+        let mut url = format!("file://{}", percent_encode_file_url_path(host));
+        if !rest.is_empty() {
+            url.push('/');
+            url.push_str(&percent_encode_file_url_path(rest));
+        }
+        return url;
+    }
+    let has_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if has_drive {
+        return format!("file:///{}", percent_encode_file_url_path(&slash_path));
+    }
+    format!("file:///{}", percent_encode_file_url_path(&slash_path))
+}
+
+fn percent_encode_file_url_path(path: &str) -> String {
+    let mut url = String::new();
+    for byte in path.as_bytes() {
         let ch = *byte as char;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.' | '~') {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '/' | ':' | '-' | '_' | '.' | '~') {
             url.push(ch);
         } else {
             url.push_str(&format!("%{byte:02X}"));
@@ -9072,6 +9112,22 @@ mod tests {
             Some(file_url_for_path(&preview).as_str())
         );
         assert!(preview.exists());
+    }
+
+    #[test]
+    fn file_url_for_windows_drive_path_uses_slash_file_uri() {
+        assert_eq!(
+            windows_file_url_for_path_text(r"C:\Users\Laith Weinberger\capture frames\live.html"),
+            "file:///C:/Users/Laith%20Weinberger/capture%20frames/live.html"
+        );
+    }
+
+    #[test]
+    fn file_url_for_windows_unc_path_uses_host_file_uri() {
+        assert_eq!(
+            windows_file_url_for_path_text(r"\\server\share\capture frames\live.html"),
+            "file://server/share/capture%20frames/live.html"
+        );
     }
 
     #[test]

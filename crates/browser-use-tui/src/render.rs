@@ -3015,10 +3015,10 @@ fn browser_select_local_row_is_current(app: &App, browser: &str) -> bool {
         return false;
     }
     app.browser == BROWSER_LOCAL_CHROME
-        && app.browser_local_label.as_deref().map_or_else(
-            || browser.eq_ignore_ascii_case("Google Chrome"),
-            |current| current.eq_ignore_ascii_case(browser),
-        )
+        && app
+            .current_local_browser_label()
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(browser))
 }
 
 fn goal_lines(app: &App) -> Vec<Line<'static>> {

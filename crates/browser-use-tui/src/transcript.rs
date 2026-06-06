@@ -3458,7 +3458,10 @@ fn is_useful_source_for_backend(source: &str, backend: &str) -> bool {
 
 fn browser_backend_supports_live_url(backend: &str) -> bool {
     let backend = backend.to_ascii_lowercase();
-    backend.contains("cloud") || backend.contains("managed")
+    backend.contains("cloud")
+        || backend.contains("managed")
+        || backend.contains("headless chromium")
+        || backend.contains("managed chromium")
 }
 
 fn is_cloud_live_url(source: &str) -> bool {
@@ -5001,6 +5004,33 @@ mod tests {
             group_label_style("run", NodeStyle::Normal),
             group_label_style("explored", NodeStyle::Normal)
         );
+    }
+
+    #[test]
+    fn source_for_state_keeps_headless_chromium_live_preview() {
+        let live_url = "file:///tmp/browser-use-terminal/.capture.frames/live.html";
+        let state = WorkbenchState {
+            setup_complete: true,
+            current_session: None,
+            task: None,
+            result: None,
+            failure: None,
+            activity: Vec::new(),
+            transcript: Vec::new(),
+            browser: browser_use_protocol::BrowserSummary {
+                backend: "Headless Chromium".to_string(),
+                status: "connected".to_string(),
+                title: None,
+                url: None,
+                live_url: Some(live_url.to_string()),
+                tabs: None,
+                viewport: None,
+            },
+            telemetry: browser_use_protocol::TelemetrySummary::default(),
+            history: Vec::new(),
+        };
+
+        assert_eq!(source_for_state(&state).as_deref(), Some(live_url));
     }
 
     #[test]
