@@ -10,7 +10,7 @@ use browser_use_protocol::{
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal};
@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::palette;
 use crate::settings::{
     is_claude_code_account, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK,
-    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_CHOICES, BROWSER_USE_CLOUD,
+    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -30,8 +30,8 @@ use super::{
     collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
     format_goal_tokens_compact, goal_command_hint, goal_status_label,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
-    CookieSyncStatus, DefaultProfileStatus, FeedbackCategory, FeedbackStep, MessageActionKind,
-    ModelSearchEntry, ProductState, SetupResultKind, Surface,
+    BrowserSelectRow, CookieSyncStatus, DefaultProfileStatus, FeedbackCategory, FeedbackStep,
+    MessageActionKind, ModelSearchEntry, ProductState, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -1407,7 +1407,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::ModelSearch => ("Model", "Search this provider's models"),
         Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
-        Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
+        Surface::BrowserSelect => ("Browser", "Choose a local browser or backend"),
         Surface::DefaultProfile => ("Profile", "Choose the default local Chrome profile"),
         Surface::CookieSync => (
             "Cookie Sync",
@@ -1518,7 +1518,7 @@ fn surface_lines(
         Surface::ModelSearch => model_search_lines(app, height),
         Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
-        Surface::BrowserSelect => browser_select_lines(app),
+        Surface::BrowserSelect => browser_select_lines(app, width),
         Surface::DefaultProfile => default_profile_lines(app, width),
         Surface::CookieSync => cookie_sync_lines(app, width),
         Surface::Context => context_lines(app, state, width),
@@ -1636,10 +1636,23 @@ fn render_composer(
         width: box_area.width,
         height: 1,
     };
-    frame.render_widget(
-        Paragraph::new(composer_bottom_border(box_area.width, app)).style(border()),
-        bottom_area,
-    );
+    let (bottom_border, bottom_live_link) = composer_bottom_border(box_area.width, app, state);
+    frame.render_widget(Paragraph::new(bottom_border).style(border()), bottom_area);
+    if let Some(link) = bottom_live_link {
+        let col = bottom_area.x.saturating_add(link.col as u16);
+        let max_visible = bottom_area.right().saturating_sub(col) as usize;
+        let width = link.width.min(max_visible);
+        if width > 0 {
+            let text: String = link.text.chars().take(width).collect();
+            *app.live_link_overlay.borrow_mut() = Some(LiveLinkOverlay {
+                col,
+                row: bottom_area.y,
+                text,
+                url: link.url,
+                fg: accent().fg.unwrap_or(ratatui::style::Color::Reset),
+            });
+        }
+    }
 
     if status_h > 0 {
         let status_area = Rect {
@@ -1678,39 +1691,80 @@ fn render_composer(
 /// Bottom border line for the composer, with the browser tag punched
 /// through it on the right. Corners and dashes use the same gray
 /// `border()` style as the rest of the box; the browser text is white.
-fn composer_bottom_border(width: u16, app: &App) -> Line<'static> {
+fn composer_bottom_border(
+    width: u16,
+    app: &App,
+    state: &WorkbenchState,
+) -> (Line<'static>, Option<LiveLink>) {
     if width < 2 {
-        return Line::from("");
+        return (Line::from(""), None);
     }
     let inner_w = width.saturating_sub(2) as usize;
     let mut spans: Vec<Span<'static>> = vec![Span::styled("╰", border())];
+    let mut live_link = None;
     let browser = app.browser_status_label();
     let browser = browser.trim();
-    if !browser.is_empty() {
-        // ` browser ` with one cell of dash padding on each side, so the
-        // background dashes hug right up to the spaces around the tag.
-        let label = truncate(browser, inner_w.saturating_sub(4).max(1));
-        let tag_style = if cloud_browser_needs_key(app) {
-            failed()
+    let live_url = state
+        .browser
+        .live_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if !browser.is_empty() || live_url.is_some() {
+        let live_label = "Open Live Browser";
+        let live_tag_w = live_label.chars().count() + 2;
+        let wants_live = live_url.is_some() && inner_w >= live_tag_w;
+        let browser_budget = if wants_live {
+            inner_w.saturating_sub(live_tag_w + 3)
         } else {
-            text_style()
+            inner_w.saturating_sub(4).max(1)
         };
-        let tag: Vec<Span<'static>> = vec![
-            Span::raw(" "),
-            Span::styled(label, tag_style),
-            Span::raw(" "),
-        ];
-        let tag_w: usize = tag.iter().map(|s| s.content.chars().count()).sum();
+        let browser_label = (!browser.is_empty())
+            .then(|| truncate(browser, browser_budget.max(1)))
+            .filter(|label| !label.is_empty());
+        let browser_tag_w = browser_label
+            .as_ref()
+            .map(|label| label.chars().count() + 2)
+            .unwrap_or(0);
+        let tag_w = usize::from(wants_live) * live_tag_w + browser_tag_w;
         let trail = 2usize.min(inner_w.saturating_sub(tag_w));
         let lead = inner_w.saturating_sub(tag_w + trail);
         spans.push(Span::styled("─".repeat(lead), border()));
-        spans.extend(tag);
+        let col = 1 + lead;
+        if wants_live {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                live_label,
+                accent().add_modifier(Modifier::UNDERLINED),
+            ));
+            if let Some(url) = live_url {
+                live_link = Some(LiveLink {
+                    col: col + 1,
+                    width: live_label.chars().count(),
+                    text: live_label.to_string(),
+                    url: url.to_string(),
+                });
+            }
+            spans.push(Span::raw(" "));
+        }
+        if let Some(label) = browser_label {
+            let tag_style = if app.browser == BROWSER_USE_CLOUD
+                && !app.browser_use_cloud_key_ready().unwrap_or(false)
+            {
+                failed()
+            } else {
+                text_style()
+            };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(label, tag_style));
+            spans.push(Span::raw(" "));
+        }
         spans.push(Span::styled("─".repeat(trail), border()));
     } else {
         spans.push(Span::styled("─".repeat(inner_w), border()));
     }
     spans.push(Span::styled("╯", border()));
-    Line::from(spans)
+    (Line::from(spans), live_link)
 }
 
 /// Geometry of the clickable live-view link inside the status row, as built
@@ -1750,11 +1804,8 @@ pub(crate) struct LiveLinkOverlay {
 }
 
 /// Status row below the composer: active model and context-fill bar,
-/// plus running cost when there is one. The browser lives on the box's
-/// bottom border, not here.
-///
-/// Returns the rendered line plus, when present, the geometry of the live
-/// URL so the caller can attach an OSC-8 hyperlink to the full URL.
+/// plus running cost when there is one. Browser and live-browser links live on
+/// the box's bottom border, not here.
 fn composer_status_line(
     app: &App,
     state: &WorkbenchState,
@@ -1781,33 +1832,8 @@ fn composer_status_line(
         spans.push(status_separator());
         spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
     }
-    let mut live_link = None;
-    if let Some(live_url) = state
-        .browser
-        .live_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let used = spans_text_width(&spans);
-        let prefix_width = status_separator_width() + "live ".chars().count();
-        if width > used.saturating_add(prefix_width).saturating_add(8) {
-            let available = width.saturating_sub(used + prefix_width);
-            let shown = truncate(live_url, available);
-            // The URL text starts after everything rendered so far plus the
-            // separator and the "live " label.
-            let url_col = used + prefix_width;
-            live_link = Some(LiveLink {
-                col: url_col,
-                width: shown.chars().count(),
-                text: shown.clone(),
-                url: live_url.to_string(),
-            });
-            spans.push(status_separator());
-            spans.push(Span::styled(format!("live {shown}"), muted()));
-        }
-    }
-    (Line::from(spans), live_link)
+    let _ = width;
+    (Line::from(spans), None)
 }
 
 /// Dropdown rows used by the fused composer. No top/bottom rules and no
@@ -1887,14 +1913,6 @@ fn context_bar_spans(used_tokens: i64, budget_tokens: i64) -> Vec<Span<'static>>
 
 fn status_separator() -> Span<'static> {
     Span::styled("  ·  ", dim())
-}
-
-fn status_separator_width() -> usize {
-    5
-}
-
-fn spans_text_width(spans: &[Span<'_>]) -> usize {
-    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 /// Per-session token and cost totals. Codex-style `token_count` events are the
@@ -2918,41 +2936,126 @@ fn access_label(account: &'static str) -> &'static str {
     }
 }
 
-fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
+fn browser_select_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let body_width = cookie_sync_body_width(width);
     let mut lines = vec![
         Line::from(Span::styled("CHOOSE BROWSER", muted())),
         Line::from(""),
     ];
+    lines.push(Line::from(Span::styled("BROWSERS", muted())));
+    match &app.default_profile.status {
+        DefaultProfileStatus::Loading => {
+            lines.push(Line::from("  Scanning local browsers..."));
+        }
+        DefaultProfileStatus::Ready => {
+            let rows = app.browser_select_rows();
+            if rows
+                .iter()
+                .all(|row| matches!(row, BrowserSelectRow::Cloud))
+            {
+                lines.push(Line::from("  No local browsers found."));
+            } else {
+                for (idx, row) in rows.iter().enumerate() {
+                    match row {
+                        BrowserSelectRow::Local(browser) => {
+                            let is_current = browser_select_local_row_is_current(app, browser);
+                            let metadata = if browser.eq_ignore_ascii_case("Google Chrome") {
+                                Some("recommended")
+                            } else {
+                                None
+                            };
+                            lines.push(browser_select_row_line(
+                                &truncate(browser, body_width),
+                                metadata,
+                                idx,
+                                app.selected_row,
+                                is_current,
+                            ));
+                        }
+                        BrowserSelectRow::ChromiumHeaded => {
+                            lines.push(browser_select_row_line(
+                                "  Mode: headed",
+                                None,
+                                idx,
+                                app.selected_row,
+                                app.browser == "Managed Chromium",
+                            ));
+                        }
+                        BrowserSelectRow::ChromiumHeadless => {
+                            lines.push(browser_select_row_line(
+                                "  Mode: headless",
+                                None,
+                                idx,
+                                app.selected_row,
+                                app.browser == "Headless Chromium",
+                            ));
+                        }
+                        BrowserSelectRow::Cloud => {}
+                    }
+                }
+            }
+        }
+        DefaultProfileStatus::Failed(error) => {
+            push_wrapped_cookie_sync_message(&mut lines, error, body_width);
+        }
+    }
+    let non_local_start = app.browser_select_local_browser_count();
     let cloud_description = if !app.browser_use_cloud_key_ready().unwrap_or(false) {
         "needs Browser Use key"
     } else {
         "remote browser with live view"
     };
-    let descriptions = [
-        "attach to already-open browser",
-        cloud_description,
-        "Rust-owned background browser",
-    ];
-    for (idx, browser) in BROWSER_CHOICES.iter().enumerate() {
-        lines.push(selected(
-            &format!("{browser:<24} {}", descriptions[idx]),
-            idx,
-            app.selected_row,
-        ));
-    }
-    lines.extend([
-        Line::from(""),
-        Line::from(Span::styled("CURRENT", muted())),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(app.browser.clone(), text_style()),
-            Span::styled(
-                format!(" . {}", browser_current_status_for_select(app)),
-                browser_current_status_style(app),
-            ),
-        ]),
-    ]);
+    lines.extend([Line::from(""), Line::from(Span::styled("REMOTE", muted()))]);
+    lines.push(browser_select_row_line(
+        BROWSER_USE_CLOUD,
+        Some(cloud_description),
+        non_local_start,
+        app.selected_row,
+        app.browser == BROWSER_USE_CLOUD,
+    ));
     lines
+}
+
+fn browser_select_row_line(
+    title: &str,
+    metadata: Option<&str>,
+    idx: usize,
+    selected: usize,
+    is_current: bool,
+) -> Line<'static> {
+    let cursor = idx == selected;
+    let title_style = if is_current {
+        current()
+    } else if cursor {
+        bold()
+    } else {
+        text_style()
+    };
+    let mut spans = vec![
+        Span::styled(
+            if cursor { "> " } else { "  " },
+            if cursor { accent() } else { dim() },
+        ),
+        Span::styled(title.to_string(), title_style),
+    ];
+    if let Some(metadata) = metadata.filter(|value| !value.trim().is_empty()) {
+        spans.push(Span::styled(format!("  {metadata}"), muted()));
+    }
+    Line::from(spans)
+}
+
+fn browser_select_local_row_is_current(app: &App, browser: &str) -> bool {
+    if app.browser == "Headless Chromium" {
+        return false;
+    }
+    if app.browser == "Managed Chromium" {
+        return false;
+    }
+    app.browser == BROWSER_LOCAL_CHROME
+        && app
+            .current_local_browser_label()
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(browser))
 }
 
 fn goal_lines(app: &App) -> Vec<Line<'static>> {
@@ -4214,26 +4317,6 @@ fn append_telemetry_detail_lines(lines: &mut Vec<Line<'static>>, telemetry: &Tel
             &format!("disabled: {}", truncate(&first_line(error), 120)),
         ));
     }
-}
-
-fn browser_current_status_for_select(app: &App) -> &'static str {
-    if cloud_browser_needs_key(app) {
-        "needs key"
-    } else {
-        "ready"
-    }
-}
-
-fn browser_current_status_style(app: &App) -> Style {
-    if cloud_browser_needs_key(app) {
-        failed()
-    } else {
-        done()
-    }
-}
-
-fn cloud_browser_needs_key(app: &App) -> bool {
-    app.browser == BROWSER_USE_CLOUD && !app.browser_use_cloud_key_ready().unwrap_or(false)
 }
 
 fn masked_secret(value: &str) -> String {

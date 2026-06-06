@@ -687,6 +687,7 @@ pub fn browser_summary_from_events(
             }
             "browser.disconnected" => {
                 summary.status = "disconnected".to_string();
+                summary.live_url = None;
             }
             "browser.backend_changed" => {
                 summary.status = "not connected".to_string();
@@ -738,7 +739,11 @@ pub fn browser_summary_from_events(
 }
 
 fn browser_backend_supports_live_url(backend: &str) -> bool {
-    backend.to_ascii_lowercase().contains("cloud")
+    let backend = backend.to_ascii_lowercase();
+    backend.contains("cloud")
+        || backend.contains("managed")
+        || backend.contains("headless chromium")
+        || backend.contains("managed chromium")
 }
 
 pub fn telemetry_summary_from_events(events: &[EventRecord]) -> TelemetrySummary {
@@ -1632,6 +1637,60 @@ mod tests {
         assert_eq!(
             browser.live_url.as_deref(),
             Some("https://live.browser-use.com/legacy")
+        );
+    }
+
+    #[test]
+    fn browser_live_url_projection_accepts_managed_chromium_backends() {
+        let events = vec![event(
+            1,
+            "browser.live_url",
+            json!({"live_url": "https://chrome-devtools-frontend.appspot.com/serve_rev/@rev/inspector.html?ws=127.0.0.1:9222/devtools/page/abc"}),
+        )];
+
+        for backend in ["managed", "Managed Chromium", "Headless Chromium"] {
+            let browser = browser_summary_from_events(&events, backend);
+            assert_eq!(
+                browser.live_url.as_deref(),
+                Some("https://chrome-devtools-frontend.appspot.com/serve_rev/@rev/inspector.html?ws=127.0.0.1:9222/devtools/page/abc"),
+                "backend {backend} should keep local DevTools live URL"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_live_url_projection_keeps_local_devtools_after_done() {
+        let events = vec![
+            event(
+                1,
+                "browser.live_url",
+                json!({"live_url": "https://chrome-devtools-frontend.appspot.com/serve_rev/@rev/inspector.html?ws=127.0.0.1:9222/devtools/page/abc"}),
+            ),
+            event(2, "session.done", json!({"result": "Done"})),
+        ];
+
+        let browser = browser_summary_from_events(&events, "Headless Chromium");
+        assert_eq!(
+            browser.live_url.as_deref(),
+            Some("https://chrome-devtools-frontend.appspot.com/serve_rev/@rev/inspector.html?ws=127.0.0.1:9222/devtools/page/abc")
+        );
+    }
+
+    #[test]
+    fn browser_live_url_projection_keeps_cloud_live_url_after_done() {
+        let events = vec![
+            event(
+                1,
+                "browser.live_url",
+                json!({"live_url": "https://live.browser-use.com/watch"}),
+            ),
+            event(2, "session.done", json!({"result": "Done"})),
+        ];
+
+        let browser = browser_summary_from_events(&events, "Browser Use Cloud");
+        assert_eq!(
+            browser.live_url.as_deref(),
+            Some("https://live.browser-use.com/watch")
         );
     }
 

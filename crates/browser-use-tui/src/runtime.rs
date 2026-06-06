@@ -910,6 +910,7 @@ fn child_request_browser(request: &ChildAgentRunRequest) -> Option<String> {
         .filter(|value| !value.is_empty())?;
     match browser_mode {
         "managed-headless" => Some("Headless Chromium".to_string()),
+        "managed-headed" => Some("Managed Chromium".to_string()),
         "cloud" => Some(BROWSER_USE_CLOUD.to_string()),
         "local" => Some("Local Chrome".to_string()),
         _ => None,
@@ -980,6 +981,12 @@ fn tui_agent_options(
         "Headless Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headless")
+            .with_dynamic_browser_mode_from_store(true)
+            .with_model_compaction(true)
+            .with_analytics_source("tui"),
+        "Managed Chromium" => AgentRunOptions::default()
+            .with_collaboration_mode(collaboration_mode)
+            .with_browser_mode("managed-headed")
             .with_dynamic_browser_mode_from_store(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),

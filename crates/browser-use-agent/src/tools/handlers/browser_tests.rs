@@ -54,6 +54,7 @@ struct FakeBackend {
     last: Mutex<LastCall>,
     commands: Mutex<Vec<String>>,
     local_profiles: Mutex<Option<serde_json::Value>>,
+    cloud_profiles: Mutex<Option<serde_json::Value>>,
     local_list: Mutex<Option<serde_json::Value>>,
     active_local_profile_id: Mutex<Option<String>>,
     browser_page_ready: Mutex<bool>,
@@ -130,6 +131,24 @@ impl FakeBackend {
         })
     }
 
+    fn default_cloud_profiles() -> serde_json::Value {
+        json!({
+            "status": "ok",
+            "profiles": [
+                {
+                    "id": "cloud-work",
+                    "name": "Browser Use - Work",
+                    "cookieDomains": ["app.example.com", "accounts.example.com"]
+                },
+                {
+                    "id": "cloud-personal",
+                    "name": "Personal Profile",
+                    "cookieDomains": ["shopping.example"]
+                }
+            ]
+        })
+    }
+
     fn command_output_for(&self, command: &str) -> BrowserCommandOutput {
         if let Some(profile_id) = command
             .strip_prefix("browser local open --profile ")
@@ -157,6 +176,12 @@ impl FakeBackend {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(Self::default_local_profiles),
+            "browser remote profiles --json" => self
+                .cloud_profiles
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(Self::default_cloud_profiles),
             "browser local list --json" => self
                 .local_list
                 .lock()
@@ -525,6 +550,155 @@ async fn stored_cloud_profile_influences_bare_connect_when_mode_unlocked() {
         backend.last(),
         LastCall::Command("browser remote start --profile-id 'profile with space'".to_string())
     );
+}
+
+#[tokio::test]
+async fn stored_cloud_profile_influences_bare_connect_when_mode_locked() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_setting("browser.preference.mode", "cloud")
+            .unwrap();
+        store
+            .set_setting("browser.preference.profile", "cloud-work")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command("browser remote start --profile-id cloud-work".to_string())
+    );
+}
+
+#[tokio::test]
+async fn selected_cloud_mode_ignores_stored_local_profile_on_bare_connect() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_setting("browser.preference.mode", "local")
+            .unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Profile 1")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command("browser remote start".to_string())
+    );
+}
+
+#[tokio::test]
+async fn cloud_profile_suggest_lists_matching_cloud_profiles() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_setting("browser.preference.mode", "cloud")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store, session);
+
+    let req = BrowserRequest::command(
+        "sess-1",
+        "browser profile suggest --domain example[.]com$ --json",
+    );
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("\"mode\":\"cloud\""), "{}", out.stdout);
+    assert!(out.stdout.contains("\"cloud_profiles\""), "{}", out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(parsed["default_profile_id"], serde_json::Value::Null);
+    assert_eq!(
+        parsed["matching_profiles"][0]["matching_cookie_domains"],
+        json!(["app.example.com", "accounts.example.com"])
+    );
+    assert_eq!(
+        parsed["matching_profiles"][0]["cookie_domain_count"],
+        json!(2)
+    );
+    assert!(parsed["matching_profiles"][0]
+        .get("cookieDomains")
+        .is_none());
+    assert!(parsed["matching_profiles"][0]
+        .get("sample_cookie_domains")
+        .is_none());
+    assert!(parsed["cloud_profiles"][0].get("cookieDomains").is_none());
+    assert!(parsed["cloud_profiles"][0]
+        .get("sample_cookie_domains")
+        .is_none());
+    assert!(parsed["profile_choices"][0].get("cookie_domains").is_none());
+    assert!(parsed["profile_choices"][0]
+        .get("sample_cookie_domains")
+        .is_none());
+    assert!(out.stdout.contains("cloud-work"), "{}", out.stdout);
+    assert_eq!(
+        backend.commands(),
+        vec!["browser remote profiles --json".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn cloud_profile_remember_sets_mode_and_cloud_next_step() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store.clone(), session);
+
+    let req = BrowserRequest::command(
+        "sess-1",
+        "browser profile remember --mode cloud --profile cloud-work",
+    );
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("\"mode\":\"cloud\""), "{}", out.stdout);
+    assert!(
+        out.stdout
+            .contains("\"next_step\":\"browser remote start --profile-id cloud-work\""),
+        "{}",
+        out.stdout
+    );
+    {
+        let store = store.lock().unwrap();
+        assert_eq!(
+            store
+                .get_setting("browser.preference.mode")
+                .unwrap()
+                .as_deref(),
+            Some("cloud")
+        );
+        assert_eq!(
+            store
+                .get_setting("browser.preference.profile")
+                .unwrap()
+                .as_deref(),
+            Some("cloud-work")
+        );
+    }
 }
 
 #[tokio::test]
