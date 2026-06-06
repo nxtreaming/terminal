@@ -60,13 +60,16 @@ use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
 /// Default per-script timeout (seconds) when a request omits one.
 ///
 /// The `browser-use-browser` script fns take a `timeout_seconds`; we default to
-/// a generous 120s so a single page interaction has room to complete.
-pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 120;
+/// a generous 300s so a single page interaction has room to complete while the
+/// run-level task timebox remains responsible for bounding the whole agent.
+pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 300;
 
 /// Default observe poll window (ms) for [`BrowserAction::Observe`].
 ///
-/// Mirrors the legacy default observe window used by the browser_script runtime.
-pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
+/// Long browser_script runs should be observed in coarse windows so the agent
+/// does not burn many LLM turns polling the same run_id while work is ongoing.
+pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_OBSERVE_TIMEOUT_MS: u64 = 120_000;
 
 /// Appended to `browser_script` stdout when the response carries image parts.
 ///
@@ -74,11 +77,19 @@ pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
 /// [`ContentPart`]s so provider protocols can send images to vision-capable
 /// models while preserving a plain text fallback for logs/tests.
 pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_content__:";
+/// Maximum bytes of browser-script text returned to the next model turn.
+///
+/// Full browser-script output is persisted through durable events/artifacts; the
+/// inline model view is deliberately smaller because long eval tasks repeatedly
+/// carry every prior tool result in later prompts.
+pub const MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES: usize = 4 * 1024;
 
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_BROWSER: &str = "browser.preference.browser";
 const BROWSER_PREF_BROWSER_LABEL: &str = "browser.preference.browser_label";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
+const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
+const BROWSER_SCRIPT_MAX_IMAGE_DIMENSION: u32 = 8_000;
 const BROWSER_PREF_PROFILE_LABEL: &str = "browser.preference.profile_label";
 
 /// What the model wants the browser to do.
@@ -192,6 +203,7 @@ impl BrowserRequest {
     fn effective_observe_ms(&self) -> u64 {
         self.observe_timeout_ms
             .unwrap_or(DEFAULT_OBSERVE_TIMEOUT_MS)
+            .clamp(DEFAULT_OBSERVE_TIMEOUT_MS, MAX_OBSERVE_TIMEOUT_MS)
     }
 }
 
@@ -458,6 +470,7 @@ impl RealBackend {
         Some(
             match mode {
                 "cloud" | "browser-use-cloud" | "remote-cloud" => "cloud",
+                "remote-cdp" | "cdp" => "remote-cdp",
                 "headless" | "headless-chromium" | "managed-headless" => "managed-headless",
                 other => other,
             }
@@ -466,13 +479,18 @@ impl RealBackend {
     }
 
     fn should_ensure_before_command(&self, command: &str) -> bool {
-        if self.normalized_browser_mode().is_none() {
+        let Some(mode) = self.normalized_browser_mode() else {
             return false;
-        }
+        };
         let Ok(words) = browser_command_words(command) else {
             return false;
         };
         let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+        if mode == "remote-cdp"
+            && matches!(words.as_slice(), ["browser", "status", ..] | ["status", ..])
+        {
+            return true;
+        }
         if browser_command_is_passive(words.as_slice()) {
             return false;
         }
@@ -482,6 +500,8 @@ impl RealBackend {
                 | ["remote", "start", ..]
                 | ["browser", "remote", "stop", ..]
                 | ["remote", "stop", ..]
+                | ["browser", "connect", "remote-cdp", ..]
+                | ["connect", "remote-cdp", ..]
         )
     }
 
@@ -529,16 +549,24 @@ impl RealBackend {
             status.content.get("connection").and_then(Value::as_str) == Some("connected");
         let current_mode = status.content.get("mode").and_then(Value::as_str);
         let owner = status.content.get("owner").and_then(Value::as_str);
-        let Some(desired_command) =
+        let desired_command = if mode == "remote-cdp" {
+            if connected && current_mode == Some("remote-cdp") {
+                None
+            } else {
+                Some(remote_cdp_connect_command()?)
+            }
+        } else {
             desired_browser_connect_command(mode.as_str(), connected, current_mode, owner)
-        else {
+                .map(str::to_string)
+        };
+        let Some(desired_command) = desired_command else {
             return Ok(events);
         };
         let mut started = browser_use_browser::run_browser_command_with_options_and_registries(
             session_id,
             cwd,
             artifact_dir,
-            desired_command,
+            &desired_command,
             browser_use_browser::BrowserCommandOptions::default(),
             &self.script_registry,
             &self.session_registry,
@@ -775,10 +803,12 @@ fn dispatch_browser_preference(
     selected_browser_mode: Option<&str>,
 ) -> anyhow::Result<Value> {
     match args.get(1).map(String::as_str) {
-        None | Some("--json") | Some("show") => browser_preference_json(store),
+        None | Some("--json") | Some("show") => {
+            browser_preference_json(store, selected_browser_mode)
+        }
         Some("use") => {
             let mode = args.get(2).map(String::as_str).ok_or_else(|| {
-                anyhow!("browser preference use requires <local|cloud|managed-headless>")
+                anyhow!("browser preference use requires <local|cloud|managed-headless|remote-cdp>")
             })?;
             let normalized = normalize_browser_preference_mode(mode)?;
             enforce_selected_browser_mode(selected_browser_mode, normalized)?;
@@ -786,7 +816,7 @@ fn dispatch_browser_preference(
             store.set_setting("browser", browser_display_name(normalized))?;
             Ok(json!({
                 "status": "ok",
-                "preference": browser_preference_json(store)?,
+                "preference": browser_preference_json(store, selected_browser_mode)?,
                 "next_step": "browser connect",
             }))
         }
@@ -804,7 +834,7 @@ fn dispatch_browser_profile_preference(
     selected_browser_mode: Option<&str>,
 ) -> anyhow::Result<Value> {
     match args.get(1).map(String::as_str) {
-        Some("current") => browser_preference_json(store),
+        Some("current") => browser_preference_json(store, selected_browser_mode),
         Some("use") => {
             enforce_selected_browser_mode(selected_browser_mode, "local")?;
             let profile_id = args
@@ -974,7 +1004,7 @@ fn dispatch_browser_profile_preference(
             }))
         }
         Some(other) => bail!("unknown browser profile command: {other}"),
-        None => browser_preference_json(store),
+        None => browser_preference_json(store, selected_browser_mode),
     }
 }
 
@@ -995,14 +1025,41 @@ fn resolve_browser_command_for_selected_mode(
         } else {
             None
         };
-        Ok(browser_connect_command_for_mode(
-            effective_mode,
-            profile_id.as_deref(),
-        ))
+        browser_connect_command_for_mode(effective_mode, profile_id.as_deref())
     } else {
+        if let Some(command) =
+            remote_cdp_compatibility_connect_command(&args, selected_browser_mode)?
+        {
+            return Ok(command);
+        }
         enforce_browser_command_matches_selected_mode(&args, selected_browser_mode)?;
         Ok(cmd.to_string())
     }
+}
+
+fn remote_cdp_compatibility_connect_command(
+    args: &[String],
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(selected_mode) = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if normalize_browser_preference_mode(selected_mode)? != "remote-cdp" {
+        return Ok(None);
+    }
+    let requests_different_browser_setup = match args {
+        [command, mode, ..] if command == "connect" => mode != "remote-cdp",
+        [command, ..] if command == "local" => true,
+        [command, action, ..] if command == "remote" && action == "start" => true,
+        _ => false,
+    };
+    if requests_different_browser_setup {
+        return Ok(Some(remote_cdp_connect_command()?));
+    }
+    Ok(None)
 }
 
 fn local_connect_default_profile_preflight(
@@ -1851,6 +1908,35 @@ fn preferred_browser_mode(store: Option<&Store>) -> anyhow::Result<&'static str>
     normalize_browser_preference_mode(&mode)
 }
 
+fn remote_cdp_connect_command() -> anyhow::Result<String> {
+    if let Some(ws) = env_trimmed("BU_CDP_WS") {
+        return Ok(remote_cdp_connect_command_for_endpoint(&ws));
+    }
+    if let Some(url) = env_trimmed("BU_CDP_URL") {
+        return Ok(remote_cdp_connect_command_for_endpoint(&url));
+    }
+    bail!("browser mode is locked to Remote CDP, but BU_CDP_URL or BU_CDP_WS is not set")
+}
+
+fn remote_cdp_connect_command_for_endpoint(endpoint: &str) -> String {
+    let flag = if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        "--ws"
+    } else {
+        "--url"
+    };
+    format!(
+        "browser connect remote-cdp {flag} {}",
+        shell_quote_browser_arg(endpoint)
+    )
+}
+
+fn env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn stored_profile_for_mode(store: &Store, mode: &str) -> anyhow::Result<Option<String>> {
     let normalized_mode = normalize_browser_preference_mode(mode)?;
     let stored_mode = preferred_browser_mode(Some(store))?;
@@ -1862,20 +1948,31 @@ fn stored_profile_for_mode(store: &Store, mode: &str) -> anyhow::Result<Option<S
         .filter(|profile| !profile.trim().is_empty()))
 }
 
-fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> String {
+fn browser_connect_command_for_mode(
+    mode: &str,
+    profile_id: Option<&str>,
+) -> anyhow::Result<String> {
     match normalize_browser_preference_mode(mode).unwrap_or("local") {
-        "cloud" => profile_id.filter(|value| !value.is_empty()).map_or_else(
-            || "browser remote start".to_string(),
-            |profile_id| {
-                format!(
-                    "browser remote start --profile-id {}",
+        "cloud" => {
+            let mut command = "browser remote start".to_string();
+            if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
+                command.push_str(&format!(
+                    " --profile-id {}",
                     shell_quote_browser_arg(profile_id)
-                )
-            },
-        ),
-        "managed-headless" => "browser connect managed --headless".to_string(),
-        "managed-headed" => "browser connect managed --headed".to_string(),
-        _ => "browser connect local".to_string(),
+                ));
+            }
+            if let Some(country) = env_trimmed("BU_BROWSER_PROXY_COUNTRY_CODE") {
+                command.push_str(&format!(
+                    " --proxy-country {}",
+                    shell_quote_browser_arg(&country)
+                ));
+            }
+            Ok(command)
+        }
+        "managed-headless" => Ok("browser connect managed --headless".to_string()),
+        "managed-headed" => Ok("browser connect managed --headed".to_string()),
+        "remote-cdp" => remote_cdp_connect_command(),
+        _ => Ok("browser connect local".to_string()),
     }
 }
 
@@ -1929,10 +2026,7 @@ fn enforce_browser_command_matches_selected_mode(
                     };
                 enforce_selected_browser_mode(Some(selected_mode), requested_mode)
             }
-            Some("remote-cdp") => bail!(
-                "browser mode is locked to {} for this run; remote CDP endpoints are not selectable from this terminal browser mode",
-                browser_display_name(selected_mode),
-            ),
+            Some("remote-cdp") => enforce_selected_browser_mode(Some(selected_mode), "remote-cdp"),
             Some(other) => bail!("unknown browser connect mode: {other}"),
         },
         "local" => enforce_selected_browser_mode(Some(selected_mode), "local"),
@@ -1956,17 +2050,42 @@ fn has_browser_arg(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
-fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
-    let mode = store
-        .get_setting(BROWSER_PREF_MODE)?
-        .or_else(|| {
-            store
-                .get_setting("browser")
-                .ok()
-                .flatten()
-                .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
+fn browser_preference_json(
+    store: &Store,
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<Value> {
+    let selected_mode = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_browser_preference_mode)
+        .transpose()?;
+    let mode = selected_mode.map(ToOwned::to_owned).unwrap_or_else(|| {
+        store
+            .get_setting(BROWSER_PREF_MODE)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                store
+                    .get_setting("browser")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
+            })
+            .unwrap_or_else(|| "local".to_string())
+    });
+    let domain_profiles = store
+        .list_settings()?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix(BROWSER_DOMAIN_PROFILE_PREFIX)
+                .and_then(|domain| {
+                    serde_json::from_str::<Value>(&value)
+                        .ok()
+                        .map(|value| (domain.to_string(), value))
+                })
         })
-        .unwrap_or_else(|| "local".to_string());
+        .map(|(domain, value)| json!({ "domain": domain, "preference": value }))
+        .collect::<Vec<_>>();
     let normalized_mode = normalize_browser_preference_mode(&mode)?;
     let profile_id = stored_profile_for_mode(store, normalized_mode)?;
     let profile_label = if profile_id.is_some() {
@@ -1981,13 +2100,19 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
         "browser_label": store.get_setting(BROWSER_PREF_BROWSER_LABEL)?,
         "profile_id": profile_id,
         "profile_label": profile_label,
-        "connect_command": match normalized_mode {
-            "cloud" => "browser remote start",
-            "managed-headless" => "browser connect managed --headless",
-            "managed-headed" => "browser connect managed --headed",
-            _ => "browser connect local",
-        },
+        "domain_profiles": domain_profiles,
+        "connect_command": browser_connect_command_display_for_mode(normalized_mode, profile_id.as_deref())?,
     }))
+}
+
+fn browser_connect_command_display_for_mode(
+    mode: &str,
+    profile_id: Option<&str>,
+) -> anyhow::Result<String> {
+    match normalize_browser_preference_mode(mode)? {
+        "remote-cdp" => Ok("browser connect remote-cdp --url <BU_CDP_URL>".to_string()),
+        _ => browser_connect_command_for_mode(mode, profile_id),
+    }
 }
 
 fn browser_command_words(cmd: &str) -> anyhow::Result<Vec<String>> {
@@ -2057,6 +2182,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
     match normalized.as_str() {
         "local" | "local-chrome" => Ok("local"),
         "cloud" | "browser-use-cloud" | "remote-cloud" => Ok("cloud"),
+        "remote-cdp" | "cdp" => Ok("remote-cdp"),
         "headless" | "headless-chromium" | "managed-headless" => Ok("managed-headless"),
         "managed" | "managed-headed" | "headed" => Ok("managed-headed"),
         other => bail!("unknown browser preference mode: {other}"),
@@ -2066,6 +2192,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
 fn browser_display_name(mode: &str) -> &'static str {
     match mode {
         "cloud" => "Browser Use Cloud",
+        "remote-cdp" => "Remote CDP",
         "managed-headless" => "Headless Chromium",
         "managed-headed" => "Managed Chromium",
         _ => "Local Chrome",
@@ -2074,7 +2201,8 @@ fn browser_display_name(mode: &str) -> &'static str {
 
 fn display_browser_to_mode(display: &str) -> Option<&'static str> {
     match display {
-        "Browser Use Cloud" => Some("cloud"),
+        "Browser Use Cloud" | "Browser Use cloud" => Some("cloud"),
+        "Remote CDP" => Some("remote-cdp"),
         "Headless Chromium" => Some("managed-headless"),
         "Managed Chromium" => Some("managed-headed"),
         "Local Chrome" => Some("local"),
@@ -2166,11 +2294,28 @@ fn map_script_output(out: BrowserScriptOutput) -> ExecOutput {
 fn browser_script_stdout(response: &BrowserScriptOutput) -> String {
     let text = browser_script_tool_message_content(response);
     let (image_parts, warnings) = browser_script_image_parts(response);
-    let text = append_browser_script_image_warnings(text, &warnings);
+    let text =
+        cap_inline_browser_script_stdout(append_browser_script_image_warnings(text, &warnings));
     let Some(payload) = browser_script_content_payload(&text, image_parts) else {
         return text;
     };
     format!("{text}{BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX}{payload}")
+}
+
+fn cap_inline_browser_script_stdout(text: String) -> String {
+    if text.len() <= MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES {
+        return text;
+    }
+    let mut end = MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let elided = text.len() - end;
+    let mut out = text[..end].to_string();
+    out.push_str(&format!(
+        "\n... [browser_script stdout truncated, {elided} more bytes; full output persisted. Use a narrower browser_script extraction, the emitted summaries, or a saved artifact instead of re-reading broad page text.]"
+    ));
+    out
 }
 
 fn browser_script_content_payload(text: &str, image_parts: Vec<ContentPart>) -> Option<String> {
@@ -2222,12 +2367,29 @@ fn browser_script_image_part(image: &Value) -> Result<Option<ContentPart>, Strin
     if !mime_type.starts_with("image/") {
         return Ok(None);
     }
+    if let Some((width, height)) = png_dimensions(&bytes) {
+        if width > BROWSER_SCRIPT_MAX_IMAGE_DIMENSION || height > BROWSER_SCRIPT_MAX_IMAGE_DIMENSION
+        {
+            return Err(format!(
+                "Warning: image artifact was not attached because its dimensions {width}x{height} exceed provider limit; artifact remains at {path}"
+            ));
+        }
+    }
     Ok(Some(ContentPart::Media {
         mime_type: mime_type.to_string(),
         data: Some(general_purpose::STANDARD.encode(bytes)),
         url: None,
         detail: None,
     }))
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+    Some((width, height))
 }
 
 fn browser_script_tool_message_content(response: &BrowserScriptOutput) -> String {
@@ -2308,12 +2470,6 @@ fn browser_script_failure_message(response: &BrowserScriptOutput) -> String {
 
 fn browser_script_structured_message_parts(response: &BrowserScriptOutput) -> Vec<String> {
     let mut parts = Vec::new();
-    if !response.outputs.is_empty() {
-        parts.push(format!(
-            "outputs: {}",
-            Value::Array(response.outputs.clone())
-        ));
-    }
     if !response.summary.is_empty() {
         parts.push(format!(
             "summary: {}",
@@ -2322,6 +2478,12 @@ fn browser_script_structured_message_parts(response: &BrowserScriptOutput) -> Ve
     }
     if !response.data.is_null() && response.data != serde_json::json!({}) {
         parts.push(format!("data: {}", response.data));
+    }
+    if !response.outputs.is_empty() {
+        parts.push(format!(
+            "outputs: {}",
+            Value::Array(response.outputs.clone())
+        ));
     }
     parts
 }

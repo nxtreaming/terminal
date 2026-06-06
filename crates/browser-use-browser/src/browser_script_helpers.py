@@ -12,9 +12,11 @@ import math
 import os
 import pathlib
 import sys
+import threading
 import time as _time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 
@@ -23,13 +25,50 @@ PROFILE_MARKER = "browser-use-profile-target"
 __last_domain_skills = []
 
 
+_bridge_call_lock = threading.RLock()
+_TRANSIENT_BRIDGE_ERRORS = (
+    "browser is not connected or is busy",
+    "browser session is busy",
+    "browser bridge closed before response",
+    "cdp runtime.evaluate timed out",
+    "runtime.evaluate timed out",
+    "temporarily unavailable",
+)
+
+
+def _is_transient_bridge_error(exc):
+    message = str(exc).lower()
+    return any(part in message for part in _TRANSIENT_BRIDGE_ERRORS)
+
+
+def _bridge_with_retry(payload, *, attempts=4):
+    delay = 0.25
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            with _bridge_call_lock:
+                return _bridge(payload)
+        except (OSError, TimeoutError, RuntimeError) as exc:
+            last_exc = exc
+            if attempt + 1 >= attempts or not _is_transient_bridge_error(exc):
+                raise
+            print(
+                f"browser_script bridge retry {attempt + 2}/{attempts} after transient error: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            _time.sleep(delay)
+            delay = min(delay * 2, 2.0)
+    raise last_exc
+
+
 def _send_meta(meta, **params):
-    return _bridge({"kind": "meta", "meta": meta, **params})
+    return _bridge_with_retry({"kind": "meta", "meta": meta, **params})
 
 
 def cdp(method, session_id=None, **params):
     """Raw CDP. Example: cdp("Page.navigate", url="https://example.com")."""
-    return _bridge({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
+    return _bridge_with_retry({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
 
 
 def cdp_batch(calls):
@@ -114,6 +153,27 @@ def _runtime_evaluate(expression, session_id=None, await_promise=False, return_b
     except TimeoutError as exc:
         raise RuntimeError(f"Runtime.evaluate timed out; expression: {_js_snippet(expression)}") from exc
     return _runtime_value(response, expression)
+
+
+def _is_anonymous_function_expression(expression):
+    source = expression.lstrip()
+    return source.startswith("function(") or source.startswith("function (")
+
+
+def _is_async_anonymous_function_expression(expression):
+    source = expression.lstrip()
+    return source.startswith("async function(") or source.startswith("async function (")
+
+
+def _asyncify_parenthesized_function_iife(expression):
+    source = expression.lstrip()
+    leading = expression[: len(expression) - len(source)]
+    if not source.startswith("(function"):
+        return expression
+    after_function = source[len("(function") :]
+    if not (after_function.startswith("(") or after_function.startswith(" (")):
+        return expression
+    return f"{leading}(async function{after_function}"
 
 
 def _has_return_statement(expression):
@@ -210,6 +270,97 @@ def _has_return_statement(expression):
     return False
 
 
+def _has_top_level_lexical_declaration(expression):
+    i = 0
+    n = len(expression)
+    state = "code"
+    quote = ""
+    brace_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+
+    def is_ident(ch):
+        return ch == "_" or ch == "$" or ch.isalnum()
+
+    def is_keyword_at(keyword, pos):
+        if not expression.startswith(keyword, pos):
+            return False
+        before = expression[pos - 1] if pos > 0 else ""
+        after_pos = pos + len(keyword)
+        after = expression[after_pos] if after_pos < n else ""
+        return not is_ident(before) and not is_ident(after)
+
+    while i < n:
+        ch = expression[i]
+        nxt = expression[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch in ("'", '"', "`"):
+                state = "string"
+                quote = ch
+                i += 1
+                continue
+            if ch == "/" and nxt == "/":
+                state = "line_comment"
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block_comment"
+                i += 2
+                continue
+            if ch == "{":
+                brace_depth += 1
+                i += 1
+                continue
+            if ch == "}":
+                brace_depth = max(0, brace_depth - 1)
+                i += 1
+                continue
+            if ch == "(":
+                paren_depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                paren_depth = max(0, paren_depth - 1)
+                i += 1
+                continue
+            if ch == "[":
+                bracket_depth += 1
+                i += 1
+                continue
+            if ch == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+                i += 1
+                continue
+            if brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
+                for keyword in ("let", "const", "class", "function"):
+                    if is_keyword_at(keyword, i):
+                        return True
+            i += 1
+            continue
+        if state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+                continue
+            i += 1
+            continue
+        if state == "string":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                state = "code"
+                quote = ""
+            i += 1
+            continue
+    return False
+
+
 def js(expression, *args, target_id=None, returnByValue=True):
     """Run JS in the attached tab, or call a JS function with JSON args.
 
@@ -243,8 +394,22 @@ def js(expression, *args, target_id=None, returnByValue=True):
   return await fn(...args);
 }})()
 """
-    elif _has_return_statement(expression) and not expression.strip().startswith("("):
-        expression = f"(function(){{{expression}}})()"
+    else:
+        source = expression.strip().rstrip(";")
+        if _is_anonymous_function_expression(source) or _is_async_anonymous_function_expression(source):
+            expression = f"({source})()"
+        elif source.startswith("(function") and "await " in source:
+            expression = _asyncify_parenthesized_function_iife(expression)
+        elif _has_return_statement(expression) and not expression.strip().startswith("("):
+            if "await " in expression:
+                expression = f"(async function(){{{expression}}})()"
+            else:
+                expression = f"(function(){{{expression}}})()"
+        elif _has_top_level_lexical_declaration(expression) and not expression.strip().startswith("("):
+            if "await " in expression:
+                expression = f"(async function(){{{expression}}})()"
+            else:
+                expression = f"(function(){{{expression}}})()"
     session_id = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
     return _runtime_evaluate(
         expression,
@@ -372,6 +537,103 @@ def last_domain_skills(include_content=False):
     return __last_domain_skills
 
 
+def _target_matches_requested_url(target_url, requested_url):
+    target_url = str(target_url or "")
+    requested_url = str(requested_url or "")
+    if not target_url or target_url.startswith(INTERNAL):
+        return False
+    if not requested_url:
+        return True
+    try:
+        target = urlparse(target_url)
+        requested = urlparse(requested_url)
+        if requested.netloc and target.netloc == requested.netloc:
+            return True
+    except Exception:
+        pass
+    return target_url == requested_url or target_url.startswith(requested_url)
+
+
+def _navigation_target_state(requested_url, timeout=3.0):
+    deadline = _time.time() + float(timeout)
+    last_tab = None
+    last_error = None
+    while _time.time() < deadline:
+        try:
+            tab = current_tab()
+            last_tab = tab
+            if _target_matches_requested_url(tab.get("url"), requested_url):
+                return {"observed": True, "target": tab}
+        except Exception as exc:
+            last_error = str(exc)
+        _time.sleep(0.25)
+    state = {"observed": False}
+    if last_tab is not None:
+        state["target"] = last_tab
+    if last_error is not None:
+        state["error"] = last_error
+    return state
+
+
+def _navigation_wait_timeout_seconds():
+    raw = os.environ.get("BU_NAVIGATION_READY_WAIT_SECONDS")
+    if raw is None:
+        return 8.0
+    try:
+        return max(0.0, min(float(raw), 30.0))
+    except Exception:
+        return 8.0
+
+
+def _emit_navigation(action, url, result):
+    """Record navigation commands even when callers discard helper return values."""
+    waited_for_load = False
+    load_error = None
+    wait_timeout = _navigation_wait_timeout_seconds()
+    if wait_timeout > 0:
+        try:
+            waited_for_load = bool(wait_for_load(timeout=wait_timeout))
+        except Exception as exc:
+            load_error = str(exc)
+    page_state = _navigation_target_state(url)
+    page_snapshot = None
+    page_info_error = None
+    try:
+        page_snapshot = page_info()
+    except Exception as exc:
+        page_info_error = str(exc)
+    page_url = page_snapshot.get("url") if isinstance(page_snapshot, dict) else None
+    ready_state = page_snapshot.get("readyState") if isinstance(page_snapshot, dict) else None
+    target_ready = _target_matches_requested_url(page_url, url) and ready_state in (
+        "interactive",
+        "complete",
+    )
+    status = "navigation_ready" if waited_for_load or target_ready else "navigation_sent"
+    output = {
+        "action": action,
+        "url": url,
+        "status": status,
+        "waited_for_load": waited_for_load,
+        "page_state": page_state,
+        "page_info": page_snapshot,
+        "result": result,
+        "next_step": (
+            "Inspect the current page before navigating again unless the URL is wrong."
+            if status == "navigation_ready"
+            else "The navigation was sent; wait or inspect page state before repeating it."
+        ),
+    }
+    if load_error:
+        output["load_error"] = load_error
+    if page_info_error:
+        output["page_info_error"] = page_info_error
+    try:
+        emit_output(output, label="navigation")
+    except Exception:
+        pass
+    return output
+
+
 def goto_url(url):
     global __last_domain_skills
     result = cdp("Page.navigate", url=url)
@@ -381,11 +643,18 @@ def goto_url(url):
         if skills:
             __last_domain_skills = [{"url": url, **skill} for skill in skills]
             result = {**result, "domain_skills": __last_domain_skills}
-    return result
+    navigation = _emit_navigation("goto_url", url, result)
+    if isinstance(result, dict):
+        return {**result, "navigation": navigation}
+    return {"result": result, "navigation": navigation}
 
 
 def page_info():
     """Return url, title, viewport, scroll position, page size, and target info."""
+    try:
+        ensure_real_tab()
+    except Exception:
+        pass
     dialog = _send_meta("pending_dialog").get("dialog")
     if dialog:
         return {"dialog": dialog}
@@ -426,6 +695,13 @@ def current_tab():
     return tab
 
 
+def _is_agent_startup_placeholder(title, url):
+    url = str(url or "")
+    return str(title or "").startswith("Starting agent ") and (
+        url in ("", "about:blank") or url.startswith("about:blank#")
+    )
+
+
 def list_tabs(include_chrome=True, include_other_contexts=False):
     out = []
     current_context = None if include_other_contexts else _current_target_browser_context_id()
@@ -435,6 +711,8 @@ def list_tabs(include_chrome=True, include_other_contexts=False):
         if current_context and target.get("browserContextId") != current_context:
             continue
         url = target.get("url", "")
+        if _is_agent_startup_placeholder(target.get("title", ""), url):
+            continue
         if not include_chrome and PROFILE_MARKER in url:
             continue
         if not include_chrome and url.startswith(INTERNAL):
@@ -579,10 +857,21 @@ def _timeout_seconds(timeout):
 def wait_for_load(timeout=3.0):
     timeout = _timeout_seconds(timeout)
     deadline = _time.time() + timeout
+    interactive_since = None
     while _time.time() < deadline:
         try:
-            if js("document.readyState") == "complete":
+            state = js("document.readyState")
+            if state == "complete":
                 return True
+            if state == "interactive":
+                has_body = js("!!document.body && !!location.href && !location.href.startsWith('about:')")
+                if has_body:
+                    if interactive_since is None:
+                        interactive_since = _time.time()
+                    if _time.time() - interactive_since >= 1.0:
+                        return True
+            else:
+                interactive_since = None
         except Exception:
             pass
         _time.sleep(0.3)
@@ -646,9 +935,53 @@ def _write_b64_artifact(label, data_b64, suffix=".png", mime_type="image/png"):
     return str(path)
 
 
+def _positive_int_env(names, default=None):
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+        if value == 0:
+            return None
+    return default
+
+
+def _screenshot_max_dim(max_dim):
+    if max_dim is not None:
+        try:
+            value = int(max_dim)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+    return _positive_int_env(("BU_BROWSER_SCREENSHOT_MAX_DIM", "BROWSER_USE_SCREENSHOT_MAX_DIM"), 7600)
+
+
+def _downscale_image_artifact(path, max_dim):
+    if not max_dim:
+        return None
+    try:
+        from PIL import Image
+
+        img = Image.open(path)
+        original_size = img.size
+        if max(original_size) > max_dim:
+            img.thumbnail((max_dim, max_dim))
+            img.save(path)
+            return {"width": img.size[0], "height": img.size[1], "downscaled": True, "original_size": original_size}
+        return {"width": original_size[0], "height": original_size[1], "downscaled": False}
+    except Exception:
+        return None
+
+
 def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None, **kwargs):
     """Save a PNG of the current viewport and return its local artifact path."""
     try:
+        ensure_real_tab()
         target_id = (current_tab() or {}).get("targetId")
         if target_id:
             cdp("Target.activateTarget", session_id=None, targetId=target_id)
@@ -663,27 +996,33 @@ def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None
     if full:
         params["captureBeyondViewport"] = True
     params.update(kwargs)
-    result = cdp("Page.captureScreenshot", **params)
+    last_error = None
+    for attempt in range(3):
+        try:
+            result = cdp("Page.captureScreenshot", **params)
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt == 2:
+                raise
+            _time.sleep(0.35 * (attempt + 1))
+    else:
+        raise last_error
     if not attach:
         return result
     path = _write_b64_artifact(label, result["data"], ".png", "image/png")
-    if max_dim:
-        try:
-            from PIL import Image
-
-            img = Image.open(path)
-            if max(img.size) > max_dim:
-                img.thumbnail((max_dim, max_dim))
-                img.save(path)
-        except Exception:
-            pass
+    image_info = _downscale_image_artifact(path, _screenshot_max_dim(max_dim))
+    if image_info and __images:
+        __images[-1].update(image_info)
+    if image_info and __artifacts:
+        __artifacts[-1].update({key: image_info[key] for key in ("width", "height") if key in image_info})
     return path
 
 
 def note(caption):
     """Mark the current moment as important for the recording, with a short
     human-readable caption (e.g. note("Delta $209 - cheapest fare details")).
-    Cheap: it just timestamps a caption; the 2fps session capture already has the
+    Cheap: it just timestamps a caption; when enabled, session capture already has the
     frame. Call it at each meaningful step so the end-of-run highlight GIF can be
     captioned. Returns the recorded note."""
     record = {"ts_ms": int(_time.time() * 1000), "caption": str(caption)}
@@ -946,6 +1285,35 @@ class _HttpGetBytes(bytes):
         return json.loads(self.text)
 
 
+class _HttpErrorRecord(dict):
+    def __init__(self, url=None, error=None, status_code=None, headers=None):
+        super().__init__(
+            ok=False,
+            url=url,
+            error=error or "request failed",
+            status_code=status_code,
+            status=status_code,
+            headers=headers or {},
+        )
+        self.ok = False
+        self.url = url
+        self.error = error or "request failed"
+        self.status_code = status_code
+        self.status = status_code
+        self.headers = headers or {}
+
+    @property
+    def text(self):
+        return ""
+
+    @property
+    def content(self):
+        return b""
+
+    def json(self):
+        raise ValueError(f"request failed for {self.url}: {self.error}")
+
+
 def http_get(url, headers=None, timeout=20.0, binary=None):
     """Pure HTTP fetch for static pages and APIs.
 
@@ -1008,3 +1376,246 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
         raise RuntimeError(
             f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
         ) from exc
+
+
+def http_get_many(urls, headers=None, timeout=20.0, binary=None, max_workers=8, return_errors=True):
+    """Fetch many independent URLs with http_get while preserving input order.
+
+    By default one failed URL becomes {"ok": False, "url": ..., "error": ...}
+    instead of failing the whole batch. Set return_errors=False when every URL is
+    required and the caller should abort on the first failure.
+    """
+    items = list(urls)
+    if not items:
+        return []
+    workers = max(1, min(int(max_workers or 1), len(items)))
+    results = [None] * len(items)
+
+    def fetch_one(index, item):
+        if isinstance(item, dict):
+            request_url = item["url"]
+            request_headers = dict(headers or {})
+            request_headers.update(item.get("headers") or {})
+            request_timeout = item.get("timeout", timeout)
+            request_binary = item.get("binary", binary)
+        else:
+            request_url = str(item)
+            request_headers = headers
+            request_timeout = timeout
+            request_binary = binary
+        return index, request_url, http_get(
+            request_url,
+            headers=request_headers,
+            timeout=request_timeout,
+            binary=request_binary,
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fetch_one, index, item) for index, item in enumerate(items)]
+        for future in as_completed(futures):
+            try:
+                index, _url, response = future.result()
+                results[index] = response
+            except Exception as exc:
+                index = futures.index(future)
+                item = items[index]
+                request_url = item.get("url") if isinstance(item, dict) else str(item)
+                if not return_errors:
+                    raise
+                results[index] = _HttpErrorRecord(url=request_url, error=str(exc))
+    return results
+
+
+def _normalize_browser_fetch_request(
+    url,
+    method="GET",
+    headers=None,
+    body=None,
+    json_body=None,
+    timeout=20.0,
+    binary=None,
+):
+    request_headers = dict(headers or {})
+    request_body = body
+    if json_body is not None:
+        request_body = json.dumps(json_body)
+        if not any(k.lower() == "content-type" for k in request_headers):
+            request_headers["Content-Type"] = "application/json"
+    if isinstance(request_body, (dict, list)):
+        request_body = json.dumps(request_body)
+        if not any(k.lower() == "content-type" for k in request_headers):
+            request_headers["Content-Type"] = "application/json"
+    if isinstance(request_body, bytes):
+        request_body = request_body.decode("latin1")
+    return {
+        "url": str(url),
+        "method": str(method or "GET").upper(),
+        "headers": request_headers,
+        "body": request_body,
+        "timeout_ms": int(float(timeout) * 1000),
+        "binary": bool(binary),
+    }
+
+
+def _browser_fetch_response(result, return_error=False):
+    if not isinstance(result, dict):
+        if return_error:
+            return _HttpErrorRecord(url=None, error=f"invalid browser_fetch result: {result!r}")
+        raise RuntimeError(f"invalid browser_fetch result: {result!r}")
+    if not result.get("ok"):
+        if return_error:
+            return _HttpErrorRecord(
+                url=result.get("url"),
+                error=result.get("error", "browser_fetch failed"),
+                status_code=result.get("status"),
+                headers=result.get("headers") or {},
+            )
+        raise RuntimeError(f"browser_fetch failed for {result.get('url')}: {result.get('error')}")
+    headers = result.get("headers") or {}
+    status = result.get("status")
+    url = result.get("url")
+    if result.get("binary"):
+        body = base64.b64decode(result.get("body_b64") or "")
+        return _HttpGetBytes(body, status, headers, url)
+    return _HttpGetText(result.get("body") or "", status, headers, url)
+
+
+def browser_fetch(
+    url,
+    method="GET",
+    headers=None,
+    body=None,
+    json_body=None,
+    json=None,
+    timeout=20.0,
+    binary=None,
+    return_error=True,
+):
+    """Fetch from the current page context with browser cookies/session state.
+
+    By default a failed page-context fetch returns
+    {"ok": False, "url": ..., "error": ...} instead of failing the entire
+    browser_script call. Pass return_error=False when the caller wants a hard
+    exception for required URLs.
+    """
+    request = _normalize_browser_fetch_request(
+        url,
+        method=method,
+        headers=headers,
+        body=body,
+        json_body=json_body if json_body is not None else json,
+        timeout=timeout,
+        binary=binary,
+    )
+    return browser_fetch_many([request], timeout=timeout, return_errors=return_error)[0]
+
+
+def browser_fetch_many(requests, timeout=20.0, max_concurrency=6, return_errors=True, max_workers=None):
+    """Fetch many URLs from the current page context, preserving order.
+
+    Each item may be a URL string or a dict with url/method/headers/body/json_body/
+    timeout/binary. This is useful after the page reveals stable endpoints but
+    direct http_get lacks cookies, auth headers, or browser-only access.
+
+    max_workers is accepted as a compatibility alias for http_get_many callers.
+    """
+    if max_workers is not None:
+        max_concurrency = max_workers
+    normalized = []
+    for item in list(requests):
+        if isinstance(item, dict):
+            normalized.append(
+                _normalize_browser_fetch_request(
+                    item["url"],
+                    method=item.get("method", "GET"),
+                    headers=item.get("headers"),
+                    body=item.get("body"),
+                    json_body=item.get("json_body") if item.get("json_body") is not None else item.get("json"),
+                    timeout=item.get("timeout", timeout),
+                    binary=item.get("binary"),
+                )
+            )
+        else:
+            normalized.append(_normalize_browser_fetch_request(item, timeout=timeout))
+    if not normalized:
+        return []
+
+    expression = f"""
+(async () => {{
+  const requests = {json.dumps(normalized)};
+  const maxConcurrency = Math.max(1, Math.min({int(max_concurrency or 1)}, requests.length));
+  function arrayBufferToBase64(buffer) {{
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {{
+      const chunk = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode.apply(null, chunk);
+    }}
+    return btoa(binary);
+  }}
+  async function fetchOne(request) {{
+    const controller = new AbortController();
+    const timeoutMs = Math.max(1, Number(request.timeout_ms || 20000));
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {{
+      const options = {{
+        method: request.method || "GET",
+        headers: request.headers || {{}},
+        credentials: "include",
+        signal: controller.signal
+      }};
+      if (request.body !== null && request.body !== undefined) {{
+        options.body = request.body;
+      }}
+      const response = await fetch(request.url, options);
+      const headers = {{}};
+      response.headers.forEach((value, key) => {{ headers[key] = value; }});
+      if (request.binary) {{
+        const buffer = await response.arrayBuffer();
+        return {{
+          ok: true,
+          response_ok: response.ok,
+          status: response.status,
+          statusText: response.statusText,
+          url: response.url,
+          headers,
+          binary: true,
+          body_b64: arrayBufferToBase64(buffer)
+        }};
+      }}
+      const body = await response.text();
+      return {{
+        ok: true,
+        response_ok: response.ok,
+        status: response.status,
+        statusText: response.statusText,
+        url: response.url,
+        headers,
+        binary: false,
+        body
+      }};
+    }} catch (error) {{
+      return {{
+        ok: false,
+        url: request.url,
+        error: String(error && (error.message || error))
+      }};
+    }} finally {{
+      clearTimeout(timer);
+    }}
+  }}
+  const results = new Array(requests.length);
+  let next = 0;
+  async function worker() {{
+    while (next < requests.length) {{
+      const index = next++;
+      results[index] = await fetchOne(requests[index]);
+    }}
+  }}
+  await Promise.all(Array.from({{length: maxConcurrency}}, worker));
+  return results;
+}})()
+"""
+    raw_results = _runtime_evaluate(expression, await_promise=True, return_by_value=True)
+    return [_browser_fetch_response(result, return_error=return_errors) for result in raw_results]

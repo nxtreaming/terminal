@@ -10,7 +10,7 @@ Important execution model:
 - Python variables do not persist across calls.
 - Browser/CDP state persists in Rust.
 - Fast calls return their final result immediately. Long calls return `status: running` with a `run_id`; keep observing that same run until it finishes, fails, or is cancelled.
-- To listen to a running script, call this tool with `action="observe"`, the returned `run_id`, and optionally `observe_timeout_ms`. If observe reports no new output, wait/back off instead of polling in a tight loop.
+- To listen to a running script, call this tool with `action="observe"`, the returned `run_id`, and optionally `observe_timeout_ms`. Prefer coarse waits such as 30000-120000 ms for long navigation or extraction scripts; do not burn many turns polling the same `run_id` with short waits.
 - To stop a running script, call this tool with `action="cancel"` and the `run_id`. Partial images and artifacts emitted before cancellation are preserved.
 - A failed `browser_script` call may include a short diagnosis. Read that diagnosis first: if it says the browser is still connected or the same page is usable, continue from the same page instead of reconnecting.
 - Helpers are preimported; you do not need imports for normal browser work.
@@ -51,6 +51,9 @@ ensure_real_tab()
 upload_file(...)
 drain_events()
 http_get(url, **kwargs)
+http_get_many(urls, **kwargs)
+browser_fetch(url, **kwargs)
+browser_fetch_many(requests, **kwargs)
 
 copy_artifact(path, kind="file")
 emit_output(value, label=None)
@@ -67,13 +70,13 @@ last_domain_skills(include_content=False)
 
 Usage guidance:
 
-- First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url(url)` mutates the current controlled tab. `new_tab(url)` and `goto_url(url)` have zero implicit wait: they send the CDP navigation command and then return without waiting for readyState, network idle, selectors, paint, or sleeps. If you chain more work in the same script after navigation, explicitly wait or poll before reading/clicking. If navigation is the last action before yielding to the model, the LLM call itself may provide enough elapsed time; the next call must still inspect state before assuming the page loaded.
+- First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url(url)` mutates the current controlled tab. Both helpers send the CDP navigation command, perform a bounded readiness check, and emit a labeled `navigation` output with `status`, `page_info`, `page_state`, and `next_step`. If that output says `navigation_ready` and `page_info.url` is the expected page, trust it and inspect/extract from the current page instead of navigating to the same URL again. If you chain more work in the same script after navigation, explicitly wait or poll for the specific selector/state you need before reading/clicking.
 - Keep keyboard semantics browser-harness/Rod aligned: `press_key(...)` simulates physical keys or shortcuts, while `type_text(...)` inserts/pastes text into the focused element with `Input.insertText`.
 - For React/Vue/Svelte/controlled inputs, prefer `fill_input(selector, text)` over direct DOM value assignment. It focuses the element, clears with Cmd/Ctrl+A plus Backspace, types through physical key events, then fires final `input`/`change` events.
 - Do not combine `Input.dispatchKeyEvent` carrying printable `text` with a manual `char` event for the same character; that double-inserts text in Chrome.
 - If the task is site-specific, call `domain_skills_for_url(url, include_content=True)` before inventing selectors, private API routes, or flows. `goto_url(url)` also returns matching `domain_skills` metadata when a skill root is available.
 - Be patient with loading pages by making several cheap observations, not one long blind wait. Prefer short waits such as `wait_for_load(1)`, `wait_for_element(selector, timeout=2)`, or `wait_for_network_idle(2)`, then inspect again. If a wait returns false, that is not a task failure; inspect the current page and continue from the best available state or decide whether it is stuck.
-- Use screenshots as labeled temporal checkpoints: initial load, before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and final verification.
+- Use screenshots as labeled temporal checkpoints when visual state matters: before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and visual final verification. For text-heavy research, document reading, search, pricing, tables, and list extraction, prefer `page_info()`, `js(...)`, targeted DOM text, `http_get_many`, or `browser_fetch_many`; screenshots add latency and usually do not help.
 - The common screenshot call is `screenshot(label)`, for example `screenshot("before_submit")`.
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.
 - If a script emits screenshots/images and then fails, the next model turn still receives the images alongside the failure diagnosis. Use those pixels to decide the next smaller retry.
@@ -109,7 +112,38 @@ emit_output(rows, label="employee_rows")
 - Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level browser actions.
 - Use `js(function_source, *args)` when passing JSON-serializable Python values into JavaScript; use `target_id=` as a keyword for iframe targets.
 - For real user forms, act like a browser user: screenshot, click the visible field/control, type with `type_text(...)`, `press_key(...)`, or `fill_input(...)`, then screenshot or otherwise verify. Use coordinate clicks for checkboxes, radios, buttons, dropdowns, and custom controls. Do not assign `element.value`, `element.checked`, `selectedIndex`, React private state, or MutationObserver restore loops on live forms. Do not synthesize `input`, `change`, `click`, or keyboard events in page JavaScript to make a form look filled. Those anti-patterns can desynchronize framework state from the visible DOM.
-- Use `http_get(...)` for static pages and APIs after the browser reveals stable endpoints. It returns the response body as a string by default, or bytes with `binary=True`; the returned body also exposes `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. If direct HTTP hits bot or login protection, retry with site-specific headers/cookies, `js(fetch(...))` in the browser, or the configured Browser Use fetch proxy.
+- Use `http_get(...)` for one static page/API URL after the browser reveals a stable endpoint, and `http_get_many(...)` for several independent public URLs. Use `browser_fetch(...)` or `browser_fetch_many(...)` when the page's cookies, auth headers, or browser session are needed. Returned bodies are strings by default, bytes with `binary=True`, and expose `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. `browser_fetch(...)` and the batch helpers return error records by default so one bad endpoint does not waste the whole extraction chunk; pass `return_error=False` or `return_errors=False` only when a hard failure is intended. If direct HTTP hits bot or login protection, retry with `browser_fetch(...)`, site-specific headers/cookies, or the configured Browser Use fetch proxy.
+- Batch recipe after discovering stable links or endpoints:
+
+```python
+# browser_summary:
+# {
+#   "fetch_progress": {
+#     "kind": "extracted",
+#     "message": "Fetched ${$.ok_count}/${$.total} independent URLs"
+#   },
+#   "records": {
+#     "kind": "extracted",
+#     "message": "Extracted ${$.length} records from fetched pages"
+#   }
+# }
+
+urls = [...]
+responses = http_get_many(urls, timeout=12, max_workers=8)
+ok = [r for r in responses if not isinstance(r, dict) and getattr(r, "status_code", 0) < 400]
+emit_output({"total": len(responses), "ok_count": len(ok)}, label="fetch_progress")
+
+records = []
+for url, response in zip(urls, responses):
+    if isinstance(response, dict) and response.get("error"):
+        records.append({"url": url, "status": "error", "error": response["error"]})
+        continue
+    text = response.text
+    records.append({"url": url, "status": response.status_code, "title": text[:200]})
+
+emit_output(records, label="records")
+```
+
 - Extract only fields needed for the task. Do not emit full profile text, full DOM text, cookies, localStorage, or entire app caches unless you are debugging and the smaller field-level extraction failed.
 - Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
 - For large structured results, write the full JSON/CSV/text to a file. If the task asks for an exact inline final format, return that content with `done(result=...)` and optionally include `result_file=path`; otherwise finish with `done(result_file=path)`.

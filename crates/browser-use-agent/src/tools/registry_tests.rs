@@ -28,6 +28,7 @@ use crate::tools::handlers::mcp::{
     McpCallResult, McpClient, McpTool, McpToolCallRequest, McpWireArgs,
 };
 use crate::tools::handlers::python::{PythonBackend, PythonRequest, PythonTool};
+use crate::tools::handlers::search::{SearchBackend, SearchError, SearchTool};
 use crate::tools::handlers::shell::{ShellRequest, ShellTool};
 use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
 use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
@@ -485,6 +486,23 @@ impl McpClient for FakeMcpClient {
     }
 }
 
+/// A fake search backend: returns a canned DuckDuckGo Lite HTML fragment with a
+/// single result echoing the query, so no network is touched (mirrors
+/// `search_tests.rs`).
+struct FakeSearchBackend;
+
+#[async_trait::async_trait]
+impl SearchBackend for FakeSearchBackend {
+    async fn fetch(&self, query: &str) -> Result<String, SearchError> {
+        Ok(format!(
+            "<table>\
+               <tr><td><a class=\"result-link\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F\">Result for {query}</a></td></tr>\
+               <tr><td class=\"result-snippet\">snippet for {query}</td></tr>\
+             </table>"
+        ))
+    }
+}
+
 /// Build a registry holding all handlers via [`default_registry`], using
 /// fake backends for browser/python/mcp so no OS resource is touched.
 fn full_registry() -> ToolRegistry {
@@ -502,6 +520,7 @@ fn full_registry() -> ToolRegistry {
             ["namespace"],
         )]),
         WebSearchTool::new(WebSearchConfig::enabled()),
+        SearchTool::with_backend(Arc::new(FakeSearchBackend)),
         DoneTool::new(),
     )
 }
@@ -519,11 +538,11 @@ fn ctx_at(name: &str, cwd: PathBuf) -> ToolCtx {
 #[test]
 fn default_registry_registers_all_tools() {
     let reg = full_registry();
-    assert_eq!(reg.len(), 12, "all tools must register");
+    assert_eq!(reg.len(), 13, "all tools must register");
     let defs = reg.model_visible_definitions();
     assert_eq!(
         defs.len(),
-        12,
+        13,
         "model_visible_definitions must list all tools"
     );
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
@@ -537,6 +556,7 @@ fn default_registry_registers_all_tools() {
             "exec_command",
             "mcp",
             "python",
+            "search",
             "shell",
             "tool_search",
             "update_plan",
@@ -562,6 +582,7 @@ fn parallel_safe_flags_match_registration() {
     // Pure / read-only tools are parallel-safe.
     assert_eq!(reg.parallel_safe("tool_search"), Some(true));
     assert_eq!(reg.parallel_safe("web_search"), Some(true));
+    assert_eq!(reg.parallel_safe("search"), Some(true));
     // Everything else is serial.
     for name in [
         "shell",
@@ -802,6 +823,42 @@ async fn tool_search_and_web_search_dispatch() {
 }
 
 #[tokio::test]
+async fn search_dispatches_to_the_fake_backend() {
+    let reg = full_registry();
+    let orch = ToolOrchestrator::stub();
+    let out = reg
+        .dispatch(
+            "search",
+            &serde_json::json!({ "query": "rust lang" }),
+            &ctx("search"),
+            &env(),
+            AskForApproval::Never,
+            &orch,
+        )
+        .await
+        .expect("search should dispatch");
+    assert_eq!(out.exit_code, 0);
+    // The fake backend's canned HTML yields one result whose title echoes the
+    // query (within the 30-char cap, so shown in full), its unwrapped
+    // destination URL (kept intact), and the snippet.
+    assert!(
+        out.stdout.contains("Result for rust lang"),
+        "search stdout: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("https://example.com/"),
+        "search stdout: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("snippet for rust lang"),
+        "search stdout: {:?}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
 async fn browser_bad_action_value_surfaces_an_error_naming_the_tool() {
     let reg = full_registry();
     let orch = ToolOrchestrator::stub();
@@ -967,6 +1024,16 @@ fn definitions_carry_required_fields_and_names() {
 }
 
 #[test]
+fn done_definition_preserves_timebox_partial_result_guidance() {
+    let done = definitions::done();
+    assert!(done.description.contains("best verified partial result"));
+    assert!(done.description.contains("external cancellation"));
+    assert!(done
+        .description
+        .contains("unknown, unavailable, or incomplete fields"));
+}
+
+#[test]
 fn subagent_v2_definitions_match_codex_output_schema_surface() {
     let spawn = definitions::spawn_agent();
     assert_eq!(
@@ -1096,7 +1163,7 @@ async fn done_dispatches_through_the_registry() {
     let out = reg
         .dispatch(
             "done",
-            &serde_json::json!({ "text": "task finished" }),
+            &serde_json::json!({ "result": "task finished" }),
             &ctx("done"),
             &env(),
             AskForApproval::Never,
@@ -1114,4 +1181,14 @@ async fn done_dispatches_through_the_registry() {
     );
     // done is serial (terminal).
     assert_eq!(reg.parallel_safe("done"), Some(false));
+
+    let done_def = reg
+        .model_visible_definitions()
+        .into_iter()
+        .find(|definition| definition.name == "done")
+        .expect("done definition");
+    let properties = &done_def.input_schema["properties"];
+    assert!(properties.get("result").is_some());
+    assert!(properties.get("text").is_some());
+    assert!(properties.get("result_file").is_some());
 }

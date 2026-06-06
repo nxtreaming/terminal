@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +29,7 @@ const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+const PROVIDER_MAX_IMAGE_DIMENSION: u32 = 2000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderErrorKind {
@@ -101,6 +102,7 @@ impl ProviderError {
                 | ProviderErrorKind::InternalServerError
                 | ProviderErrorKind::UnexpectedStatus
                 | ProviderErrorKind::RequestTimeout
+                | ProviderErrorKind::ServerOverloaded
         )
     }
 
@@ -2450,6 +2452,7 @@ impl AnthropicMessagesProvider {
         let mut body = json!({
             "model": self.model,
             "max_tokens": 16000,
+            "cache_control": { "type": "ephemeral" },
             "system": anthropic_system_blocks_with_developer_context(&instructions, &turn.messages, is_oauth),
             "messages": messages_to_anthropic_messages(&turn.messages, is_oauth)?,
         });
@@ -5306,7 +5309,7 @@ fn chat_tool_description(tool: &ToolSpec) -> String {
 }
 
 fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Value> {
-    tools
+    let mut anthropic_tools: Vec<Value> = tools
         .iter()
         .map(|tool| {
             json!({
@@ -5315,7 +5318,11 @@ fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Valu
                 "input_schema": tool.input_schema,
             })
         })
-        .collect()
+        .collect();
+    if let Some(Value::Object(last_tool)) = anthropic_tools.last_mut() {
+        last_tool.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+    }
+    anthropic_tools
 }
 
 fn anthropic_tool_description(tool: &ToolSpec) -> String {
@@ -5923,7 +5930,19 @@ fn messages_to_anthropic_messages(messages: &[Value], is_oauth: bool) -> Result<
             })),
         }
     }
+    drop_trailing_anthropic_assistant_prefill(&mut out);
     Ok(out)
+}
+
+fn drop_trailing_anthropic_assistant_prefill(messages: &mut Vec<Value>) {
+    while messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+    {
+        messages.pop();
+    }
 }
 
 fn should_skip_raw_response_item_for_fallback_provider(message: &Value) -> bool {
@@ -5940,7 +5959,8 @@ fn anthropic_user_content(message: &Value) -> Vec<Value> {
             .filter_map(|part| match part.get("type").and_then(Value::as_str) {
                 Some("input_image") => {
                     let image_url = part.get("image_url").and_then(Value::as_str)?;
-                    data_url_source(image_url).map(|(media_type, data)| {
+                    let safe_image_url = provider_safe_image_url(image_url);
+                    data_url_source(&safe_image_url).map(|(media_type, data)| {
                         json!({
                             "type": "image",
                             "source": {
@@ -6087,6 +6107,39 @@ fn data_url_source(image_url: &str) -> Option<(String, String)> {
     Some((media_type, data.to_string()))
 }
 
+fn provider_safe_image_url(image_url: &str) -> String {
+    downsample_oversized_data_url_image(image_url).unwrap_or_else(|| image_url.to_string())
+}
+
+fn downsample_oversized_data_url_image(image_url: &str) -> Option<String> {
+    let (media_type, data) = data_url_source(image_url)?;
+    if !media_type.starts_with("image/") {
+        return None;
+    }
+    let bytes = general_purpose::STANDARD.decode(data.as_bytes()).ok()?;
+    let image = image::load_from_memory(&bytes).ok()?;
+    let width = image.width();
+    let height = image.height();
+    if width <= PROVIDER_MAX_IMAGE_DIMENSION && height <= PROVIDER_MAX_IMAGE_DIMENSION {
+        return None;
+    }
+
+    let scale = (PROVIDER_MAX_IMAGE_DIMENSION as f32 / width as f32)
+        .min(PROVIDER_MAX_IMAGE_DIMENSION as f32 / height as f32);
+    let resized_width = ((width as f32 * scale).round() as u32).max(1);
+    let resized_height = ((height as f32 * scale).round() as u32).max(1);
+    let resized = image.resize(
+        resized_width,
+        resized_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    let mut out = Cursor::new(Vec::new());
+    resized.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    let encoded = general_purpose::STANDARD.encode(out.into_inner());
+    Some(format!("data:image/png;base64,{encoded}"))
+}
+
 fn input_text_type_for_role(role: &str) -> &'static str {
     if role == "assistant" {
         "output_text"
@@ -6119,7 +6172,7 @@ fn normalize_content_part(part: &Value, role: &str) -> Option<Value> {
             let image_url = part.get("image_url").and_then(Value::as_str)?;
             let mut out = json!({
                 "type": "input_image",
-                "image_url": image_url,
+                "image_url": provider_safe_image_url(image_url),
             });
             if let Some(detail) = part.get("detail").and_then(Value::as_str) {
                 out["detail"] = json!(detail);
@@ -6218,7 +6271,7 @@ fn normalize_tool_image_part(part: &Value) -> Option<Value> {
     let image_url = part.get("image_url").and_then(Value::as_str)?;
     let mut out = json!({
         "type": "input_image",
-        "image_url": image_url,
+        "image_url": provider_safe_image_url(image_url),
     });
     if let Some(detail) = part.get("detail").and_then(Value::as_str) {
         out["detail"] = json!(detail);
@@ -7051,10 +7104,33 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
         .or_else(|| usage.get("total_cost"))
         .or_else(|| usage.get("cost_usd"))
         .and_then(value_f64);
-    let input_tokens = usage
+    let raw_input_tokens = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))
         .and_then(Value::as_i64);
+    let cached_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_i64);
+    let cache_creation_tokens = usage
+        .get("cache_creation_input_tokens")
+        .or_else(|| usage.get("prompt_cache_creation_tokens"))
+        .and_then(Value::as_i64);
+    let input_tokens = raw_input_tokens.map(|tokens| {
+        if usage.get("cache_read_input_tokens").is_some()
+            || usage.get("cache_creation_input_tokens").is_some()
+        {
+            tokens + cached_input_tokens.unwrap_or(0)
+        } else {
+            tokens
+        }
+    });
     let output_tokens = usage
         .get("output_tokens")
         .or_else(|| usage.get("completion_tokens"))
@@ -7068,26 +7144,21 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
                 .and_then(|details| details.get("reasoning_tokens"))
         })
         .and_then(Value::as_i64);
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| Some(input_tokens? + output_tokens?));
+    let has_anthropic_cache_fields = usage.get("cache_read_input_tokens").is_some()
+        || usage.get("cache_creation_input_tokens").is_some();
+    let computed_total_tokens = input_tokens? + cache_creation_tokens.unwrap_or(0) + output_tokens?;
+    let total_tokens = if has_anthropic_cache_fields {
+        Some(computed_total_tokens)
+    } else {
+        usage
+            .get("total_tokens")
+            .and_then(Value::as_i64)
+            .or(Some(computed_total_tokens))
+    };
     let usage = ModelUsage {
         input_tokens,
-        input_cached_tokens: usage
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .or_else(|| {
-                usage
-                    .get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-            })
-            .or_else(|| usage.get("cache_read_input_tokens"))
-            .and_then(Value::as_i64),
-        input_cache_creation_tokens: usage
-            .get("cache_creation_input_tokens")
-            .or_else(|| usage.get("prompt_cache_creation_tokens"))
-            .and_then(Value::as_i64),
+        input_cached_tokens: cached_input_tokens,
+        input_cache_creation_tokens: cache_creation_tokens,
         output_tokens,
         reasoning_output_tokens,
         total_tokens,
@@ -8171,6 +8242,27 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_messages_drop_trailing_assistant_prefill() -> Result<()> {
+        let messages = [
+            json!({
+                "role": "user",
+                "content": "do the browser task"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "premature final answer"
+            }),
+        ];
+
+        let anthropic = messages_to_anthropic_messages(&messages, false)?;
+
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(anthropic[0]["role"], "user");
+        assert_eq!(anthropic[0]["content"][0]["text"], "do the browser task");
+        Ok(())
+    }
+
+    #[test]
     fn chat_messages_map_developer_context_to_system_priority() -> Result<()> {
         let messages = messages_to_chat_messages(
             &[json!({
@@ -8213,6 +8305,64 @@ mod tests {
             .unwrap_or_default()
             .contains("Developer context:\n<permissions instructions>"));
         assert!(messages_to_anthropic_messages(&[developer], false)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_downsamples_oversized_tool_images() -> Result<()> {
+        let image = image::RgbImage::new(10, PROVIDER_MAX_IMAGE_DIMENSION + 500);
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image).write_to(&mut png, image::ImageFormat::Png)?;
+        let image_url = format!(
+            "data:image/png;base64,{}",
+            general_purpose::STANDARD.encode(png.into_inner())
+        );
+
+        let messages = messages_to_anthropic_messages(
+            &[
+                json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_screenshot",
+                        "name": "browser_script",
+                        "arguments": {"code": "screenshot('tall')"}
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call_screenshot",
+                    "name": "browser_script",
+                    "content": [
+                        {"type": "output_text", "text": "captured"},
+                        {"type": "input_image", "image_url": image_url, "detail": "auto"}
+                    ]
+                }),
+            ],
+            false,
+        )?;
+
+        let visual_image = messages
+            .iter()
+            .flat_map(|message| message.get("content").and_then(Value::as_array).into_iter())
+            .flatten()
+            .find(|part| part.get("type").and_then(Value::as_str) == Some("image"))
+            .expect("visual image block");
+        let data = visual_image
+            .pointer("/source/data")
+            .and_then(Value::as_str)
+            .expect("base64 image data");
+        let bytes = general_purpose::STANDARD.decode(data)?;
+        let resized = image::load_from_memory(&bytes)?;
+
+        assert_eq!(
+            visual_image
+                .pointer("/source/media_type")
+                .and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert!(resized.width() <= PROVIDER_MAX_IMAGE_DIMENSION);
+        assert!(resized.height() <= PROVIDER_MAX_IMAGE_DIMENSION);
+        assert_eq!(resized.height(), PROVIDER_MAX_IMAGE_DIMENSION);
         Ok(())
     }
 
@@ -9424,6 +9574,52 @@ mod tests {
             }
         }));
         assert!(matches!(events.last(), Some(ModelEvent::Done)));
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_request_marks_last_tool_cacheable() -> Result<()> {
+        let provider = AnthropicMessagesProvider::new("anthropic-key", "claude-test");
+        let body = provider.messages_request_body(
+            &ProviderTurn {
+                instructions: Some("Stable system prompt".to_string()),
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                tools: vec![
+                    ToolSpec {
+                        name: "browser".to_string(),
+                        namespace: None,
+                        namespace_description: None,
+                        description: "Inspect a page".to_string(),
+                        input_schema: json!({"type": "object"}),
+                        output_schema: None,
+                        freeform: None,
+                    },
+                    ToolSpec {
+                        name: "done".to_string(),
+                        namespace: None,
+                        namespace_description: None,
+                        description: "Finish the task".to_string(),
+                        input_schema: json!({"type": "object"}),
+                        output_schema: None,
+                        freeform: None,
+                    },
+                ],
+                ..ProviderTurn::default()
+            },
+            false,
+            true,
+        )?;
+
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
         Ok(())
     }
 
@@ -11087,8 +11283,6 @@ mod tests {
             ("invalid_prompt", ProviderErrorKind::InvalidRequest),
             ("invalid_image", ProviderErrorKind::InvalidImage),
             ("cyber_policy", ProviderErrorKind::CyberPolicy),
-            ("server_is_overloaded", ProviderErrorKind::ServerOverloaded),
-            ("slow_down", ProviderErrorKind::ServerOverloaded),
         ] {
             let error = response_failed_error(&json!({
                 "type": "response.failed",
@@ -11105,7 +11299,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_failed_server_overloaded_is_not_retryable_like_codex() -> Result<()> {
+    fn responses_failed_server_overloaded_is_retryable_for_transient_capacity() -> Result<()> {
         for code in ["server_is_overloaded", "slow_down"] {
             let sse = format!(
                 "data: {}\n\n",
@@ -11139,13 +11333,13 @@ mod tests {
                 .downcast_ref::<ProviderError>()
                 .expect("typed provider error");
             assert_eq!(provider_error.kind(), ProviderErrorKind::ServerOverloaded);
-            assert!(!provider_error.is_retryable());
+            assert!(provider_error.is_retryable());
         }
         Ok(())
     }
 
     #[test]
-    fn responses_http_503_server_overloaded_is_not_retryable_like_codex() -> Result<()> {
+    fn responses_http_503_server_overloaded_is_retryable_for_transient_capacity() -> Result<()> {
         let body = json!({
             "error": {
                 "code": "server_is_overloaded",
@@ -11176,7 +11370,7 @@ mod tests {
             .downcast_ref::<ProviderError>()
             .expect("typed provider error");
         assert_eq!(provider_error.kind(), ProviderErrorKind::ServerOverloaded);
-        assert!(!provider_error.is_retryable());
+        assert!(provider_error.is_retryable());
         Ok(())
     }
 
