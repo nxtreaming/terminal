@@ -6598,6 +6598,9 @@ impl App {
             Some(BrowserSelectRow::Local(browser_name))
                 if browser_name.eq_ignore_ascii_case("Chromium") =>
             {
+                if self.browser_select_chromium_expanded {
+                    return self.save_local_browser(browser_name);
+                }
                 self.browser_select_chromium_expanded = true;
                 self.selected_row = index.saturating_add(1);
                 return Ok(());
@@ -12058,6 +12061,60 @@ mod redesign_tests {
             app.store.get_setting("browser.preference.mode")?.as_deref(),
             Some("managed-headless")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn expanded_chromium_parent_selects_local_chromium() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("browser.preference.profile", "chromium:Default")?;
+        app.store
+            .set_setting("browser.preference.profile_label", "Default")?;
+        app.browser_profile_label = Some("Default".to_string());
+        app.default_profile.current_profile_id = Some("chromium:Default".to_string());
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Chromium".to_string()];
+        app.default_profile.profiles = vec![CookieSyncProfile {
+            id: "chromium:Default".to_string(),
+            display_name: "Chromium - Default".to_string(),
+            browser_name: "Chromium".to_string(),
+            profile_name: "Default".to_string(),
+        }];
+
+        app.save_browser(0)?;
+        assert!(app.browser_select_chromium_expanded);
+        assert_eq!(app.selected_row, 1);
+
+        app.selected_row = 0;
+        app.save_browser(0)?;
+
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.browser")?
+                .as_deref(),
+            Some("Chromium")
+        );
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.browser_label")?
+                .as_deref(),
+            Some("Chromium")
+        );
+        assert_eq!(
+            app.store.get_setting("browser.preference.mode")?.as_deref(),
+            Some("local")
+        );
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.profile")?
+                .as_deref(),
+            Some("chromium:Default")
+        );
+        assert_eq!(app.browser_local_label.as_deref(), Some("Chromium"));
+        assert_eq!(app.browser_profile_label.as_deref(), Some("Default"));
         Ok(())
     }
 
