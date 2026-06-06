@@ -205,7 +205,8 @@ pub fn browser_mode_instruction(mode: &str) -> String {
         )
         .to_string(),
         "cloud" | "browser-use-cloud" => concat!(
-            "Selected browser mode: Browser Use cloud. Use `browser remote start` before page work. ",
+            "Selected browser mode: Browser Use cloud. Use `browser connect` before page work. ",
+            "Plain `browser connect` uses the remembered cloud profile when one is set. ",
             "Remote start means start and connect; use `browser remote live-url` to retrieve the watch URL."
         )
         .to_string(),

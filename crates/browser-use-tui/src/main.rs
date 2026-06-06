@@ -7133,10 +7133,7 @@ impl App {
         self.default_profile.status = DefaultProfileStatus::Loading;
         self.default_profile.profiles.clear();
         self.default_profile.browsers.clear();
-        self.default_profile.current_profile_id = self
-            .store
-            .get_setting("browser.preference.profile")?
-            .filter(|value| !value.trim().is_empty());
+        self.default_profile.current_profile_id = self.current_local_profile_id_for_settings()?;
         self.spawn_default_profile_load("browser local profiles --json")
     }
 
@@ -7144,11 +7141,22 @@ impl App {
         self.default_profile.status = DefaultProfileStatus::Loading;
         self.default_profile.profiles.clear();
         self.default_profile.browsers.clear();
-        self.default_profile.current_profile_id = self
-            .store
-            .get_setting("browser.preference.profile")?
-            .filter(|value| !value.trim().is_empty());
+        self.default_profile.current_profile_id = self.current_local_profile_id_for_settings()?;
         self.spawn_default_profile_load("browser local browsers --json")
+    }
+
+    fn current_local_profile_id_for_settings(&self) -> Result<Option<String>> {
+        let mode = self
+            .store
+            .get_setting("browser.preference.mode")?
+            .or_else(|| self.store.get_setting("browser").ok().flatten())
+            .unwrap_or_else(|| "local".to_string());
+        if !is_local_browser_mode_setting(&mode) {
+            return Ok(None);
+        }
+        self.store
+            .get_setting("browser.preference.profile")
+            .map(|profile| profile.filter(|value| !value.trim().is_empty()))
     }
 
     fn spawn_default_profile_load(&mut self, command: &'static str) -> Result<()> {
@@ -7195,6 +7203,8 @@ impl App {
         };
         self.store
             .set_setting("browser.preference.profile", &profile.id)?;
+        self.store.set_setting("browser.preference.mode", "local")?;
+        self.store.set_setting("browser", "Local Chrome")?;
         let profile_label = human_profile_label(&profile);
         self.store
             .set_setting("browser.preference.profile_label", &profile_label)?;
@@ -7903,6 +7913,14 @@ fn concise_profile_label(label: &str) -> String {
 }
 
 fn browser_profile_label_from_store(store: &Store) -> Result<Option<String>> {
+    let mode = store
+        .get_setting("browser.preference.mode")?
+        .or_else(|| store.get_setting("browser").ok().flatten())
+        .unwrap_or_else(|| "local".to_string())
+        .to_string();
+    if !is_local_browser_mode_setting(&mode) {
+        return Ok(None);
+    }
     Ok(store
         .get_setting("browser.preference.profile_label")?
         .filter(|label| !label.trim().is_empty())
@@ -7939,6 +7957,16 @@ fn browser_name_from_profile_id(profile_id: &str) -> Option<&'static str> {
         "brave" => Some("Brave"),
         _ => None,
     }
+}
+
+fn is_local_browser_mode_setting(mode: &str) -> bool {
+    matches!(
+        mode.trim()
+            .to_ascii_lowercase()
+            .replace(['_', ' '], "-")
+            .as_str(),
+        "local" | "local-chrome"
+    )
 }
 
 pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
@@ -9050,14 +9078,12 @@ fn desired_terminal_viewport_height_for(
         .unwrap_or(0);
     let active_lines = transcript::with_transcript_model(app, &state, |model| {
         let active_streaming_lines = transcript::active_streaming_lines(Some(model), body_width);
+        let commit_prefix_len =
+            transcript::active_streaming_native_commit_prefix_lines(Some(model), body_width)
+                .len()
+                .min(active_streaming_lines.len());
         let estimated_stream_skip_lines =
-            if transcript::active_streaming_can_commit_all(Some(model))
-                && active_streaming_lines.len() > 1
-            {
-                active_streaming_lines.len()
-            } else {
-                active_streaming_lines.len().saturating_sub(1)
-            };
+            native_live_stream_emit_count(model, active_streaming_lines.len(), commit_prefix_len);
         let stream_skip_lines = stream_skip_lines.max(estimated_stream_skip_lines);
         transcript::active_viewport_lines_with_stream_skip(
             Some(model),
@@ -9620,12 +9646,10 @@ fn native_live_stream_plan(
     width: u16,
 ) -> NativeLiveStreamPlan {
     let lines = transcript::active_streaming_native_lines(Some(model), width);
-    let emit_count = if transcript::active_streaming_can_commit_all(Some(model)) && lines.len() > 1
-    {
-        lines.len()
-    } else {
-        lines.len().saturating_sub(1)
-    };
+    let commit_prefix_lines =
+        transcript::active_streaming_native_commit_prefix_lines(Some(model), width);
+    let commit_prefix_len = commit_prefix_lines.len().min(lines.len());
+    let emit_count = native_live_stream_emit_count(model, lines.len(), commit_prefix_len);
     if emit_count == 0 {
         return NativeLiveStreamPlan {
             clear_live_stream: true,
@@ -9639,7 +9663,7 @@ fn native_live_stream_plan(
     if emit_count <= already {
         return NativeLiveStreamPlan::default();
     }
-    let mut emitted_lines = lines[already..emit_count].to_vec();
+    let mut emitted_lines = commit_prefix_lines[already..emit_count].to_vec();
     if already == 0 {
         emitted_lines.insert(
             0,
@@ -9649,7 +9673,7 @@ fn native_live_stream_plan(
             },
         );
     }
-    let emitted_text_lines = plain_text_lines(&lines[..emit_count]);
+    let emitted_text_lines = plain_text_lines(&commit_prefix_lines[..emit_count]);
     NativeLiveStreamPlan {
         clear_live_stream: false,
         session_id: model.session_id.clone(),
@@ -9657,6 +9681,22 @@ fn native_live_stream_plan(
         emit_count,
         lines: emitted_lines,
         emitted_text_lines,
+    }
+}
+
+fn native_live_stream_emit_count(
+    model: &transcript::TranscriptModel,
+    stream_len: usize,
+    commit_prefix_len: usize,
+) -> usize {
+    if commit_prefix_len < stream_len
+        || transcript::active_streaming_has_table_holdback(Some(model))
+        || transcript::active_streaming_ends_on_line_boundary(Some(model))
+        || (transcript::active_streaming_can_commit_all(Some(model)) && stream_len > 1)
+    {
+        commit_prefix_len
+    } else {
+        commit_prefix_len.saturating_sub(1)
     }
 }
 
@@ -15112,6 +15152,109 @@ wire_api = "responses"
     }
 
     #[test]
+    fn native_live_stream_plan_defers_open_markdown_table() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "make a table"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+
+        let plan = native_live_stream_plan(&app, &model, 100);
+        let emitted = plain_text_lines(&plan.lines).join("\n");
+
+        assert!(emitted.contains("Intro."), "{emitted}");
+        assert!(!emitted.contains("Name"), "{emitted}");
+        assert!(!emitted.contains("Apples"), "{emitted}");
+        Ok(())
+    }
+
+    #[test]
+    fn native_live_stream_plan_defers_header_only_markdown_table() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "make a table"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Rendered:\n\n| ID | Name | Role |"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+
+        let plan = native_live_stream_plan(&app, &model, 100);
+        let emitted = plain_text_lines(&plan.lines).join("\n");
+
+        assert!(emitted.contains("Rendered:"), "{emitted}");
+        assert!(!emitted.contains("| ID | Name | Role |"), "{emitted}");
+        Ok(())
+    }
+
+    #[test]
+    fn native_live_stream_plan_releases_closed_table_before_final() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "make a table"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |\n\nNext paragraph\n"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+
+        let plan = native_live_stream_plan(&app, &model, 100);
+        let emitted = plain_text_lines(&plan.lines).join("\n");
+
+        assert!(emitted.contains("Intro."), "{emitted}");
+        assert!(emitted.contains("Name"), "{emitted}");
+        assert!(emitted.contains("Apples"), "{emitted}");
+        assert!(!emitted.contains("| Name | Count |"), "{emitted}");
+        assert!(emitted.contains("Next paragraph"), "{emitted}");
+        Ok(())
+    }
+
+    #[test]
     fn pre_tool_streaming_text_commits_before_tool_rows() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -16196,8 +16339,8 @@ wire_api = "responses"
         assert!(text.contains("• explored"));
         assert_eq!(text.matches("• explored").count(), 1, "{text}");
         assert!(text.contains("read README.md, Cargo.toml"));
-        assert!(text.contains("list "));
-        assert!(text.contains("search \"renderer\" (7 matches)"));
+        assert!(text.contains("listed "));
+        assert!(text.contains("searched \"renderer\" (7 matches)"));
         assert!(text.contains("• edit"));
         assert!(text.contains("changed README.md"));
         assert!(text.contains("Repository inspected."));

@@ -45,6 +45,7 @@ use base64::{engine::general_purpose, Engine as _};
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
 use browser_use_llm::schema::ContentPart;
 use browser_use_store::Store;
+use regex::Regex;
 use serde_json::{json, Value};
 
 use crate::infra::{
@@ -815,8 +816,11 @@ fn dispatch_browser_profile_preference(
                 local_profile_label_for_id(backend, session_id, cwd, artifact_dir, &profile_id);
             store.set_setting(BROWSER_PREF_PROFILE, &profile_id)?;
             store.set_setting(BROWSER_PREF_PROFILE_LABEL, &profile_label)?;
+            store.set_setting(BROWSER_PREF_MODE, "local")?;
+            store.set_setting("browser", browser_display_name("local"))?;
             Ok(json!({
                 "status": "ok",
+                "mode": "local",
                 "profile_id": profile_id,
                 "profile_label": profile_label,
                 "default_profile_id": profile_id,
@@ -841,18 +845,42 @@ fn dispatch_browser_profile_preference(
                 .or_else(|| store.get_setting(BROWSER_PREF_MODE).ok().flatten())
                 .unwrap_or_else(|| "local".to_string());
             enforce_selected_browser_mode(selected_browser_mode, &mode)?;
-            let profile_label =
-                local_profile_label_for_id(backend, session_id, cwd, artifact_dir, &profile_id);
+            let normalized_mode = normalize_browser_preference_mode(&mode)?;
+            let profile_label = if normalized_mode == "cloud" {
+                cloud_profile_label_for_id(backend, session_id, cwd, artifact_dir, &profile_id)
+            } else {
+                local_profile_label_for_id(backend, session_id, cwd, artifact_dir, &profile_id)
+            };
             store.set_setting(BROWSER_PREF_PROFILE, &profile_id)?;
             store.set_setting(BROWSER_PREF_PROFILE_LABEL, &profile_label)?;
+            store.set_setting(BROWSER_PREF_MODE, normalized_mode)?;
+            store.set_setting("browser", browser_display_name(normalized_mode))?;
+            let next_step = match normalized_mode {
+                "cloud" => format!(
+                    "browser remote start --profile-id {}",
+                    shell_quote_browser_arg(&profile_id)
+                ),
+                "managed-headless" => "browser connect managed --headless".to_string(),
+                "managed-headed" => "browser connect managed --headed".to_string(),
+                _ => "browser connect local".to_string(),
+            };
+            let message = if normalized_mode == "cloud" {
+                format!(
+                    "Default Browser Use Cloud profile set to {profile_label}. You can change it anytime with /profile."
+                )
+            } else {
+                format!(
+                    "Default Chrome profile set to {profile_label}. You can change it anytime with /profile."
+                )
+            };
             Ok(json!({
                 "status": "ok",
-                "mode": mode,
+                "mode": normalized_mode,
                 "profile_id": profile_id,
                 "profile_label": profile_label,
                 "default_profile_id": profile_id,
-                "message": format!("Default Chrome profile set to {profile_label}. You can change it anytime with /profile."),
-                "next_step": "browser connect local",
+                "message": message,
+                "next_step": next_step,
             }))
         }
         Some("forget") => {
@@ -861,6 +889,54 @@ fn dispatch_browser_profile_preference(
             Ok(json!({ "status": "ok", "default_profile_id": null }))
         }
         Some("suggest") => {
+            let mode = effective_browser_mode(Some(store), selected_browser_mode)?;
+            if mode == "cloud" {
+                let profiles = backend
+                    .command(
+                        session_id,
+                        cwd,
+                        artifact_dir,
+                        "browser remote profiles --json",
+                    )
+                    .map(|output| output.content)
+                    .unwrap_or_else(|error| {
+                        json!({
+                            "status": "failed",
+                            "error": format!("{error:#}"),
+                            "profiles": [],
+                        })
+                    });
+                let default_profile_id = stored_profile_for_mode(store, "cloud")?;
+                let cloud_profiles = profiles
+                    .get("profiles")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                let domain = option_value_core(args, "--domain");
+                let matching_profiles =
+                    cloud_profiles_matching_domain(&cloud_profiles, domain.as_deref());
+                let compact_cloud_profiles =
+                    compact_cloud_profiles_for_suggestion(&cloud_profiles, domain.as_deref());
+                let compact_matching_profiles = compact_cloud_profiles_for_suggestion(
+                    &serde_json::Value::Array(matching_profiles),
+                    domain.as_deref(),
+                );
+                let profile_options =
+                    formatted_cloud_profile_options(&cloud_profiles, domain.as_deref());
+                let profile_choices =
+                    formatted_cloud_profile_choices(&cloud_profiles, domain.as_deref());
+                let user_prompt = cloud_profile_user_prompt(&cloud_profiles, domain.as_deref());
+                return Ok(json!({
+                    "status": "ok",
+                    "mode": "cloud",
+                    "default_profile_id": default_profile_id,
+                    "cloud_profiles": compact_cloud_profiles,
+                    "matching_profiles": compact_matching_profiles,
+                    "profile_options": profile_options,
+                    "profile_choices": profile_choices,
+                    "user_prompt": user_prompt,
+                    "next_step": "For login-sensitive cloud browser work, choose a matching cloud profile and run browser profile remember --mode cloud --profile <profile-id>, then browser connect. If default_profile_id is already set, plain browser connect will use it.",
+                }));
+            }
             enforce_selected_browser_mode(selected_browser_mode, "local")?;
             let profiles = backend
                 .command(
@@ -877,7 +953,7 @@ fn dispatch_browser_profile_preference(
                         "profiles": [],
                     })
                 });
-            let default_profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
+            let default_profile_id = stored_profile_for_mode(store, "local")?;
             let preferred_browser = store.get_setting(BROWSER_PREF_BROWSER)?;
             let local_profiles = profiles
                 .get("local_profiles")
@@ -911,13 +987,13 @@ fn resolve_browser_command_for_selected_mode(
     let args = strip_browser_prefix(&argv);
     if args.len() == 1 && args.first().is_some_and(|arg| arg == "connect") {
         let effective_mode = effective_browser_mode(store, selected_browser_mode)?;
-        let profile_id = if selected_browser_mode.is_some() {
-            None
-        } else {
+        let profile_id = if effective_mode == "cloud" || selected_browser_mode.is_none() {
             store
-                .map(|store| store.get_setting(BROWSER_PREF_PROFILE))
+                .map(|store| stored_profile_for_mode(store, effective_mode))
                 .transpose()?
                 .flatten()
+        } else {
+            None
         };
         Ok(browser_connect_command_for_mode(
             effective_mode,
@@ -1156,6 +1232,44 @@ fn enrich_local_profiles_with_default_profile(
     output
 }
 
+fn enrich_status_with_selected_browser_mode(
+    mut output: BrowserCommandOutput,
+    resolved_command: &str,
+    selected_mode: Option<&str>,
+) -> BrowserCommandOutput {
+    let Ok(words) = browser_command_words(resolved_command) else {
+        return output;
+    };
+    let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+    if !matches!(words.as_slice(), ["browser", "status", ..] | ["status", ..]) {
+        return output;
+    }
+    let Some(selected_mode) = selected_mode
+        .and_then(|mode| normalize_browser_preference_mode(mode).ok())
+        .filter(|mode| *mode == "cloud")
+    else {
+        return output;
+    };
+    let Some(content) = output.content.as_object_mut() else {
+        return output;
+    };
+    if content.get("connection").and_then(Value::as_str) != Some("not-configured") {
+        return output;
+    }
+    if content.get("mode").and_then(Value::as_str) != Some("none") {
+        return output;
+    }
+
+    content.insert("selected_browser_mode".to_string(), json!(selected_mode));
+    content.insert("display_status".to_string(), json!("not-started"));
+    content.insert(
+        "reason".to_string(),
+        json!("Browser Use Cloud is selected, but no cloud browser has been started yet."),
+    );
+    content.insert("next_step".to_string(), json!("browser remote start"));
+    output
+}
+
 fn open_default_profile_before_local_connect(
     backend: &dyn BrowserBackend,
     session_id: &str,
@@ -1379,6 +1493,40 @@ fn local_profile_label_for_id(
         .unwrap_or_else(|| profile_id.to_string())
 }
 
+fn cloud_profile_label_for_id(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    profile_id: &str,
+) -> String {
+    backend
+        .command(
+            session_id,
+            cwd,
+            artifact_dir,
+            "browser remote profiles --json",
+        )
+        .ok()
+        .and_then(|output| {
+            output
+                .content
+                .get("profiles")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .find_map(|profile| {
+                    let id = profile.get("id").and_then(serde_json::Value::as_str)?;
+                    if id == profile_id {
+                        Some(cloud_profile_display_label(profile))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .unwrap_or_else(|| profile_id.to_string())
+}
+
 fn formatted_profile_options(profiles: &serde_json::Value) -> Vec<String> {
     profiles
         .as_array()
@@ -1430,6 +1578,114 @@ fn filter_local_profiles_for_browser(
     serde_json::Value::Array(filtered)
 }
 
+fn formatted_cloud_profile_options(
+    profiles: &serde_json::Value,
+    domain: Option<&str>,
+) -> Vec<String> {
+    profiles
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(idx, profile)| {
+            let summary = cloud_profile_domain_summary(profile, domain);
+            if summary.is_empty() {
+                format!("{}) {}", idx + 1, cloud_profile_display_label(profile))
+            } else {
+                format!(
+                    "{}) {} ({summary})",
+                    idx + 1,
+                    cloud_profile_display_label(profile)
+                )
+            }
+        })
+        .collect()
+}
+
+fn formatted_cloud_profile_choices(
+    profiles: &serde_json::Value,
+    domain: Option<&str>,
+) -> Vec<serde_json::Value> {
+    profiles
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|profile| {
+            let id = profile.get("id").and_then(serde_json::Value::as_str)?;
+            Some(json!({
+                "label": cloud_profile_display_label(profile),
+                "profile_id": id,
+                "cookie_domain_count": cloud_profile_cookie_domain_count(profile),
+                "matching_cookie_domains": matching_cookie_domains_for_profile(profile, domain),
+            }))
+        })
+        .collect()
+}
+
+fn compact_cloud_profiles_for_suggestion(
+    profiles: &serde_json::Value,
+    domain: Option<&str>,
+) -> Vec<serde_json::Value> {
+    profiles
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|profile| {
+            let id = profile.get("id").and_then(serde_json::Value::as_str)?;
+            Some(json!({
+                "id": id,
+                "name": profile.get("name").and_then(serde_json::Value::as_str),
+                "lastUsedAt": profile.get("lastUsedAt").cloned().unwrap_or(serde_json::Value::Null),
+                "cookie_domain_count": cloud_profile_cookie_domain_count(profile),
+                "matching_cookie_domains": matching_cookie_domains_for_profile(profile, domain),
+            }))
+        })
+        .collect()
+}
+
+fn cloud_profiles_matching_domain(
+    profiles: &serde_json::Value,
+    domain: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let Some(pattern) = cookie_domain_regex(domain) else {
+        return Vec::new();
+    };
+    profiles
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|profile| {
+            profile
+                .get("cookieDomains")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .any(|cookie_domain| cookie_domain_matches_regex(cookie_domain, &pattern))
+        })
+        .cloned()
+        .collect()
+}
+
+fn cloud_profile_user_prompt(profiles: &serde_json::Value, domain: Option<&str>) -> String {
+    let matches = cloud_profiles_matching_domain(profiles, domain);
+    let listed = if matches.is_empty() {
+        formatted_cloud_profile_options(profiles, domain)
+    } else {
+        formatted_cloud_profile_options(&serde_json::Value::Array(matches), domain)
+    };
+    if listed.is_empty() {
+        return "No Browser Use Cloud profiles were found. Ask the user to sync local cookies with /sync-cookies, or start a clean cloud browser.".to_string();
+    }
+    let scope = domain
+        .map(|domain| format!(" for {domain}"))
+        .unwrap_or_default();
+    format!(
+        "Which Browser Use Cloud profile should I use{scope}?\n\n{}\n\nChoose a profile with matching cookie domains for login-sensitive work.",
+        listed.join("\n")
+    )
+}
+
 fn default_profile_user_prompt(profiles: &serde_json::Value) -> String {
     let options = formatted_profile_options(profiles);
     if options.is_empty() {
@@ -1448,6 +1704,83 @@ fn profile_values(value: &serde_json::Value) -> impl Iterator<Item = &serde_json
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
+}
+
+fn cloud_profile_display_label(profile: &serde_json::Value) -> String {
+    profile
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| profile.get("id").and_then(serde_json::Value::as_str))
+        .map(clean_profile_label)
+        .unwrap_or_else(|| "Cloud profile".to_string())
+}
+
+fn cloud_profile_domain_summary(profile: &serde_json::Value, domain: Option<&str>) -> String {
+    let matching = matching_cookie_domains_for_profile(profile, domain);
+    if !matching.is_empty() {
+        return format!("matches {}", matching.join(", "));
+    }
+    let count = cloud_profile_cookie_domain_count(profile);
+    if count == 0 {
+        String::new()
+    } else {
+        format!("{count} cookie domains")
+    }
+}
+
+fn cloud_profile_cookie_domain_count(profile: &serde_json::Value) -> usize {
+    cloud_profile_cookie_domains(profile).len()
+}
+
+fn cloud_profile_cookie_domains(profile: &serde_json::Value) -> Vec<&str> {
+    profile
+        .get("cookieDomains")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect()
+}
+
+fn matching_cookie_domains_for_profile(
+    profile: &serde_json::Value,
+    domain: Option<&str>,
+) -> Vec<String> {
+    let Some(pattern) = cookie_domain_regex(domain) else {
+        return Vec::new();
+    };
+    cloud_profile_cookie_domains(profile)
+        .into_iter()
+        .filter(|cookie_domain| cookie_domain_matches_regex(cookie_domain, &pattern))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn cookie_domain_regex(pattern: Option<&str>) -> Option<Regex> {
+    let pattern = pattern?.trim();
+    if pattern.is_empty() {
+        return None;
+    }
+    Regex::new(&format!("(?i){pattern}")).ok()
+}
+
+fn cookie_domain_matches_regex(cookie_domain: &str, pattern: &Regex) -> bool {
+    let cookie_domain = normalize_cookie_match_domain_for_agent(cookie_domain);
+    pattern.is_match(&cookie_domain)
+}
+
+fn normalize_cookie_match_domain_for_agent(value: &str) -> String {
+    let trimmed = value
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches('.')
+        .trim_end_matches('/');
+    trimmed
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 fn profile_display_label(profile: &serde_json::Value) -> String {
@@ -1516,6 +1849,17 @@ fn preferred_browser_mode(store: Option<&Store>) -> anyhow::Result<&'static str>
         None => "local".to_string(),
     };
     normalize_browser_preference_mode(&mode)
+}
+
+fn stored_profile_for_mode(store: &Store, mode: &str) -> anyhow::Result<Option<String>> {
+    let normalized_mode = normalize_browser_preference_mode(mode)?;
+    let stored_mode = preferred_browser_mode(Some(store))?;
+    if stored_mode != normalized_mode {
+        return Ok(None);
+    }
+    Ok(store
+        .get_setting(BROWSER_PREF_PROFILE)?
+        .filter(|profile| !profile.trim().is_empty()))
 }
 
 fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> String {
@@ -1623,14 +1967,21 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
                 .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
         })
         .unwrap_or_else(|| "local".to_string());
+    let normalized_mode = normalize_browser_preference_mode(&mode)?;
+    let profile_id = stored_profile_for_mode(store, normalized_mode)?;
+    let profile_label = if profile_id.is_some() {
+        store.get_setting(BROWSER_PREF_PROFILE_LABEL)?
+    } else {
+        None
+    };
     Ok(json!({
-        "mode": normalize_browser_preference_mode(&mode)?,
-        "display": browser_display_name(normalize_browser_preference_mode(&mode)?),
+        "mode": normalized_mode,
+        "display": browser_display_name(normalized_mode),
         "browser": store.get_setting(BROWSER_PREF_BROWSER)?,
         "browser_label": store.get_setting(BROWSER_PREF_BROWSER_LABEL)?,
-        "profile_id": store.get_setting(BROWSER_PREF_PROFILE)?,
-        "profile_label": store.get_setting(BROWSER_PREF_PROFILE_LABEL)?,
-        "connect_command": match normalize_browser_preference_mode(&mode)? {
+        "profile_id": profile_id,
+        "profile_label": profile_label,
+        "connect_command": match normalized_mode {
             "cloud" => "browser remote start",
             "managed-headless" => "browser connect managed --headless",
             "managed-headed" => "browser connect managed --headed",
@@ -2310,14 +2661,16 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 selected_browser_mode,
                             )
                             .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                            let default_profile_id = store
-                                .get_setting(BROWSER_PREF_PROFILE)
-                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                                .filter(|profile| !profile.trim().is_empty());
                             let preferred_browser = store
                                 .get_setting(BROWSER_PREF_BROWSER)
                                 .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
                                 .filter(|browser| !browser.trim().is_empty());
+                            let effective_mode =
+                                effective_browser_mode(Some(&store), selected_browser_mode)
+                                    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+                            let default_profile_id =
+                                stored_profile_for_mode(&store, effective_mode)
+                                    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
                             let has_default_profile = default_profile_id.is_some();
                             drop(store);
                             if let Some(preflight) = local_connect_default_profile_preflight(
@@ -2355,10 +2708,15 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                     &resolved,
                                     default_profile_id.as_deref(),
                                 );
-                                enrich_local_connect_recovery_with_default_profile(
+                                let output = enrich_local_connect_recovery_with_default_profile(
                                     output,
                                     &resolved,
                                     default_profile_id.as_deref(),
+                                );
+                                enrich_status_with_selected_browser_mode(
+                                    output,
+                                    &resolved,
+                                    Some(effective_mode),
                                 )
                             }
                         }
@@ -2369,9 +2727,14 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             selected_browser_mode,
                         )
                         .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                        backend
+                        let output = backend
                             .command(&session_id, &cwd, &artifact_dir, &resolved)
-                            .map_err(ToolError::Other)?
+                            .map_err(ToolError::Other)?;
+                        enrich_status_with_selected_browser_mode(
+                            output,
+                            &resolved,
+                            selected_browser_mode,
+                        )
                     };
                     if let Some(persistence) = &persistence {
                         if let Ok(store) = persistence.store.lock() {
@@ -2395,10 +2758,8 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             effective_browser_mode(Some(&store), selected_browser_mode.as_deref())
                                 .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
                         let default_profile_id = if mode == "local" {
-                            store
-                                .get_setting(BROWSER_PREF_PROFILE)
+                            stored_profile_for_mode(&store, "local")
                                 .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                                .filter(|profile| !profile.trim().is_empty())
                         } else {
                             None
                         };
