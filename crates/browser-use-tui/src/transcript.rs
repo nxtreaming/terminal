@@ -727,7 +727,9 @@ fn build_transcript_model_from_events(
 
     let has_live_subagent_work = active_child_session_count(app, &session.id) > 0
         || pending_agent_mailbox_count(app, &session.id) > 0;
-    let active = if session.status.is_active() || has_live_subagent_work {
+    let active = if app.session_events_are_waiting_for_auth(&session.id, events) {
+        None
+    } else if session.status.is_active() || has_live_subagent_work {
         active_node_for_session(app, state, session, events)
     } else {
         None

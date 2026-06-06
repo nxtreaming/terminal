@@ -127,7 +127,7 @@ use settings::{
     model_choices_for_config, provider_model_choices, provider_model_for_display,
     recommended_models_for_codex_availability, AgentBackend, ModelChoice, RecommendedModel,
     ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
     BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
@@ -154,8 +154,7 @@ const TYPEWRITER_TICK_INTERVAL: Duration = Duration::from_millis(8);
 
 /// Synthetic assistant nudge shown when user submits a task with no API key.
 const NO_KEY_NUDGE_TEXT: &str = "It looks like you don't have an API key set up yet. \
-You can get one free at cloud.browser-use.com and run this on DeepSeek V4 for \
-free — or add your own key with /auth.";
+You can get one free at cloud.browser-use.com and add it with /auth.";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_EVENT: &str = "session.cloud_promo";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_TEXT: &str =
     "[tip] Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]";
@@ -4057,6 +4056,7 @@ impl App {
         self.selected_session_id = Some(session.id.clone());
         self.pending_auth_resume = Some(session.id.clone());
         self.native_history.reset_with_clear();
+        self.drain_store_notifications()?;
         Ok(())
     }
 
@@ -5450,12 +5450,9 @@ impl App {
             Surface::SetupConfirm => self.execute_setup_confirm_selection()?,
             Surface::SetupResult => self.execute_setup_result_selection()?,
             Surface::Account => {
-                let account = ACCOUNT_CHOICES
-                    .get(
-                        self.selected_row
-                            .min(ACCOUNT_CHOICES.len().saturating_sub(1)),
-                    )
-                    .unwrap_or(&ACCOUNT_CHOICES[0])
+                let account = AUTH_CHOICES
+                    .get(self.selected_row.min(AUTH_CHOICES.len().saturating_sub(1)))
+                    .unwrap_or(&AUTH_CHOICES[0])
                     .to_string();
                 self.dispatch(AppCommand::SaveAccount(account))?;
             }
@@ -5667,7 +5664,10 @@ impl App {
         let Some(session) = self.store.load_session(&session_id)? else {
             return Ok(());
         };
-        if session.status.is_active() {
+        let events = self.store.events_for_session(&session_id)?;
+        if session.status.is_active()
+            && !self.session_events_are_waiting_for_auth(&session_id, &events)
+        {
             // Agent already running — just navigate.
             self.selected_session_id = Some(session_id);
             self.native_history.reset_with_clear();
@@ -6036,6 +6036,10 @@ impl App {
     fn save_account(&mut self, account: String) -> Result<()> {
         if account == ACCOUNT_CODEX {
             self.start_codex_auth(account)?;
+            return Ok(());
+        }
+        if account == BROWSER_USE_CLOUD {
+            self.start_auth_flow(account)?;
             return Ok(());
         }
         self.account = account.clone();
@@ -7227,7 +7231,7 @@ impl App {
             Surface::Setup => self.setup_row_count(),
             Surface::SetupConfirm => 2,
             Surface::SetupResult => self.setup_result_row_count(),
-            Surface::Account => ACCOUNT_CHOICES.len(),
+            Surface::Account => AUTH_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
             Surface::Provider => self.recommended_models().len() + self.provider_rows().len(),
             Surface::OpenAiAuth => self.openai_auth_rows().len(),
@@ -7405,6 +7409,9 @@ impl App {
         let Some(session) = state.current_session.as_ref() else {
             return ProductState::Ready;
         };
+        if self.session_is_waiting_for_auth(&session.id) {
+            return ProductState::Result;
+        }
         if session.status.is_active() {
             ProductState::Running
         } else if session.status == SessionStatus::Cancelled {
@@ -7450,6 +7457,7 @@ impl App {
                 "auth.anthropic.api_key",
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             )?,
+            BROWSER_USE_CLOUD => self.browser_use_cloud_key_ready()?,
             account if is_claude_code_account(account) => self.has_claude_code_oauth()?,
             ACCOUNT_CODEX => self.has_codex_login()?,
             _ => false,
@@ -7458,6 +7466,62 @@ impl App {
 
     fn auth_notice(&self) -> Result<Option<String>> {
         self.auth_notice_for_selection(&self.current_model_selection())
+    }
+
+    pub(crate) fn session_is_waiting_for_auth(&self, session_id: &str) -> bool {
+        self.session_events_are_waiting_for_auth(
+            session_id,
+            self.cached_events_for_session(session_id),
+        )
+    }
+
+    pub(crate) fn session_events_are_waiting_for_auth(
+        &self,
+        session_id: &str,
+        events: &[EventRecord],
+    ) -> bool {
+        let Some(nudge_seq) = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.session_id == session_id
+                    && event.event_type == "session.notice"
+                    && event
+                        .payload
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(NO_KEY_NUDGE_TEXT)
+            })
+            .map(|event| event.seq)
+        else {
+            return false;
+        };
+        if events.iter().any(|event| {
+            event.session_id == session_id
+                && event.seq > nudge_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "agent.run.started" | "session.done" | "session.failed" | "session.cancelled"
+                )
+        }) {
+            return false;
+        }
+        if events.iter().any(|event| {
+            event.session_id == session_id
+                && event.seq > nudge_seq
+                && event.event_type == "session.status"
+                && event
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("running")
+        }) {
+            return false;
+        }
+        self.pending_auth_resume.as_deref() == Some(session_id)
+            || !events.iter().any(|event| {
+                event.session_id == session_id && event.event_type == "agent.run.started"
+            })
     }
 
     fn auth_notice_for_selection(
@@ -11509,6 +11573,15 @@ mod redesign_tests {
                 Some(session_id.as_str()),
                 "pending_auth_resume should point to the nudge session"
             );
+            let screen = render_dump(&mut app)?;
+            assert!(
+                screen.contains("It looks like you don't have an API key set up yet"),
+                "nudge should render as committed assistant text"
+            );
+            assert!(
+                !screen.contains("Working..."),
+                "blocked auth nudge must not render as active work: {screen}"
+            );
             Ok(())
         })();
         if let Some(value) = saved {
@@ -11776,6 +11849,51 @@ mod redesign_tests {
                     .as_deref(),
                 Some("bu-test-key")
             );
+            assert_eq!(app.browser, BROWSER_USE_CLOUD);
+            assert!(app.browser_use_cloud_key_ready()?);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn auth_surface_can_save_browser_use_cloud_key_without_changing_model_account() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let original_account = app.account.clone();
+
+            app.open_surface(Surface::Account);
+            app.selected_row = settings::AUTH_CHOICES
+                .iter()
+                .position(|account| *account == BROWSER_USE_CLOUD)
+                .context("Browser Use Cloud auth row")?;
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Browser Use Cloud"));
+            assert!(screen.contains("needs key"));
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::ApiKey);
+            assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
+            app.set_input("bu-auth-surface-key".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+            assert_eq!(
+                app.store
+                    .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+                    .as_deref(),
+                Some("bu-auth-surface-key")
+            );
+            assert_eq!(app.account, original_account);
             assert_eq!(app.browser, BROWSER_USE_CLOUD);
             assert!(app.browser_use_cloud_key_ready()?);
             Ok(())
@@ -12405,6 +12523,46 @@ mod redesign_tests {
 
         assert!(screen.contains(BROWSER_USE_CLOUD));
         Ok(())
+    }
+
+    #[test]
+    fn composer_browser_tag_is_red_when_cloud_key_is_missing() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            app.browser = BROWSER_USE_CLOUD.to_string();
+
+            let colors = render::render_text_foregrounds(&mut app, BROWSER_USE_CLOUD)?;
+            assert!(!colors.is_empty(), "cloud browser tag should render");
+            assert!(
+                colors
+                    .iter()
+                    .all(|color| Some(*color) == crate::theme::failed().fg),
+                "missing-key cloud browser tag should use failed color: {colors:?}"
+            );
+
+            app.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-test-key")?;
+            let colors = render::render_text_foregrounds(&mut app, BROWSER_USE_CLOUD)?;
+            assert!(!colors.is_empty(), "cloud browser tag should render");
+            assert!(
+                colors
+                    .iter()
+                    .all(|color| Some(*color) != crate::theme::failed().fg),
+                "key-present cloud browser tag should not use failed color: {colors:?}"
+            );
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
     }
 
     #[test]
@@ -13813,7 +13971,7 @@ wire_api = "responses"
             }
             let count = match surface {
                 Surface::Setup => app.setup_row_count(),
-                Surface::Account => ACCOUNT_CHOICES.len(),
+                Surface::Account => AUTH_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
                 Surface::Mode => 2,
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
@@ -18106,6 +18264,16 @@ wire_api = "responses"
             Some(session_id.as_str()),
             "pending_auth_resume should be set to the nudge session id"
         );
+        assert!(app.session_is_waiting_for_auth(&session_id));
+        let screen = render_dump(&mut app)?;
+        assert!(
+            screen.contains("It looks like you don't have an API key set up yet"),
+            "nudge should render as committed assistant text"
+        );
+        assert!(
+            !screen.contains("Working..."),
+            "blocked auth nudge must not render as active work: {screen}"
+        );
         // Composer should be cleared.
         assert!(app.composer.is_empty());
         Ok(())
@@ -18156,6 +18324,19 @@ wire_api = "responses"
             app.pending_auth_resume.is_none(),
             "pending_auth_resume should be cleared after resume"
         );
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "session.status"
+                    && event
+                        .payload
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("running")
+            }),
+            "auth resume should mark the blocked nudge session running"
+        );
+        assert!(!app.session_events_are_waiting_for_auth(&session.id, &events));
         // The nudge session should be selected.
         assert_eq!(
             app.selected_session_id.as_deref(),
