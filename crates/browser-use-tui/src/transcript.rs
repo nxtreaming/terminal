@@ -3457,7 +3457,8 @@ fn is_useful_source_for_backend(source: &str, backend: &str) -> bool {
 }
 
 fn browser_backend_supports_live_url(backend: &str) -> bool {
-    backend.to_ascii_lowercase().contains("cloud")
+    let backend = backend.to_ascii_lowercase();
+    backend.contains("cloud") || backend.contains("managed")
 }
 
 fn is_cloud_live_url(source: &str) -> bool {

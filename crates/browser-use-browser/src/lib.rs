@@ -177,6 +177,15 @@ struct LocalBrowserProfile {
     display_name: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct LocalBrowserChoice {
+    name: String,
+    browser_path: Option<PathBuf>,
+    profile_count: usize,
+    managed_headed: bool,
+    managed_headless: bool,
+}
+
 struct BrowserSession {
     session_id: Option<String>,
     mode: BrowserMode,
@@ -200,6 +209,7 @@ struct BrowserSession {
     preferred_profile_id: Option<String>,
     active_local_profile_id: Option<String>,
     preferred_browser_context_id: Option<String>,
+    artifact_dir: Option<PathBuf>,
     logs: VecDeque<String>,
 }
 
@@ -228,6 +238,7 @@ impl Default for BrowserSession {
             preferred_profile_id: None,
             active_local_profile_id: None,
             preferred_browser_context_id: None,
+            artifact_dir: None,
             logs: VecDeque::new(),
         }
     }
@@ -742,16 +753,15 @@ pub fn run_browser_command_with_options_and_registries(
         &options,
         script_registry,
     )?;
-    let events = session.browser_events();
     let connected = session.connection.is_some();
-    drop(sessions);
-    // Tool-agnostic recording: once the browser is connected (via any `browser`
-    // command), start session-layer 2fps capture if it isn't already running.
+    session.artifact_dir = Some(artifact_dir.as_ref().to_path_buf());
     if connected {
         start_session_capture_with_registry(session_id, artifact_dir.as_ref(), session_registry);
     } else {
         stop_session_capture_with_registry(session_id, session_registry);
     }
+    let events = session.browser_events();
+    drop(sessions);
     Ok(BrowserCommandOutput { events, content })
 }
 
@@ -2065,9 +2075,10 @@ fn dispatch_local(
             };
             Ok(local_setup_user_action_response(profile))
         }
+        Some("browsers") => Ok(list_local_browsers()),
         Some("profiles") => dispatch_local_profiles(argv),
         Some(other) => bail!("unknown browser local command: {other}"),
-        None => bail!("browser local requires list, open, setup, or profiles"),
+        None => bail!("browser local requires list, open, setup, browsers, or profiles"),
     }
 }
 
@@ -2403,7 +2414,12 @@ impl BrowserSession {
             "type": event_type,
             "payload": payload,
         }));
-        if let Some(live_url) = self.live_url.as_deref() {
+        if let Some(live_url) = self
+            .last_emitted_browser_payload
+            .as_ref()
+            .and_then(|payload| payload.get("live_url"))
+            .and_then(Value::as_str)
+        {
             events.push(json!({
                 "type": "browser.live_url",
                 "payload": {
@@ -2438,13 +2454,14 @@ impl BrowserSession {
     }
 
     fn browser_event_payload(&self) -> Value {
+        let live_url = self.effective_live_url();
         json!({
             "backend": self.mode.as_str(),
             "status": if self.connection.is_some() { "connected" } else { "disconnected" },
             "target_id": self.current_target_id,
             "session_id": self.current_session_id,
             "generation": self.connection_generation,
-            "live_url": self.live_url,
+            "live_url": live_url,
             "last_issue": self.last_issue_diagnosis(),
         })
     }
@@ -2491,8 +2508,21 @@ impl BrowserSession {
             },
             "connection_generation": self.connection_generation,
             "remote_browser_id": self.remote_browser_id,
-            "live_url": self.live_url,
+            "live_url": self.effective_live_url(),
         })
+    }
+
+    fn effective_live_url(&self) -> Option<String> {
+        self.live_url.clone().or_else(|| self.local_live_url())
+    }
+
+    fn local_live_url(&self) -> Option<String> {
+        if !(self.mode == BrowserMode::Managed && self.owner == BrowserOwner::Rust) {
+            return None;
+        }
+        self.artifact_dir
+            .as_deref()
+            .and_then(local_capture_preview_live_url)
     }
 
     fn last_issue_diagnosis(&self) -> Option<BrowserIssueDiagnosis> {
@@ -2806,7 +2836,12 @@ impl BrowserSession {
             ManagedProfile::Temp => "temp".to_string(),
             ManagedProfile::Path(path) => path.display().to_string(),
         });
-        Ok(json!({ "status": "connected", "browser": self.status_json() }))
+        Ok(json!({
+            "status": "connected",
+            "browser": self.status_json(),
+            "next_step": "Continue immediately with the user's requested browser/search/page work in this connected managed browser.",
+            "model_instruction": "Browser connection is setup only. Do not answer the user's browser/search/page task from memory or stop after connecting; continue with page work now.",
+        }))
     }
 
     fn start_remote_cloud(&mut self, argv: &[String]) -> Result<Value> {
@@ -3443,6 +3478,11 @@ impl BrowserSession {
                     .iter()
                     .find(|target| is_page_target(target) && !is_profile_marker_target(target))
                     .cloned()
+            } else if self.mode == BrowserMode::Managed {
+                targets
+                    .iter()
+                    .find(|target| is_page_target(target))
+                    .cloned()
             } else {
                 targets
                     .iter()
@@ -3560,6 +3600,11 @@ impl BrowserSession {
                 targets
                     .iter()
                     .find(|target| is_page_target(target) && !is_profile_marker_target(target))
+                    .cloned()
+            } else if self.mode == BrowserMode::Managed {
+                targets
+                    .iter()
+                    .find(|target| is_page_target(target))
                     .cloned()
             } else {
                 targets
@@ -5110,6 +5155,57 @@ fn list_local_profiles() -> Result<Value> {
         "source": "rust-local-filesystem",
         "profiles": detect_local_profiles(),
     }))
+}
+
+fn list_local_browsers() -> Value {
+    let mut choices = Vec::new();
+    let mut by_name: HashMap<String, LocalBrowserChoice> = HashMap::new();
+    for profile in detect_local_profiles() {
+        let entry = by_name
+            .entry(profile.browser_name.clone())
+            .or_insert_with(|| LocalBrowserChoice {
+                name: profile.browser_name.clone(),
+                browser_path: Some(profile.browser_path.clone()),
+                profile_count: 0,
+                managed_headed: false,
+                managed_headless: false,
+            });
+        entry.profile_count += 1;
+        if entry.browser_path.is_none() {
+            entry.browser_path = Some(profile.browser_path);
+        }
+    }
+    let managed_headed = chromium_candidate_paths(false).into_iter().next();
+    let managed_headless = chromium_candidate_paths(true).into_iter().next();
+    if managed_headed.is_some() || managed_headless.is_some() {
+        let entry = by_name
+            .entry("Chromium".to_string())
+            .or_insert_with(|| LocalBrowserChoice {
+                name: "Chromium".to_string(),
+                browser_path: managed_headed
+                    .as_deref()
+                    .or(managed_headless.as_deref())
+                    .map(PathBuf::from),
+                profile_count: 0,
+                managed_headed: false,
+                managed_headless: false,
+            });
+        if entry.browser_path.is_none() {
+            entry.browser_path = managed_headed
+                .as_deref()
+                .or(managed_headless.as_deref())
+                .map(PathBuf::from);
+        }
+        entry.managed_headed = managed_headed.is_some();
+        entry.managed_headless = managed_headless.is_some();
+    }
+    choices.extend(by_name.into_values());
+    choices.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+    json!({
+        "status": "ok",
+        "source": "rust-local-filesystem",
+        "browsers": choices,
+    })
 }
 
 fn inspect_local_profile(profile: &str, domains_only: bool) -> Result<Value> {
@@ -7701,6 +7797,73 @@ fn session_capture_quality() -> i64 {
         .unwrap_or(60)
 }
 
+fn local_capture_preview_live_url(artifact_dir: &Path) -> Option<String> {
+    let frames_dir = artifact_dir.join(".capture.frames");
+    ensure_capture_preview_files(&frames_dir).ok()?;
+    Some(file_url_for_path(&frames_dir.join("live.html")))
+}
+
+fn ensure_capture_preview_files(frames_dir: &Path) -> Result<()> {
+    fs::create_dir_all(frames_dir)
+        .with_context(|| format!("create capture preview dir {}", frames_dir.display()))?;
+    let preview = frames_dir.join("live.html");
+    if !preview.exists() {
+        fs::write(&preview, capture_preview_html())
+            .with_context(|| format!("write capture preview {}", preview.display()))?;
+    }
+    Ok(())
+}
+
+fn capture_preview_html() -> &'static str {
+    r#"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Browser preview</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #111; color: #d8dee9; font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { display: grid; place-items: center; overflow: hidden; }
+    img { max-width: 100vw; max-height: 100vh; object-fit: contain; }
+    #waiting { position: fixed; inset: 0; display: grid; place-items: center; color: #9aa4b2; }
+    .ready #waiting { display: none; }
+  </style>
+</head>
+<body>
+  <div id="waiting">Waiting for browser frames...</div>
+  <img id="frame" alt="">
+  <script>
+    const frame = document.getElementById("frame");
+    function refresh() {
+      const next = new Image();
+      next.onload = () => {
+        frame.src = next.src;
+        document.body.classList.add("ready");
+      };
+      next.src = "latest.jpg?t=" + Date.now();
+    }
+    refresh();
+    setInterval(refresh, 500);
+  </script>
+</body>
+</html>
+"#
+}
+
+fn file_url_for_path(path: &Path) -> String {
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut url = String::from("file://");
+    for byte in absolute.to_string_lossy().as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.' | '~') {
+            url.push(ch);
+        } else {
+            url.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    url
+}
+
 fn start_session_capture_with_registry(
     session_id: &str,
     artifact_dir: &Path,
@@ -7717,7 +7880,7 @@ fn start_session_capture_with_registry(
         return; // already capturing this session
     }
     let frames_dir = artifact_dir.join(".capture.frames");
-    if fs::create_dir_all(&frames_dir).is_err() {
+    if ensure_capture_preview_files(&frames_dir).is_err() {
         return;
     }
     let stop = Arc::new(AtomicBool::new(false));
@@ -7778,6 +7941,7 @@ fn session_capture_loop(
     let interval = Duration::from_secs_f64(1.0 / session_capture_fps().max(0.1));
     let quality = session_capture_quality();
     let manifest = frames_dir.join("frames.ndjson");
+    let latest = frames_dir.join("latest.jpg");
     let mut cap_session: Option<String> = None;
     let mut attached_target: Option<String> = None;
     let mut seq: u64 = 0;
@@ -7833,6 +7997,7 @@ fn session_capture_loop(
                                 .and_then(Value::as_str)
                                 .and_then(|d| general_purpose::STANDARD.decode(d.as_bytes()).ok())
                             {
+                                let _ = fs::write(&latest, &bytes);
                                 let ts = unix_time_ms() as u64;
                                 if prev_bytes.as_deref() == Some(bytes.as_slice()) {
                                     if let Some(last) = records.last_mut() {
@@ -8887,6 +9052,26 @@ mod tests {
             })),
             "browser.reconnected"
         );
+    }
+
+    #[test]
+    fn managed_status_exposes_local_capture_preview_live_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = BrowserSession {
+            mode: BrowserMode::Managed,
+            owner: BrowserOwner::Rust,
+            artifact_dir: Some(temp.path().to_path_buf()),
+            current_target_id: Some("target-1".to_string()),
+            current_session_id: Some("session-1".to_string()),
+            ..Default::default()
+        };
+
+        let preview = temp.path().join(".capture.frames/live.html");
+        assert_eq!(
+            session.status_json()["live_url"].as_str(),
+            Some(file_url_for_path(&preview).as_str())
+        );
+        assert!(preview.exists());
     }
 
     #[test]
@@ -10442,6 +10627,28 @@ print("large response ok", len(data["blob"]))
         assert_eq!(output.content["source"], "rust-local-filesystem");
         assert!(output.content["profiles"].is_array());
         assert!(!output.content.to_string().contains("profile-use"));
+    }
+
+    #[test]
+    fn local_browsers_command_uses_detected_runtime_browsers() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_command(
+            "browsers-list",
+            temp.path(),
+            temp.path(),
+            "browser local browsers --json",
+        )
+        .unwrap();
+        assert_eq!(output.content["source"], "rust-local-filesystem");
+        assert!(output.content["browsers"].is_array());
+        for browser in output.content["browsers"].as_array().unwrap() {
+            assert!(browser["name"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty()));
+            assert!(browser["profile_count"].is_u64());
+            assert!(browser["managed_headed"].is_boolean());
+            assert!(browser["managed_headless"].is_boolean());
+        }
     }
 
     #[test]

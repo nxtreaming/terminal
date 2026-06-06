@@ -75,6 +75,8 @@ pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
 pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_content__:";
 
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
+const BROWSER_PREF_BROWSER: &str = "browser.preference.browser";
+const BROWSER_PREF_BROWSER_LABEL: &str = "browser.preference.browser_label";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
 const BROWSER_PREF_PROFILE_LABEL: &str = "browser.preference.profile_label";
 
@@ -597,6 +599,13 @@ pub(crate) fn desired_browser_connect_command(
                 Some("browser connect managed --headless")
             }
         }
+        "managed-headed" => {
+            if connected && current_mode == Some("managed") {
+                None
+            } else {
+                Some("browser connect managed --headed")
+            }
+        }
         _ => None,
     }
 }
@@ -869,14 +878,18 @@ fn dispatch_browser_profile_preference(
                     })
                 });
             let default_profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
+            let preferred_browser = store.get_setting(BROWSER_PREF_BROWSER)?;
             let local_profiles = profiles
                 .get("local_profiles")
                 .or_else(|| profiles.get("profiles"))
                 .cloned()
                 .unwrap_or_else(|| json!([]));
+            let local_profiles =
+                filter_local_profiles_for_browser(local_profiles, preferred_browser.as_deref());
             Ok(json!({
                 "status": "ok",
                 "default_profile_id": default_profile_id,
+                "preferred_browser": preferred_browser,
                 "local_profiles": local_profiles,
                 "profile_options": formatted_profile_options(&local_profiles),
                 "profile_choices": formatted_profile_choices(&local_profiles),
@@ -918,6 +931,7 @@ fn resolve_browser_command_for_selected_mode(
 
 fn local_connect_default_profile_preflight(
     has_default_profile: bool,
+    preferred_browser: Option<&str>,
     backend: &dyn BrowserBackend,
     session_id: &str,
     cwd: &std::path::Path,
@@ -957,10 +971,12 @@ fn local_connect_default_profile_preflight(
         .or_else(|| profiles.get("profiles"))
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let local_profiles = filter_local_profiles_for_browser(local_profiles, preferred_browser);
     Ok(Some(BrowserCommandOutput {
         content: json!({
             "status": "needs-user-action",
             "reason": "No default local Chrome profile is set.",
+            "preferred_browser": preferred_browser,
             "local_profiles": local_profiles,
             "profile_options": formatted_profile_options(&local_profiles),
             "profile_choices": formatted_profile_choices(&local_profiles),
@@ -1388,6 +1404,32 @@ fn formatted_profile_choices(profiles: &serde_json::Value) -> Vec<serde_json::Va
         .collect()
 }
 
+fn filter_local_profiles_for_browser(
+    profiles: serde_json::Value,
+    preferred_browser: Option<&str>,
+) -> serde_json::Value {
+    let Some(preferred_browser) = preferred_browser
+        .map(str::trim)
+        .filter(|browser| !browser.is_empty())
+    else {
+        return profiles;
+    };
+    let Some(items) = profiles.as_array() else {
+        return profiles;
+    };
+    let filtered = items
+        .iter()
+        .filter(|profile| {
+            profile
+                .get("browser_name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|browser| browser.eq_ignore_ascii_case(preferred_browser))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(filtered)
+}
+
 fn default_profile_user_prompt(profiles: &serde_json::Value) -> String {
     let options = formatted_profile_options(profiles);
     if options.is_empty() {
@@ -1584,6 +1626,8 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
     Ok(json!({
         "mode": normalize_browser_preference_mode(&mode)?,
         "display": browser_display_name(normalize_browser_preference_mode(&mode)?),
+        "browser": store.get_setting(BROWSER_PREF_BROWSER)?,
+        "browser_label": store.get_setting(BROWSER_PREF_BROWSER_LABEL)?,
         "profile_id": store.get_setting(BROWSER_PREF_PROFILE)?,
         "profile_label": store.get_setting(BROWSER_PREF_PROFILE_LABEL)?,
         "connect_command": match normalize_browser_preference_mode(&mode)? {
@@ -2270,10 +2314,15 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 .get_setting(BROWSER_PREF_PROFILE)
                                 .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
                                 .filter(|profile| !profile.trim().is_empty());
+                            let preferred_browser = store
+                                .get_setting(BROWSER_PREF_BROWSER)
+                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                                .filter(|browser| !browser.trim().is_empty());
                             let has_default_profile = default_profile_id.is_some();
                             drop(store);
                             if let Some(preflight) = local_connect_default_profile_preflight(
                                 has_default_profile,
+                                preferred_browser.as_deref(),
                                 backend.as_ref(),
                                 &session_id,
                                 &cwd,
@@ -2353,10 +2402,19 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                         } else {
                             None
                         };
+                        let preferred_browser = if mode == "local" {
+                            store
+                                .get_setting(BROWSER_PREF_BROWSER)
+                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                                .filter(|browser| !browser.trim().is_empty())
+                        } else {
+                            None
+                        };
                         drop(store);
                         if mode == "local" && default_profile_id.is_none() {
                             if let Some(preflight) = local_connect_default_profile_preflight(
                                 false,
+                                preferred_browser.as_deref(),
                                 backend.as_ref(),
                                 &session_id,
                                 &cwd,

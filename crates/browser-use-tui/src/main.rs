@@ -127,8 +127,8 @@ use settings::{
     model_choices_for_config, provider_model_choices, provider_model_for_display,
     recommended_models_for_codex_availability, AgentBackend, ModelChoice, RecommendedModel,
     ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
+    ACCOUNT_OPENROUTER, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
+    BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -497,6 +497,7 @@ struct DefaultProfileEvent {
 struct DefaultProfileState {
     status: DefaultProfileStatus,
     profiles: Vec<CookieSyncProfile>,
+    browsers: Vec<String>,
     current_profile_id: Option<String>,
     rx: Option<mpsc::Receiver<DefaultProfileEvent>>,
 }
@@ -506,10 +507,19 @@ impl Default for DefaultProfileState {
         Self {
             status: DefaultProfileStatus::Loading,
             profiles: Vec::new(),
+            browsers: Vec::new(),
             current_profile_id: None,
             rx: None,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BrowserSelectRow {
+    Local(String),
+    ChromiumHeaded,
+    ChromiumHeadless,
+    Cloud,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1142,6 +1152,7 @@ struct App {
     provider_fetch: Option<mpsc::Receiver<(ModelSource, Vec<ProviderModel>)>>,
     collaboration_mode: CollaborationModeKind,
     browser: String,
+    browser_local_label: Option<String>,
     browser_profile_label: Option<String>,
     api_key_account: Option<String>,
     pending_model_after_auth: Option<ModelChoice>,
@@ -1157,6 +1168,7 @@ struct App {
     default_profile: DefaultProfileState,
     pending_cookie_sync_after_auth: bool,
     browser_notice: Option<String>,
+    browser_select_chromium_expanded: bool,
     status_notice: Option<String>,
     agent_backend: AgentBackend,
     quit_hint_until: Option<Instant>,
@@ -2124,6 +2136,7 @@ impl App {
         let browser = store
             .get_setting("browser")?
             .unwrap_or_else(|| args.browser.clone());
+        let browser_local_label = browser_local_label_from_store(&store)?;
         let browser_profile_label = browser_profile_label_from_store(&store)?;
         let selected_row = 0;
         let codex_login_available = Self::probe_codex_login_available(&store)?;
@@ -2158,6 +2171,7 @@ impl App {
             provider_fetch: None,
             collaboration_mode,
             browser,
+            browser_local_label,
             browser_profile_label,
             api_key_account: None,
             pending_model_after_auth: None,
@@ -2170,6 +2184,7 @@ impl App {
             default_profile: DefaultProfileState::default(),
             pending_cookie_sync_after_auth: false,
             browser_notice: None,
+            browser_select_chromium_expanded: false,
             status_notice: None,
             agent_backend,
             quit_hint_until: None,
@@ -2450,7 +2465,15 @@ impl App {
             Ok(value) => match value.get("status").and_then(serde_json::Value::as_str) {
                 Some("needs-user-action") | Some("ok") | None => {
                     self.default_profile.profiles = cookie_sync_profiles_from_value(&value);
-                    if let Some(current) = self.default_profile.current_profile_id.as_deref() {
+                    self.default_profile.browsers = local_browser_choices_from_value(&value)
+                        .unwrap_or_else(|| {
+                            local_browser_choices_from_profiles(&self.default_profile.profiles)
+                        });
+                    self.default_profile.status = DefaultProfileStatus::Ready;
+                    if self.surface == Surface::BrowserSelect {
+                        self.sync_browser_select_cursor_to_current();
+                    } else if let Some(current) = self.default_profile.current_profile_id.as_deref()
+                    {
                         if let Some(index) = self
                             .default_profile
                             .profiles
@@ -2460,7 +2483,6 @@ impl App {
                             self.selected_row = index;
                         }
                     }
-                    self.default_profile.status = DefaultProfileStatus::Ready;
                 }
                 Some("failed") => {
                     let error = value
@@ -4183,7 +4205,7 @@ impl App {
             }
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
-            AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
+            AppCommand::ChangeBrowser => self.open_browser_select()?,
             AppCommand::ChangeDefaultProfile => self.open_default_profile()?,
             AppCommand::SyncCookies => self.open_cookie_sync()?,
             AppCommand::Reload => self.request_reexec()?,
@@ -6572,11 +6594,36 @@ impl App {
     }
 
     fn save_browser(&mut self, index: usize) -> Result<()> {
-        let choice = BROWSER_CHOICES
-            .get(index.min(BROWSER_CHOICES.len().saturating_sub(1)))
-            .unwrap_or(&BROWSER_CHOICES[0]);
+        match self.browser_select_row(index) {
+            Some(BrowserSelectRow::Local(browser_name))
+                if browser_name.eq_ignore_ascii_case("Chromium") =>
+            {
+                self.browser_select_chromium_expanded = true;
+                self.selected_row = index.saturating_add(1);
+                return Ok(());
+            }
+            Some(BrowserSelectRow::Local(browser_name)) => {
+                return self.save_local_browser(browser_name);
+            }
+            Some(BrowserSelectRow::ChromiumHeaded) => {
+                return self.save_browser_backend("Managed Chromium");
+            }
+            Some(BrowserSelectRow::ChromiumHeadless) => {
+                return self.save_browser_backend("Headless Chromium");
+            }
+            Some(BrowserSelectRow::Cloud) | None => {
+                return self.save_browser_backend(BROWSER_USE_CLOUD);
+            }
+        }
+    }
+
+    fn save_browser_backend(&mut self, choice: &str) -> Result<()> {
         let previous_browser = self.browser.clone();
-        self.browser = (*choice).to_string();
+        self.browser = choice.to_string();
+        self.store.set_setting(
+            "browser.preference.mode",
+            browser_preference_mode_for_choice(choice),
+        )?;
         self.track_browser_selected();
         self.persist_runtime_settings()?;
         self.append_browser_backend_change_if_needed(&previous_browser)?;
@@ -6587,7 +6634,6 @@ impl App {
             self.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
             return Ok(());
         }
-        self.status_notice = Some(format!("Browser set to {}.", self.browser));
         if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
             self.complete_setup()?;
             self.close_surface();
@@ -6597,6 +6643,99 @@ impl App {
             self.close_surface();
         }
         Ok(())
+    }
+
+    fn save_local_browser(&mut self, browser_name: String) -> Result<()> {
+        let previous_browser = self.browser.clone();
+        self.browser = BROWSER_LOCAL_CHROME.to_string();
+        self.store.set_setting("browser.preference.mode", "local")?;
+        self.store
+            .set_setting("browser.preference.browser", &browser_name)?;
+        self.store
+            .set_setting("browser.preference.browser_label", &browser_name)?;
+        self.browser_local_label = Some(browser_name.clone());
+        if !self.current_profile_matches_browser(&browser_name) {
+            self.store.delete_setting("browser.preference.profile")?;
+            self.store
+                .delete_setting("browser.preference.profile_label")?;
+            self.browser_profile_label = None;
+            self.default_profile.current_profile_id = None;
+        }
+        self.track_browser_selected();
+        self.persist_runtime_settings()?;
+        self.append_browser_backend_change_if_needed(&previous_browser)?;
+        if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
+            self.complete_setup()?;
+            self.close_surface();
+        } else if !self.setup_complete {
+            self.open_surface(Surface::Setup);
+        } else {
+            self.close_surface();
+        }
+        Ok(())
+    }
+
+    fn browser_select_local_browsers(&self) -> Vec<String> {
+        self.default_profile.browsers.clone()
+    }
+
+    fn browser_select_local_browser_count(&self) -> usize {
+        self.browser_select_rows()
+            .into_iter()
+            .take_while(|row| !matches!(row, BrowserSelectRow::Cloud))
+            .count()
+    }
+
+    pub(crate) fn browser_select_rows(&self) -> Vec<BrowserSelectRow> {
+        let mut rows = Vec::new();
+        match &self.default_profile.status {
+            DefaultProfileStatus::Ready => {
+                for browser in self.browser_select_local_browsers() {
+                    let is_chromium = browser.eq_ignore_ascii_case("Chromium");
+                    rows.push(BrowserSelectRow::Local(browser));
+                    if is_chromium && self.browser_select_chromium_expanded {
+                        rows.push(BrowserSelectRow::ChromiumHeaded);
+                        rows.push(BrowserSelectRow::ChromiumHeadless);
+                    }
+                }
+            }
+            DefaultProfileStatus::Loading | DefaultProfileStatus::Failed(_) => {}
+        }
+        rows.push(BrowserSelectRow::Cloud);
+        rows
+    }
+
+    fn browser_select_row(&self, index: usize) -> Option<BrowserSelectRow> {
+        self.browser_select_rows().get(index).cloned()
+    }
+
+    fn sync_browser_select_cursor_to_current(&mut self) {
+        let rows = self.browser_select_rows();
+        if let Some(index) = rows.iter().position(|row| match row {
+            BrowserSelectRow::Local(browser) => {
+                self.browser == BROWSER_LOCAL_CHROME
+                    && self.browser_local_label.as_deref().map_or_else(
+                        || browser.eq_ignore_ascii_case("Google Chrome"),
+                        |current| current.eq_ignore_ascii_case(browser),
+                    )
+            }
+            BrowserSelectRow::ChromiumHeaded => self.browser == "Managed Chromium",
+            BrowserSelectRow::ChromiumHeadless => self.browser == "Headless Chromium",
+            BrowserSelectRow::Cloud => self.browser == BROWSER_USE_CLOUD,
+        }) {
+            self.selected_row = index;
+        } else {
+            self.selected_row = 0;
+        }
+    }
+
+    fn current_profile_matches_browser(&self, browser_name: &str) -> bool {
+        let Some(current) = self.default_profile.current_profile_id.as_deref() else {
+            return false;
+        };
+        self.default_profile.profiles.iter().any(|profile| {
+            profile.id == current && profile.browser_name.eq_ignore_ascii_case(browser_name)
+        })
     }
 
     fn append_browser_backend_change_if_needed(&mut self, previous_browser: &str) -> Result<()> {
@@ -6883,6 +7022,10 @@ impl App {
         }
     }
 
+    fn browser_select_row_count(&self) -> usize {
+        self.browser_select_rows().len()
+    }
+
     fn default_profile_row_count(&self) -> usize {
         match &self.default_profile.status {
             DefaultProfileStatus::Ready => self.default_profile.profiles.len().max(1),
@@ -6942,6 +7085,16 @@ impl App {
         self.start_cookie_sync_profile_load()
     }
 
+    fn open_browser_select(&mut self) -> Result<()> {
+        self.open_surface(Surface::BrowserSelect);
+        self.browser_select_chromium_expanded = matches!(
+            self.browser.as_str(),
+            "Headless Chromium" | "Managed Chromium"
+        );
+        self.status_notice = None;
+        self.start_local_browser_load()
+    }
+
     fn open_default_profile(&mut self) -> Result<()> {
         self.open_surface(Surface::DefaultProfile);
         self.status_notice = None;
@@ -6951,10 +7104,26 @@ impl App {
     fn start_default_profile_load(&mut self) -> Result<()> {
         self.default_profile.status = DefaultProfileStatus::Loading;
         self.default_profile.profiles.clear();
+        self.default_profile.browsers.clear();
         self.default_profile.current_profile_id = self
             .store
             .get_setting("browser.preference.profile")?
             .filter(|value| !value.trim().is_empty());
+        self.spawn_default_profile_load("browser local profiles --json")
+    }
+
+    fn start_local_browser_load(&mut self) -> Result<()> {
+        self.default_profile.status = DefaultProfileStatus::Loading;
+        self.default_profile.profiles.clear();
+        self.default_profile.browsers.clear();
+        self.default_profile.current_profile_id = self
+            .store
+            .get_setting("browser.preference.profile")?
+            .filter(|value| !value.trim().is_empty());
+        self.spawn_default_profile_load("browser local browsers --json")
+    }
+
+    fn spawn_default_profile_load(&mut self, command: &'static str) -> Result<()> {
         let cwd = std::env::current_dir()?;
         let artifact_root = self.store.state_dir().join("profile-settings-artifacts");
         fs::create_dir_all(&artifact_root)?;
@@ -6966,7 +7135,7 @@ impl App {
                     "tui-profile-settings",
                     &cwd,
                     &artifact_root,
-                    "browser local profiles --json",
+                    command,
                     None,
                 )
                 .map_err(|error| format!("{error:#}"));
@@ -7012,15 +7181,30 @@ impl App {
         if self.browser != settings::BROWSER_LOCAL_CHROME {
             return self.browser.clone();
         }
-        match self.browser_profile_label.as_deref() {
-            Some(profile) => format!("{} · {}", self.browser, concise_profile_label(&profile)),
-            None => self.browser.clone(),
+        match (
+            self.browser_local_label.as_deref(),
+            self.browser_profile_label.as_deref(),
+        ) {
+            (Some(browser), Some(profile)) => format!(
+                "{} · {} · {}",
+                self.browser,
+                browser,
+                concise_profile_label(profile)
+            ),
+            (Some(browser), None) => format!("{} · {}", self.browser, browser),
+            (None, Some(profile)) => {
+                format!("{} · {}", self.browser, concise_profile_label(profile))
+            }
+            (None, None) => self.browser.clone(),
         }
     }
 
     fn refresh_browser_profile_label(&mut self) -> Result<bool> {
+        let local_browser = browser_local_label_from_store(&self.store)?;
         let next = browser_profile_label_from_store(&self.store)?;
-        let changed = self.browser_profile_label != next;
+        let changed =
+            self.browser_local_label != local_browser || self.browser_profile_label != next;
+        self.browser_local_label = local_browser;
         self.browser_profile_label = next;
         Ok(changed)
     }
@@ -7235,7 +7419,7 @@ impl App {
             Surface::ModelSearch => self.model_search_row_count(),
             Surface::Mode => 2,
             Surface::Browser => 3,
-            Surface::BrowserSelect => BROWSER_CHOICES.len(),
+            Surface::BrowserSelect => self.browser_select_row_count(),
             Surface::DefaultProfile => self.default_profile_row_count(),
             Surface::CookieSync => self.cookie_sync_row_count(),
             Surface::Context | Surface::Goal => 0,
@@ -7703,6 +7887,18 @@ fn browser_profile_label_from_store(store: &Store) -> Result<Option<String>> {
         }))
 }
 
+fn browser_local_label_from_store(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .get_setting("browser.preference.browser_label")?
+        .or_else(|| {
+            store
+                .get_setting("browser.preference.browser")
+                .ok()
+                .flatten()
+        })
+        .filter(|label| !label.trim().is_empty()))
+}
+
 pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
     let profile_name = concise_profile_label(&profile.profile_name);
     if profile_name.trim().is_empty() {
@@ -7710,6 +7906,61 @@ pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
     } else {
         profile_name
     }
+}
+
+fn local_browser_choices_from_profiles(profiles: &[CookieSyncProfile]) -> Vec<String> {
+    let mut browsers = Vec::new();
+    for profile in profiles {
+        let browser = profile.browser_name.trim();
+        if browser.is_empty() {
+            continue;
+        }
+        if !browsers
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(browser))
+        {
+            browsers.push(browser.to_string());
+        }
+    }
+    sort_local_browser_choices(&mut browsers);
+    browsers
+}
+
+fn local_browser_choices_from_value(value: &serde_json::Value) -> Option<Vec<String>> {
+    let browsers = value.get("browsers")?.as_array()?;
+    let mut names = Vec::new();
+    for browser in browsers {
+        let Some(name) = browser
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if !names
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.to_string());
+        }
+    }
+    sort_local_browser_choices(&mut names);
+    Some(names)
+}
+
+fn sort_local_browser_choices(browsers: &mut [String]) {
+    browsers.sort_by(|a, b| local_browser_sort_key(a).cmp(&local_browser_sort_key(b)));
+}
+
+fn local_browser_sort_key(browser: &str) -> (u8, String) {
+    let normalized = browser.trim().to_ascii_lowercase();
+    let rank = match normalized.as_str() {
+        "google chrome" => 0,
+        "chromium" => 1,
+        _ => 2,
+    };
+    (rank, normalized)
 }
 
 fn cookie_sync_profile_from_value(value: &serde_json::Value) -> Option<CookieSyncProfile> {
@@ -7876,8 +8127,18 @@ fn browser_choice_kind(browser: &str) -> &'static str {
     match browser {
         BROWSER_LOCAL_CHROME => "local",
         "Headless Chromium" => "headless",
+        "Managed Chromium" => "managed",
         BROWSER_USE_CLOUD => "cloud",
         _ => "other",
+    }
+}
+
+fn browser_preference_mode_for_choice(browser: &str) -> &'static str {
+    match browser {
+        "Headless Chromium" => "managed-headless",
+        "Managed Chromium" => "managed-headed",
+        BROWSER_USE_CLOUD => "cloud",
+        _ => "local",
     }
 }
 
@@ -10847,6 +11108,82 @@ mod redesign_tests {
     }
 
     #[test]
+    fn headless_chromium_live_status_link_uses_local_preview_url() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.browser = "Headless Chromium".to_string();
+        app.store.set_setting("browser", "Headless Chromium")?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        let live_url = "file:///tmp/browser-use-terminal/.capture.frames/live.html";
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": live_url}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Done"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Open Live Browser"));
+        assert!(screen.contains("Headless Chromium"));
+        assert!(!screen.contains("live file:///tmp/browser-use-terminal/.capture.frames/live.html"));
+        let link = app
+            .live_link_overlay
+            .borrow()
+            .as_ref()
+            .map(|link| link.url.clone())
+            .context("live link overlay")?;
+        assert_eq!(link, live_url);
+        Ok(())
+    }
+
+    #[test]
+    fn live_browser_link_stays_visible_in_narrow_footer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.width = 64;
+        app.args.height = 16;
+        app.browser = "Headless Chromium".to_string();
+        app.store.set_setting("browser", "Headless Chromium")?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        let live_url = "file:///tmp/browser-use-terminal/.capture.frames/live.html";
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": live_url}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Open Live Browser"), "{screen}");
+        let link = app
+            .live_link_overlay
+            .borrow()
+            .as_ref()
+            .map(|link| (link.text.clone(), link.url.clone()))
+            .context("live link overlay")?;
+        assert_eq!(
+            link,
+            ("Open Live Browser".to_string(), live_url.to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn escape_prefixed_word_keys_decode_as_alt_navigation() {
         assert_eq!(
             escape_prefixed_alt_key_event(&TermEvent::Key(KeyEvent::new(
@@ -11446,7 +11783,8 @@ mod redesign_tests {
 
             app.open_surface(Surface::BrowserSelect);
             let screen = render_dump(&mut app)?;
-            assert!(screen.contains("Browser Use Cloud . needs key"));
+            assert!(screen.contains("Browser Use Cloud"));
+            assert!(screen.contains("needs Browser Use key"));
             Ok(())
         })();
         if let Some(value) = saved {
@@ -11536,10 +11874,7 @@ mod redesign_tests {
             )?;
             app.selected_session_id = Some(session.id.clone());
             app.open_surface(Surface::BrowserSelect);
-            app.selected_row = BROWSER_CHOICES
-                .iter()
-                .position(|browser| *browser == BROWSER_USE_CLOUD)
-                .context("cloud browser choice")?;
+            app.selected_row = app.browser_select_local_browser_count();
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::ApiKey);
@@ -11560,6 +11895,134 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn browser_select_can_choose_detected_local_browser() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("browser.preference.profile", "chromium:Default")?;
+        app.store
+            .set_setting("browser.preference.profile_label", "Default")?;
+        app.browser_profile_label = Some("Default".to_string());
+        app.default_profile.current_profile_id = Some("chromium:Default".to_string());
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Google Chrome".to_string(), "Chromium".to_string()];
+        app.default_profile.profiles = vec![
+            CookieSyncProfile {
+                id: "google-chrome:Default".to_string(),
+                display_name: "Google Chrome - Default".to_string(),
+                browser_name: "Google Chrome".to_string(),
+                profile_name: "Default".to_string(),
+            },
+            CookieSyncProfile {
+                id: "chromium:Default".to_string(),
+                display_name: "Chromium - Default".to_string(),
+                browser_name: "Chromium".to_string(),
+                profile_name: "Default".to_string(),
+            },
+        ];
+
+        app.save_browser(0)?;
+
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.browser")?
+                .as_deref(),
+            Some("Google Chrome")
+        );
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.browser_label")?
+                .as_deref(),
+            Some("Google Chrome")
+        );
+        assert_eq!(
+            app.store.get_setting("browser.preference.mode")?.as_deref(),
+            Some("local")
+        );
+        assert_eq!(app.store.get_setting("browser.preference.profile")?, None);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Google Chrome"));
+        assert_eq!(app.browser_profile_label, None);
+        Ok(())
+    }
+
+    #[test]
+    fn browser_select_can_choose_chromium_managed_modes_without_notice() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Chromium".to_string()];
+        app.store.set_setting("browser.preference.mode", "local")?;
+
+        app.save_browser(0)?;
+        assert!(app.browser_select_chromium_expanded);
+        assert_eq!(app.selected_row, 1);
+
+        app.save_browser(1)?;
+        assert_eq!(app.browser, "Managed Chromium");
+        assert_eq!(app.status_notice, None);
+        assert_eq!(
+            app.store.get_setting("browser.preference.mode")?.as_deref(),
+            Some("managed-headed")
+        );
+
+        app.save_browser(2)?;
+        assert_eq!(app.browser, "Headless Chromium");
+        assert_eq!(app.status_notice, None);
+        assert_eq!(
+            app.store.get_setting("browser.preference.mode")?.as_deref(),
+            Some("managed-headless")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_browser_choices_keep_chromium_as_single_browser() {
+        let value = serde_json::json!({
+            "browsers": [
+                {
+                    "name": "Chromium",
+                    "browser_path": "/tmp/chromium",
+                    "profile_count": 0,
+                    "managed_headed": true,
+                    "managed_headless": true
+                },
+                {
+                    "name": "Google Chrome",
+                    "browser_path": "/tmp/chrome",
+                    "profile_count": 1,
+                    "managed_headed": false,
+                    "managed_headless": false
+                }
+            ]
+        });
+
+        assert_eq!(
+            local_browser_choices_from_value(&value),
+            Some(vec!["Google Chrome".to_string(), "Chromium".to_string()])
+        );
+    }
+
+    #[test]
+    fn browser_select_starts_on_current_and_labels_recommended() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.surface = Surface::BrowserSelect;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = None;
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Google Chrome".to_string(), "Chromium".to_string()];
+
+        app.sync_browser_select_cursor_to_current();
+
+        assert_eq!(app.selected_row, 0);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Google Chrome  recommended"));
+        assert!(!screen.contains("current"));
+        Ok(())
     }
 
     #[test]
@@ -11760,10 +12223,7 @@ mod redesign_tests {
             app.model_configured = true;
             app.store.set_setting("setup.complete", "1")?;
             app.open_surface(Surface::BrowserSelect);
-            app.selected_row = BROWSER_CHOICES
-                .iter()
-                .position(|browser| *browser == BROWSER_USE_CLOUD)
-                .context("cloud browser choice")?;
+            app.selected_row = app.browser_select_local_browser_count();
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::ApiKey);
@@ -13794,7 +14254,7 @@ wire_api = "responses"
             Surface::CookieSync,
         ] {
             app.open_surface(surface);
-            if surface == Surface::DefaultProfile {
+            if matches!(surface, Surface::BrowserSelect | Surface::DefaultProfile) {
                 app.default_profile.status = DefaultProfileStatus::Ready;
                 app.default_profile.profiles = vec![
                     CookieSyncProfile {
@@ -13810,13 +14270,16 @@ wire_api = "responses"
                         profile_name: "Personal".to_string(),
                     },
                 ];
+                app.default_profile.browsers =
+                    local_browser_choices_from_profiles(&app.default_profile.profiles);
             }
             let count = match surface {
                 Surface::Setup => app.setup_row_count(),
                 Surface::Account => ACCOUNT_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
                 Surface::Mode => 2,
-                Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
+                Surface::Browser => 3,
+                Surface::BrowserSelect => app.browser_select_row_count(),
                 Surface::DefaultProfile => app.default_profile_row_count(),
                 Surface::CookieSync => app.cookie_sync_row_count(),
                 _ => unreachable!(),
@@ -13991,11 +14454,15 @@ wire_api = "responses"
         )?;
         app.selected_session_id = Some(session.id.clone());
 
-        let local_index = BROWSER_CHOICES
-            .iter()
-            .position(|choice| *choice == BROWSER_LOCAL_CHROME)
-            .context("local browser choice")?;
-        app.save_browser(local_index)?;
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Google Chrome".to_string()];
+        app.default_profile.profiles = vec![CookieSyncProfile {
+            id: "google-chrome:Default".to_string(),
+            display_name: "Google Chrome - Default".to_string(),
+            browser_name: "Google Chrome".to_string(),
+            profile_name: "Default".to_string(),
+        }];
+        app.save_browser(0)?;
         let state = app.workbench_state()?;
         assert_eq!(state.browser.backend, BROWSER_LOCAL_CHROME);
         assert_eq!(state.browser.live_url, None);

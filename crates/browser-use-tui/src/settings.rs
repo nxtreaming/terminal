@@ -133,8 +133,6 @@ pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use Cloud";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
 pub(crate) const BROWSER_LOCAL_CHROME: &str = "Local Chrome";
-pub(crate) const BROWSER_CHOICES: [&str; 3] =
-    [BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, "Headless Chromium"];
 
 pub(crate) fn browser_use_cloud_env_key_present() -> bool {
     std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).is_ok_and(|value| !value.trim().is_empty())
